@@ -166,3 +166,150 @@ models when connected.
 ## License
 
 GPL-3.0 — see [LICENSE](LICENSE).
+
+---
+
+## Developer notes
+
+> This section is for contributors and maintainers. End users only need the
+> **Dependencies** and **Building** sections above.
+
+### Repository layout
+
+```
+console-music-player/
+├── src/                    # Main binary (TUI, player, library, UI)
+│   ├── main.rs             # Entry point, event loop, DLL probe
+│   ├── app.rs              # App state machine
+│   ├── ui/                 # Ratatui rendering
+│   ├── player/             # rodio audio backend
+│   ├── tracker/            # libopenmpt wrapper + pure-Rust metadata parsers
+│   ├── library/            # Scanner, lofty tag reader/writer
+│   └── ...
+├── ipod-rs/                # Workspace crate: iTunesDB / iTunesSD / detect
+│   └── src/
+│       ├── itunesdb.rs     # Binary DB read/write (atomic via .tmp rename)
+│       ├── itunessd.rs     # Shuffle SD file read/write
+│       └── detect.rs       # iPod health scan (O(n) via HashSet)
+├── deps/                   # Vendored native libraries (not committed to git)
+│   ├── openmpt.lib         # MSVC import library for libopenmpt
+│   └── libopenmpt.dll      # Runtime DLL — copied to target dir by build.rs
+├── build.rs                # Copies DLL to output dir; adds /DELAYLOAD on MSVC
+├── Cargo.toml              # `tracker` feature gates the openmpt dep
+└── .vscode/
+    ├── tasks.json          # Build + run tasks (see below)
+    └── launch.json         # Attach-only configs (launch via tasks, not F5)
+```
+
+### Cargo features
+
+| Feature | Default | Effect |
+|---------|---------|--------|
+| `tracker` | yes | Enables MOD/XM/IT/S3M playback via libopenmpt |
+
+Build without the tracker feature to get a pure-Rust binary with no C++ dep:
+
+```bash
+cargo build --no-default-features
+```
+
+### Windows DLL handling
+
+`libopenmpt.dll` is a load-time dependency when the `tracker` feature is
+enabled. To make this developer-friendly, two mechanisms work together:
+
+**1. `/DELAYLOAD` linker flag** (`build.rs`)
+
+On MSVC targets, `build.rs` adds `/DELAYLOAD:openmpt.dll` and links
+`delayimp.lib`. This defers DLL resolution to the first openmpt call rather
+than process start, so `main()` runs even when the DLL is missing.
+
+**2. Runtime DLL probe** (`src/main.rs: check_openmpt_dll`)
+
+`main()` calls `LoadLibraryW("libopenmpt.dll")` before any tracker code
+executes. If the DLL is absent, the app prints the exe path, a download URL,
+and the `--no-default-features` fallback, then exits with code 1. No cryptic
+OS crash dialog.
+
+**3. Task-level pre-flight** (`.vscode/tasks.json: check: libopenmpt.dll`)
+
+The `run (tracker)` VS Code task runs a PowerShell check first. If
+`$CARGO_TARGET_DIR\debug\libopenmpt.dll` is missing it prints coloured
+instructions and aborts before the build even starts.
+
+**Setting up `deps/` on a new machine (Windows)**
+
+```powershell
+# Download the Windows dev package from lib.openmpt.org/libopenmpt/download/
+# (the file named libopenmpt-*-dev.zip, not the plain bin zip)
+# Extract these files from bin/amd64/ into deps/:
+#
+#   openmpt.lib            (MSVC import library — from lib/amd64/ inside the zip)
+#   libopenmpt.dll         (main runtime DLL)
+#   openmpt-mpg123.dll     (MP3 decoder — required by libopenmpt.dll)
+#   openmpt-ogg.dll        (Ogg container — required by libopenmpt.dll)
+#   openmpt-vorbis.dll     (Vorbis decoder — required by libopenmpt.dll)
+#   openmpt-zlib.dll       (zlib — required by libopenmpt.dll)
+#
+# All six files must be present. libopenmpt.dll will silently fail to load if
+# the companion DLLs are missing — this was the original launch failure.
+#
+# build.rs copies all five DLLs next to cmp.exe automatically on each build.
+```
+
+`deps/` is in `.gitignore` — do not commit DLLs or the import lib.
+
+### VS Code workflow
+
+The project deliberately avoids `cppvsdbg` launch configurations for running
+the app. `cppvsdbg` injects a debugger into every process it spawns, which
+breaks raw-mode TUI applications (crossterm / ratatui) on Windows regardless
+of the `console` setting.
+
+**`CARGO_TARGET_DIR` override**
+
+The system-level `CARGO_TARGET_DIR` environment variable may redirect cargo
+output outside the workspace (e.g. `D:\rust\cargo`). All tasks override it to
+`${workspaceFolder}/target` so that `launch.json` and the DLL pre-flight check
+can use a fixed, predictable path. If you change the build task, keep this
+override or the exe path in `launch.json` will not exist.
+
+**Running** — use tasks, not F5:
+
+| Task | What it does |
+|------|-------------|
+| `run` | `cargo run --no-default-features` — no DLL needed, always works |
+| `run (tracker)` | DLL pre-flight → build → `cargo run --features tracker` |
+| `run (release, tracker)` | Same but `--release` |
+
+Trigger via **Terminal → Run Task** or `Ctrl+Shift+P → Tasks: Run Test Task`.
+
+**Debugging** — `launch.json` only contains attach configs:
+
+```
+F5 → Attach to cmp (debug) → pick the running cmp.exe process
+```
+
+Start the app first via a run task, then attach.
+
+### iTunesDB / iTunesSD internals
+
+All DB writes go through `ipod_rs::atomic_write`, which writes to a `.tmp`
+sibling file and renames atomically. This prevents partial writes from
+corrupting the iPod database if the process or power is interrupted.
+
+The `scan_health` function in `ipod-rs/src/detect.rs` was refactored from
+O(n²) to O(n) — it builds a `HashSet<u32>` of master-playlist correlation IDs
+in a single DB pass, then checks each track against the set.
+
+### Adding a new audio format
+
+1. If the format has a pure-Rust decoder available on crates.io, add it to
+   `symphonia` features in `Cargo.toml` — `player/mod.rs` will pick it up
+   automatically via the `Decoder` path.
+2. If it requires a C library (like libopenmpt), model it after `tracker/`:
+   - Add an optional feature in `Cargo.toml`
+   - Gate the dep and the implementation behind `#[cfg(feature = "...")]`
+   - Add a `/DELAYLOAD` entry in `build.rs` for Windows
+   - Add a `check_<lib>_dll()` probe in `main.rs`
+   - Add a pre-flight task in `.vscode/tasks.json`

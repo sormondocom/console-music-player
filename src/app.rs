@@ -9,6 +9,7 @@ use ipod_rs::{DeviceScanResult, DeviceTrackEntry};
 
 use crate::device::ipod_ums::IpodUmsDevice;
 use crate::device::MusicDevice;
+use crate::library::dedup::{self, DedupAction, DuplicateGroup};
 use crate::library::scanner;
 use crate::library::{Library, TrackEdit};
 use crate::player::Player;
@@ -37,6 +38,8 @@ pub enum Screen {
     DeviceTracks,
     /// Multi-field metadata editor for the focused local track.
     EditTrack,
+    /// Interactive duplicate-track finder and resolver.
+    Dedup,
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +58,100 @@ pub struct EditState {
     pub fields: [String; 5],
     /// Which field the cursor is on (0–4).
     pub focused_field: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Dedup state
+// ---------------------------------------------------------------------------
+
+/// Which panel of the dedup screen has keyboard focus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DedupFocus {
+    /// Left panel — scrolling through duplicate groups.
+    Groups,
+    /// Right panel — navigating candidates within the focused group.
+    Candidates,
+}
+
+/// All state needed for the deduplication screen.
+#[derive(Debug, Clone)]
+pub struct DedupState {
+    pub groups: Vec<DuplicateGroup>,
+    /// Index of the focused group in the left panel.
+    pub group_index: usize,
+    /// Index of the focused candidate in the right panel.
+    pub candidate_index: usize,
+    /// Per-group, per-candidate action chosen by the user.
+    pub actions: Vec<Vec<DedupAction>>,
+    pub focus: DedupFocus,
+}
+
+impl DedupState {
+    pub fn new(groups: Vec<DuplicateGroup>) -> Self {
+        let actions = groups.iter().map(|g| g.suggested_actions()).collect();
+        Self {
+            groups,
+            group_index: 0,
+            candidate_index: 0,
+            actions,
+            focus: DedupFocus::Groups,
+        }
+    }
+
+    pub fn focused_group(&self) -> Option<&DuplicateGroup> {
+        self.groups.get(self.group_index)
+    }
+
+    pub fn focused_actions(&self) -> Option<&Vec<DedupAction>> {
+        self.actions.get(self.group_index)
+    }
+
+    pub fn group_count(&self) -> usize { self.groups.len() }
+
+    pub fn to_delete_count(&self) -> usize {
+        self.actions.iter().flatten().filter(|&&a| a == DedupAction::Delete).count()
+    }
+
+    pub fn move_group_up(&mut self) {
+        if self.group_index > 0 {
+            self.group_index -= 1;
+            self.candidate_index = 0;
+        }
+    }
+
+    pub fn move_group_down(&mut self) {
+        if self.group_index + 1 < self.groups.len() {
+            self.group_index += 1;
+            self.candidate_index = 0;
+        }
+    }
+
+    pub fn move_candidate_up(&mut self) {
+        if self.candidate_index > 0 {
+            self.candidate_index -= 1;
+        }
+    }
+
+    pub fn move_candidate_down(&mut self) {
+        let max = self.focused_group().map(|g| g.candidates.len()).unwrap_or(0);
+        if self.candidate_index + 1 < max {
+            self.candidate_index += 1;
+        }
+    }
+
+    /// Cycle the action for the focused candidate.
+    pub fn toggle_focused_action(&mut self) {
+        if let Some(actions) = self.actions.get_mut(self.group_index) {
+            if let Some(action) = actions.get_mut(self.candidate_index) {
+                *action = action.cycle();
+            }
+        }
+    }
+
+    /// Re-apply auto-suggestions for all groups.
+    pub fn auto_suggest_all(&mut self) {
+        self.actions = self.groups.iter().map(|g| g.suggested_actions()).collect();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +207,9 @@ pub struct App {
     // --- tag editor ---
     pub edit_state: Option<EditState>,
 
+    // --- deduplication ---
+    pub dedup_state: Option<DedupState>,
+
     // --- marquee scrolling ---
     /// Monotonically incrementing tick counter, reset whenever the focused
     /// library track changes.  The UI computes the scroll offset from this.
@@ -141,6 +241,7 @@ impl App {
             device_tracks: Vec::new(),
             device_tracks_selected: 0,
             edit_state: None,
+            dedup_state: None,
             marquee_tick: 0,
         };
         app.rescan();
@@ -209,6 +310,15 @@ impl App {
         }
     }
 
+    pub fn sources_page_up(&mut self, page: usize) {
+        self.sources_selected = self.sources_selected.saturating_sub(page);
+    }
+
+    pub fn sources_page_down(&mut self, page: usize) {
+        let max = self.source_dirs.len().saturating_sub(1);
+        self.sources_selected = (self.sources_selected + page).min(max);
+    }
+
     // --- playlists ---
 
     pub fn refresh_playlist_names(&mut self) {
@@ -228,6 +338,15 @@ impl App {
         if self.playlists_selected + 1 < self.playlist_names.len() {
             self.playlists_selected += 1;
         }
+    }
+
+    pub fn playlists_page_up(&mut self, page: usize) {
+        self.playlists_selected = self.playlists_selected.saturating_sub(page);
+    }
+
+    pub fn playlists_page_down(&mut self, page: usize) {
+        let max = self.playlist_names.len().saturating_sub(1);
+        self.playlists_selected = (self.playlists_selected + page).min(max);
     }
 
     /// Load the highlighted playlist into the library view.
@@ -379,7 +498,9 @@ impl App {
 
     pub fn play_focused(&mut self) {
         if let Some(track) = self.library.tracks.get(self.library.selected_index).cloned() {
-            self.player.play(&track);
+            if let Err(e) = self.player.play(&track) {
+                self.status_message = Some(format!("Playback error: {e}"));
+            }
         }
     }
 
@@ -571,6 +692,15 @@ impl App {
         }
     }
 
+    pub fn device_tracks_page_up(&mut self, page: usize) {
+        self.device_tracks_selected = self.device_tracks_selected.saturating_sub(page);
+    }
+
+    pub fn device_tracks_page_down(&mut self, page: usize) {
+        let max = self.device_tracks.len().saturating_sub(1);
+        self.device_tracks_selected = (self.device_tracks_selected + page).min(max);
+    }
+
     pub fn repair_move_up(&mut self) {
         if self.repair_selected > 0 {
             self.repair_selected -= 1;
@@ -582,6 +712,15 @@ impl App {
         if self.repair_selected + 1 < max {
             self.repair_selected += 1;
         }
+    }
+
+    pub fn repair_page_up(&mut self, page: usize) {
+        self.repair_selected = self.repair_selected.saturating_sub(page);
+    }
+
+    pub fn repair_page_down(&mut self, page: usize) {
+        let max = self.repair_results.as_ref().map(|r| r.issue_count()).unwrap_or(0).saturating_sub(1);
+        self.repair_selected = (self.repair_selected + page).min(max);
     }
 
     // --- tag editor ---
@@ -662,6 +801,73 @@ impl App {
             let n = EDIT_FIELD_LABELS.len();
             state.focused_field = if state.focused_field == 0 { n - 1 } else { state.focused_field - 1 };
         }
+    }
+
+    // --- deduplication ---
+
+    /// Scan the library for duplicates and open the dedup screen.
+    pub fn begin_dedup(&mut self) {
+        let groups = dedup::find_duplicates(&self.library.all_tracks);
+        let n = groups.len();
+        if groups.is_empty() {
+            self.status_message = Some("No duplicates found in library.".into());
+            return;
+        }
+        self.status_message = Some(format!(
+            "Found {n} duplicate group(s). Review and mark tracks to delete."
+        ));
+        self.dedup_state = Some(DedupState::new(groups));
+        self.screen = Screen::Dedup;
+    }
+
+    /// Delete all tracks marked Delete, remove them from the library, and
+    /// return to the library screen.
+    pub fn apply_dedup(&mut self) {
+        let Some(state) = self.dedup_state.take() else { return };
+
+        let mut deleted = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        let mut deleted_paths = std::collections::HashSet::new();
+
+        for (group, actions) in state.groups.iter().zip(state.actions.iter()) {
+            for (candidate, &action) in group.candidates.iter().zip(actions.iter()) {
+                if action == DedupAction::Delete {
+                    match std::fs::remove_file(&candidate.track.path) {
+                        Ok(()) => {
+                            deleted += 1;
+                            deleted_paths.insert(candidate.track.path.clone());
+                        }
+                        Err(e) => errors.push(format!(
+                            "Could not delete {}: {e}",
+                            candidate.track.path.display()
+                        )),
+                    }
+                }
+            }
+        }
+
+        // Remove deleted tracks from in-memory library.
+        self.library.all_tracks.retain(|t| !deleted_paths.contains(&t.path));
+        self.library.tracks.retain(|t| !deleted_paths.contains(&t.path));
+        self.library.selected_index =
+            self.library.selected_index.min(self.library.tracks.len().saturating_sub(1));
+
+        self.screen = Screen::Library;
+        let failed = errors.len();
+        for e in errors {
+            self.transfer_log.push(e);
+        }
+        self.status_message = Some(format!(
+            "Dedup: {deleted} file(s) deleted{}.",
+            if failed > 0 { format!(", {failed} failed — see transfer log") } else { String::new() }
+        ));
+    }
+
+    /// Discard dedup state and return to library without deleting anything.
+    pub fn cancel_dedup(&mut self) {
+        self.dedup_state = None;
+        self.screen = Screen::Library;
+        self.status_message = Some("Deduplication cancelled — no files deleted.".into());
     }
 
     // --- tick ---

@@ -11,7 +11,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, EditState, Focus, Screen, EDIT_FIELD_LABELS};
+use crate::app::{App, DedupFocus, EditState, Focus, Screen, EDIT_FIELD_LABELS};
+use crate::library::dedup::{DedupAction, DuplicateKind};
+use crate::library::SortOrder;
 use crate::media::MediaItem;
 use crate::player::PlaybackState;
 
@@ -61,6 +63,7 @@ pub fn render(app: &App, frame: &mut Frame) {
                 render_edit_overlay(state, frame, body_area);
             }
         }
+        Screen::Dedup => render_dedup(app, frame, body_area),
     }
 }
 
@@ -98,8 +101,8 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
                 "[R] Rescan"
             };
             library_hint = format!(
-                " [↑↓/jk] Nav  [Enter] Play  [P] Pause  []/[ Vol  \
-                 [Space] Sel  [Tab] Pane  {r_hint}"
+                " [↑↓/jk] Nav  [PgUp/Dn] Page  [Enter] Play  [P] Pause  [O] Repeat  \
+                 [Z] Sort  []/[ Vol  [Space] Sel  [Tab] Pane  {r_hint}"
             );
             library_hint.as_str()
         }
@@ -112,6 +115,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         Screen::RepairIpod => " [F] Fix all  [↑↓] Navigate  [Esc] Back",
         Screen::DeviceTracks => " [↑↓] Navigate  [Esc/Q] Back",
         Screen::EditTrack => " [Tab/↑↓] Next field  [Enter] Save  [Esc] Cancel",
+        Screen::Dedup => " [Tab] Panel  [↑↓] Navigate  [Space] Cycle action  [A] Auto  [Enter] Apply  [Esc] Cancel",
     };
 
     let status = app.status_message.as_deref().unwrap_or(help);
@@ -165,8 +169,9 @@ fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
         .map(|n| format!(" [{n}]"))
         .unwrap_or_default();
 
+    let sort_label = app.library.sort_order.label();
     let title = format!(
-        " Library{pl_label} — {track_count} tracks{}",
+        " Library{pl_label} — {track_count} tracks  ↕ {sort_label}{}",
         if sel_count > 0 { format!(" ({sel_count} selected)") } else { String::new() }
     );
 
@@ -332,8 +337,9 @@ fn render_player_pane(app: &App, frame: &mut Frame, area: Rect) {
             let vol_pct = (p.volume * 100.0).round() as u8;
 
             let time_vol = Paragraph::new(format!(
-                "{elapsed_s}/{total_s}  Vol:{} {vol_pct}%",
-                p.volume_bar()
+                "{elapsed_s}/{total_s}  Vol:{} {vol_pct}%  {}",
+                p.volume_bar(),
+                p.repeat.icon()
             ))
             .style(Style::default().fg(CLR_DIM))
             .alignment(Alignment::Center);
@@ -526,6 +532,8 @@ fn render_functions_pane(_app: &App, frame: &mut Frame, area: Rect) {
         Line::from(vec![key("S"), label("Sources  "), key("L"), label("Playlists")]),
         Line::from(vec![key("W"), label("Save PL  "), key("D"), label("Rescan devs")]),
         Line::from(vec![key("E"), label("Edit tags"), key("R"), label("Rescan")]),
+        Line::from(vec![key("F"), label("Find dupes"), key("Z"), label("Sort")]),
+        Line::from(vec![key("O"), label("Repeat one")]),
         Line::from(vec![key("Q"), label("Quit")]),
     ];
 
@@ -997,6 +1005,178 @@ fn render_input_overlay(title: &str, buffer: &str, frame: &mut Frame, parent: Re
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Deduplication screen
+// ---------------------------------------------------------------------------
+//
+// Layout: left panel (35 %) = scrollable group list
+//         right panel (65%) = candidate detail for the focused group
+//
+// Navigation:
+//   Tab          — switch focus between panels
+//   ↑/↓ / j/k   — scroll groups (left) or candidates (right)
+//   Space        — cycle action for focused candidate (right panel)
+//   A            — auto-suggest all groups
+//   Enter        — apply deletions
+//   Esc          — cancel, return to library
+
+fn render_dedup(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(state) = &app.dedup_state else { return };
+
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(area);
+
+    // ── Left: group list ────────────────────────────────────────────────────
+    let group_items: Vec<ListItem> = state
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let kind_tag = match g.kind {
+                DuplicateKind::ExactContent  => "=",
+                DuplicateKind::MetadataMatch => "~",
+            };
+            let title = g
+                .candidates
+                .first()
+                .map(|c| truncate(&c.track.title, 22))
+                .unwrap_or_default();
+            let del_count = state.actions.get(i)
+                .map(|acts| acts.iter().filter(|&&a| a == DedupAction::Delete).count())
+                .unwrap_or(0);
+            let del_tag = if del_count > 0 { format!(" -{del_count}") } else { String::new() };
+
+            let text = format!("{kind_tag} {title}{del_tag}");
+            let style = if i == state.group_index {
+                if state.focus == DedupFocus::Groups {
+                    Style::default().fg(CLR_SELECTED).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                }
+            } else {
+                Style::default().fg(CLR_DIM)
+            };
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let left_border = if state.focus == DedupFocus::Groups { CLR_SELECTED } else { CLR_DIM };
+    let groups_widget = List::new(group_items).block(
+        Block::default()
+            .title(format!(
+                " Duplicates — {} group(s)  [=]exact [~]meta ",
+                state.group_count()
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(left_border)),
+    );
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.group_index));
+    frame.render_stateful_widget(groups_widget, left, &mut list_state);
+
+    // ── Right: candidate detail ──────────────────────────────────────────────
+    if let (Some(group), Some(actions)) = (state.focused_group(), state.focused_actions()) {
+        let kind_label = match group.kind {
+            DuplicateKind::ExactContent  => "Exact content match (identical bytes)",
+            DuplicateKind::MetadataMatch => "Metadata match (same title + artist)",
+        };
+
+        let mut lines: Vec<Line> = vec![
+            Line::from(vec![
+                Span::styled("  Kind: ", Style::default().fg(CLR_DIM)),
+                Span::styled(kind_label, Style::default().fg(CLR_ACCENT)),
+            ]),
+            Line::raw(""),
+        ];
+
+        for (ci, (candidate, &action)) in
+            group.candidates.iter().zip(actions.iter()).enumerate()
+        {
+            let focused = ci == state.candidate_index && state.focus == DedupFocus::Candidates;
+            let action_style = match action {
+                DedupAction::Keep      => Style::default().fg(CLR_SUCCESS).bold(),
+                DedupAction::Delete    => Style::default().fg(CLR_ERROR).bold(),
+                DedupAction::Undecided => Style::default().fg(CLR_DIM),
+            };
+            let selector = if focused { "▶ " } else { "  " };
+
+            lines.push(Line::from(vec![
+                Span::raw(selector),
+                Span::styled(
+                    format!("[{}]", action.label()),
+                    action_style,
+                ),
+                Span::raw(format!("  #{}", ci + 1)),
+            ]));
+
+            let t = &candidate.track;
+            let path_str = truncate(&t.path.to_string_lossy(), right.width as usize - 6);
+            lines.push(Line::from(Span::styled(
+                format!("     {path_str}"),
+                Style::default().fg(Color::White),
+            )));
+
+            let mut meta = Vec::new();
+            if !t.title.is_empty() { meta.push(t.title.clone()); }
+            if !t.artist.is_empty() { meta.push(t.artist.clone()); }
+            if !t.album.is_empty() {
+                let a = match t.year {
+                    Some(y) => format!("{} ({})", t.album, y),
+                    None    => t.album.clone(),
+                };
+                meta.push(a);
+            }
+            if !meta.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("     {}", meta.join(" · ")),
+                    Style::default().fg(CLR_DIM),
+                )));
+            }
+
+            let mut info = Vec::new();
+            info.push(format_size(t.file_size, DECIMAL));
+            if let Some(d) = t.duration_secs {
+                info.push(format!("{}:{:02}", d / 60, d % 60));
+            }
+            if let Some(br) = t.bitrate_kbps {
+                info.push(format!("{br} kbps"));
+            }
+            if let Some(cs) = candidate.checksum {
+                info.push(format!("fp:{cs:016x}"));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("     {}", info.join("  ")),
+                Style::default().fg(CLR_DIM),
+            )));
+            lines.push(Line::raw(""));
+        }
+
+        let to_delete = actions.iter().filter(|&&a| a == DedupAction::Delete).count();
+        let summary = format!(
+            "  Group {}/{} — {} to delete total across all groups",
+            state.group_index + 1,
+            state.group_count(),
+            state.to_delete_count(),
+        );
+        lines.push(Line::from(Span::styled(summary, Style::default().fg(CLR_ACCENT))));
+        let _ = to_delete;
+
+        let right_border = if state.focus == DedupFocus::Candidates { CLR_SELECTED } else { CLR_DIM };
+        let detail = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Candidates — [Space] cycle action  [A] auto-suggest ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(right_border)),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(detail, right);
+    }
+}
 
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {

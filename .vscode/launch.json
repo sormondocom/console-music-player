@@ -1,43 +1,4 @@
 {
     "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "Debug cmp",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${env:CARGO_TARGET_DIR}/debug/cmp.exe",
-            "args": ["--library", "${env:USERPROFILE}/Music"],
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "console": "externalTerminal",
-            "preLaunchTask": "cargo build (debug)"
-        },
-        {
-            "name": "Debug cmp (Tracker)",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${env:CARGO_TARGET_DIR}/debug/cmp.exe",
-            "args": ["--library", "${env:USERPROFILE}/Music"],
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "console": "externalTerminal",
-            "preLaunchTask": "cargo build (debug, tracker)",
-            "comment": "Builds with --features tracker (libopenmpt). Requires libopenmpt.dll in the workspace root or on PATH."
-        },
-        {
-            "name": "Release cmp (Tracker)",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${env:CARGO_TARGET_DIR}/release/cmp.exe",
-            "args": ["--library", "${env:USERPROFILE}/Music"],
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "console": "externalTerminal",
-            "preLaunchTask": "cargo build (release, tracker)",
-            "comment": "Optimised release build with tracker support."
-        }
-    ]
+    "configurations": []
 }

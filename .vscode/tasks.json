@@ -1,52 +1,80 @@
 {
     "version": "2.0.0",
     "tasks": [
+        // ── Build ─────────────────────────────────────────────────────────────
         {
-            "label": "cargo build (debug)",
+            "label": "build",
             "type": "shell",
-            "command": "${env:USERPROFILE}/.cargo/bin/cargo build --bin cmp",
-            "group": {
-                "kind": "build",
-                "isDefault": true
+            "command": "cargo build",
+            "options": {
+                "env": { "CARGO_TARGET_DIR": "${workspaceFolder}/target" }
             },
+            "group": { "kind": "build", "isDefault": true },
             "problemMatcher": "$rustc",
-            "presentation": {
-                "reveal": "silent",
-                "panel": "shared"
-            }
+            "presentation": { "reveal": "silent", "panel": "shared" }
         },
         {
-            "label": "cargo build (release)",
+            "label": "build (tracker)",
             "type": "shell",
-            "command": "${env:USERPROFILE}/.cargo/bin/cargo build --bin cmp --release",
+            "command": "cargo build --features tracker",
+            "options": {
+                "env": { "CARGO_TARGET_DIR": "${workspaceFolder}/target" }
+            },
             "group": "build",
             "problemMatcher": "$rustc",
-            "presentation": {
-                "reveal": "silent",
-                "panel": "shared"
-            }
+            "presentation": { "reveal": "silent", "panel": "shared" }
         },
         {
-            "label": "cargo build (debug, tracker)",
+            "label": "build (release, tracker)",
             "type": "shell",
-            "command": "${env:USERPROFILE}/.cargo/bin/cargo build --bin cmp --features tracker",
+            "command": "cargo build --release --features tracker",
+            "options": {
+                "env": { "CARGO_TARGET_DIR": "${workspaceFolder}/target" }
+            },
             "group": "build",
             "problemMatcher": "$rustc",
-            "presentation": {
-                "reveal": "silent",
-                "panel": "shared"
-            }
+            "presentation": { "reveal": "silent", "panel": "shared" }
+        },
+
+        // ── Run (opens a real Windows console, fully outside VS Code) ──────────
+        // Uses Start-Process so cmp.exe gets its own console window with no
+        // VS Code interference. The task itself exits immediately — cmp.exe
+        // keeps running in its own window. WorkingDirectory ensures DLLs are found.
+        {
+            "label": "run",
+            "type": "shell",
+            "options": {
+                "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] },
+                "env": { "CARGO_TARGET_DIR": "${workspaceFolder}/target" }
+            },
+            "command": "cargo build; $exe = '${workspaceFolder}\\target\\debug\\cmp.exe'; Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)",
+            "group": { "kind": "test", "isDefault": true },
+            "problemMatcher": [],
+            "presentation": { "reveal": "silent", "panel": "shared", "close": true }
         },
         {
-            "label": "cargo build (release, tracker)",
+            "label": "run (tracker)",
             "type": "shell",
-            "command": "${env:USERPROFILE}/.cargo/bin/cargo build --bin cmp --release --features tracker",
-            "group": "build",
-            "problemMatcher": "$rustc",
-            "presentation": {
-                "reveal": "silent",
-                "panel": "shared"
-            }
+            "options": {
+                "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] },
+                "env": { "CARGO_TARGET_DIR": "${workspaceFolder}/target" }
+            },
+            "command": "cargo build --features tracker; $exe = '${workspaceFolder}\\target\\debug\\cmp.exe'; Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)",
+            "group": "test",
+            "problemMatcher": [],
+            "presentation": { "reveal": "silent", "panel": "shared", "close": true }
+        },
+        {
+            "label": "run (release, tracker)",
+            "type": "shell",
+            "options": {
+                "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] },
+                "env": { "CARGO_TARGET_DIR": "${workspaceFolder}/target" }
+            },
+            "command": "cargo build --release --features tracker; $exe = '${workspaceFolder}\\target\\release\\cmp.exe'; Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)",
+            "group": "test",
+            "problemMatcher": [],
+            "presentation": { "reveal": "silent", "panel": "shared", "close": true }
         }
     ]
 }

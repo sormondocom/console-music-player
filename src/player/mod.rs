@@ -32,6 +32,31 @@ impl PlaybackState {
     }
 }
 
+/// Single-track repeat mode.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    /// Replay the current track automatically when it ends.
+    One,
+}
+
+impl RepeatMode {
+    pub fn toggle(&self) -> Self {
+        match self {
+            Self::Off => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Off => "  ",
+            Self::One => "🔂",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Player
 // ---------------------------------------------------------------------------
@@ -42,6 +67,7 @@ pub struct Player {
 
     pub current_track: Option<Track>,
     pub state: PlaybackState,
+    pub repeat: RepeatMode,
     /// Volume 0.0..=1.0
     pub volume: f32,
 
@@ -58,6 +84,7 @@ impl Player {
             sink: None,
             current_track: None,
             state: PlaybackState::Stopped,
+            repeat: RepeatMode::Off,
             volume: 0.8,
             started_at: None,
             elapsed_before_pause: Duration::ZERO,
@@ -66,21 +93,21 @@ impl Player {
 
     // --- transport ---
 
-    pub fn play(&mut self, track: &Track) {
+    /// Start playing `track`.
+    ///
+    /// Returns `Err(message)` with a user-facing description if playback
+    /// cannot start (missing audio device, unreadable file, unsupported
+    /// format, missing tracker feature, etc.).  On error the player is left
+    /// in the `Stopped` state.
+    pub fn play(&mut self, track: &Track) -> Result<(), String> {
         self.stop_internal();
 
         let Some(handle) = &self.handle else {
-            warn!("No audio output — playback unavailable.");
-            return;
+            return Err("No audio output device — playback unavailable.".into());
         };
 
-        let sink = match Sink::try_new(handle) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Cannot create audio sink: {e}");
-                return;
-            }
-        };
+        let sink = Sink::try_new(handle)
+            .map_err(|e| format!("Cannot create audio sink: {e}"))?;
 
         let ext = track
             .path
@@ -90,11 +117,9 @@ impl Player {
             .unwrap_or_default();
 
         if tracker::is_tracker_ext(&ext) {
-            if !self.play_tracker(track, &sink) {
-                return;
-            }
-        } else if !self.play_standard(track, &sink) {
-            return;
+            self.play_tracker(track, &sink)?;
+        } else {
+            self.play_standard(track, &sink)?;
         }
 
         self.sink = Some(sink);
@@ -104,64 +129,44 @@ impl Player {
         self.elapsed_before_pause = Duration::ZERO;
 
         info!("Playing: {} — {}", track.display_artist(), track.display_title());
+        Ok(())
     }
 
     /// Decode and append a standard audio file (MP3, FLAC, etc.) via rodio/symphonia.
-    fn play_standard(&self, track: &Track, sink: &Sink) -> bool {
-        let file = match File::open(&track.path) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("Cannot open {}: {e}", track.path.display());
-                return false;
-            }
-        };
-        let source = match Decoder::new(BufReader::new(file)) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Cannot decode {}: {e}", track.path.display());
-                return false;
-            }
-        };
+    fn play_standard(&self, track: &Track, sink: &Sink) -> Result<(), String> {
+        let file = File::open(&track.path)
+            .map_err(|e| format!("Cannot open '{}': {e}", track.path.display()))?;
+        let source = Decoder::new(BufReader::new(file))
+            .map_err(|e| format!("Cannot decode '{}': {e}", track.path.display()))?;
         sink.set_volume(self.volume);
         sink.append(source);
-        true
+        Ok(())
     }
 
     /// Decode and append a tracker module via libopenmpt.
-    fn play_tracker(&self, track: &Track, sink: &Sink) -> bool {
+    fn play_tracker(&self, track: &Track, sink: &Sink) -> Result<(), String> {
         #[cfg(feature = "tracker")]
         {
-            let data = match std::fs::read(&track.path) {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!("Cannot read tracker file {}: {e}", track.path.display());
-                    return false;
-                }
-            };
+            let data = std::fs::read(&track.path)
+                .map_err(|e| format!("Cannot read '{}': {e}", track.path.display()))?;
             match crate::tracker::TrackerSource::from_bytes(&data) {
                 Some(source) => {
                     sink.set_volume(self.volume);
                     sink.append(source);
-                    true
+                    Ok(())
                 }
-                None => {
-                    warn!(
-                        "libopenmpt could not parse tracker file: {}",
-                        track.path.display()
-                    );
-                    false
-                }
+                None => Err(format!(
+                    "libopenmpt could not parse '{}'",
+                    track.path.display()
+                )),
             }
         }
         #[cfg(not(feature = "tracker"))]
         {
-            warn!(
-                "Tracker playback is not compiled in. \
-                 Build with --features tracker and install libopenmpt."
-            );
-            let _ = track;
-            let _ = sink;
-            false
+            let _ = (track, sink);
+            Err("Tracker playback is not compiled in — \
+                 build with --features tracker and install libopenmpt."
+                .into())
         }
     }
 
@@ -230,10 +235,22 @@ impl Player {
         format!("{}{}", "█".repeat(filled), "░".repeat(empty))
     }
 
-    /// Called every tick — detects natural end-of-track.
+    /// Toggle single-track repeat on/off.
+    pub fn toggle_repeat(&mut self) {
+        self.repeat = self.repeat.toggle();
+    }
+
+    /// Called every tick — detects natural end-of-track and handles repeat.
     pub fn tick(&mut self) {
         if self.state == PlaybackState::Playing {
             if self.sink.as_ref().map(|s| s.empty()).unwrap_or(false) {
+                if self.repeat == RepeatMode::One {
+                    // Re-queue the same track without going through app state.
+                    if let Some(track) = self.current_track.clone() {
+                        let _ = self.play(&track);
+                        return;
+                    }
+                }
                 self.state = PlaybackState::Stopped;
                 self.started_at = None;
             }

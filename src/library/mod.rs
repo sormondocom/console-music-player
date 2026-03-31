@@ -1,4 +1,48 @@
+pub mod dedup;
 pub mod scanner;
+
+// ---------------------------------------------------------------------------
+// Sort order
+// ---------------------------------------------------------------------------
+
+/// Preset sort orders for the library list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortOrder {
+    #[default]
+    /// Artist → Album → Title  (the default scan order)
+    ArtistAlbumTitle,
+    /// Title alphabetical
+    Title,
+    /// Album → Track title
+    Album,
+    /// Longest first
+    DurationDesc,
+    /// Most recently added (highest inode / OS-assigned order, approximation)
+    DateAdded,
+}
+
+impl SortOrder {
+    /// Cycle to the next preset.
+    pub fn next(self) -> Self {
+        match self {
+            Self::ArtistAlbumTitle => Self::Title,
+            Self::Title            => Self::Album,
+            Self::Album            => Self::DurationDesc,
+            Self::DurationDesc     => Self::DateAdded,
+            Self::DateAdded        => Self::ArtistAlbumTitle,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ArtistAlbumTitle => "Artist / Album",
+            Self::Title            => "Title",
+            Self::Album            => "Album",
+            Self::DurationDesc     => "Duration ↓",
+            Self::DateAdded        => "Date Added",
+        }
+    }
+}
 
 use std::path::{Path, PathBuf};
 
@@ -95,6 +139,8 @@ pub struct Library {
     pub selected_index: usize,
     /// Name of the playlist currently loaded, if any.
     pub active_playlist: Option<String>,
+    /// Current sort preset applied to `tracks`.
+    pub sort_order: SortOrder,
 }
 
 impl Library {
@@ -104,6 +150,7 @@ impl Library {
             tracks,
             selected_index: 0,
             active_playlist: None,
+            sort_order: SortOrder::default(),
         }
     }
 
@@ -124,6 +171,52 @@ impl Library {
         self.tracks = self.all_tracks.clone();
         self.selected_index = 0;
         self.active_playlist = None;
+        self.apply_sort();
+    }
+
+    /// Advance to the next sort preset and re-sort the displayed list.
+    pub fn cycle_sort(&mut self) {
+        self.sort_order = self.sort_order.next();
+        self.apply_sort();
+        self.selected_index = 0;
+    }
+
+    /// Re-sort `tracks` according to the current `sort_order`.
+    pub fn apply_sort(&mut self) {
+        match self.sort_order {
+            SortOrder::ArtistAlbumTitle => {
+                self.tracks.sort_by(|a, b| {
+                    a.artist.cmp(&b.artist)
+                        .then_with(|| a.album.cmp(&b.album))
+                        .then_with(|| a.title.cmp(&b.title))
+                });
+            }
+            SortOrder::Title => {
+                self.tracks.sort_by(|a, b| a.title.cmp(&b.title));
+            }
+            SortOrder::Album => {
+                self.tracks.sort_by(|a, b| {
+                    a.album.cmp(&b.album).then_with(|| a.title.cmp(&b.title))
+                });
+            }
+            SortOrder::DurationDesc => {
+                self.tracks.sort_by(|a, b| {
+                    b.duration_secs.cmp(&a.duration_secs)
+                });
+            }
+            SortOrder::DateAdded => {
+                // Best available proxy on all platforms: file modification time.
+                // Newer files sort first.
+                self.tracks.sort_by(|a, b| {
+                    let mt = |p: &std::path::PathBuf| {
+                        std::fs::metadata(p)
+                            .and_then(|m| m.modified())
+                            .ok()
+                    };
+                    mt(&b.path).cmp(&mt(&a.path))
+                });
+            }
+        }
     }
 
     pub fn selected(&self) -> Option<&Track> {
@@ -140,6 +233,15 @@ impl Library {
         if self.selected_index + 1 < self.tracks.len() {
             self.selected_index += 1;
         }
+    }
+
+    pub fn page_up(&mut self, page: usize) {
+        self.selected_index = self.selected_index.saturating_sub(page);
+    }
+
+    pub fn page_down(&mut self, page: usize) {
+        let max = self.tracks.len().saturating_sub(1);
+        self.selected_index = (self.selected_index + page).min(max);
     }
 
     /// Write `edit` to the audio file at `path` and update the matching

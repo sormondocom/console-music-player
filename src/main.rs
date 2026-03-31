@@ -35,6 +35,53 @@ use config::Config;
 // CLI args
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tracker DLL probe (Windows + MSVC + tracker feature only)
+// ---------------------------------------------------------------------------
+// openmpt.dll is delay-loaded (see build.rs), so the process starts even when
+// the DLL is absent. We probe here in main() and exit cleanly with install
+// instructions instead of crashing on the first tracker call.
+
+#[cfg(all(feature = "tracker", target_os = "windows"))]
+fn check_openmpt_dll() {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    extern "system" {
+        fn LoadLibraryW(lpLibFileName: *const u16) -> *mut std::ffi::c_void;
+        fn FreeLibrary(hModule: *mut std::ffi::c_void) -> i32;
+    }
+
+    let name: Vec<u16> = OsStr::new("libopenmpt.dll")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let h = unsafe { LoadLibraryW(name.as_ptr()) };
+    if h.is_null() {
+        eprintln!(
+            "\nconsole-music-player: tracker feature is enabled but \
+             libopenmpt.dll was not found.\n\
+             \n\
+             To fix this, copy libopenmpt.dll into the same directory as cmp.exe:\n\
+             \n\
+             {}\n\
+             \n\
+             Download the Windows package from https://lib.openmpt.org/libopenmpt/download/\n\
+             or see README.md for full instructions.\n\
+             \n\
+             To run without tracker support, build with:\n\
+               cargo run --no-default-features",
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                .unwrap_or_else(|| "<exe directory>".into())
+        );
+        std::process::exit(1);
+    }
+    unsafe { FreeLibrary(h) };
+}
+
 fn parse_initial_library_arg() -> Option<PathBuf> {
     let mut args = std::env::args().skip(1);
     loop {
@@ -81,6 +128,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     cfg.save();
+
+    // On Windows, libopenmpt.dll is a load-time dependency when the tracker
+    // feature is enabled. If the DLL is absent the OS loader will abort the
+    // process before reaching main(), so we probe for it here first and give
+    // the user an actionable message rather than a cryptic crash.
+    #[cfg(all(feature = "tracker", target_os = "windows"))]
+    check_openmpt_dll();
 
     let _audio_stream = rodio::OutputStream::try_default().ok();
     let audio_handle = _audio_stream.as_ref().map(|(_, h)| h.clone());
@@ -145,10 +199,14 @@ async fn run_event_loop(
 // Key dispatch
 // ---------------------------------------------------------------------------
 
+/// Number of items to jump on PageUp / PageDown.
+const PAGE_SIZE: usize = 10;
+
 fn handle_key(app: &mut App, key: KeyCode) {
     match app.screen {
         Screen::Library         => handle_library_key(app, key),
         Screen::EditTrack       => handle_edit_key(app, key),
+        Screen::Dedup           => handle_dedup_key(app, key),
         Screen::Sources         => handle_sources_key(app, key),
         Screen::AddSource       => handle_text_input_key(app, key, |app| {
             let path = PathBuf::from(app.input_buffer.trim());
@@ -187,6 +245,12 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
             Focus::Library => { app.library.move_down(); app.reset_marquee(); }
             Focus::Devices => app.move_device_down(),
         },
+        KeyCode::PageUp => {
+            if app.focus == Focus::Library { app.library.page_up(PAGE_SIZE); app.reset_marquee(); }
+        }
+        KeyCode::PageDown => {
+            if app.focus == Focus::Library { app.library.page_down(PAGE_SIZE); app.reset_marquee(); }
+        }
 
         KeyCode::Char(' ') => {
             if app.focus == Focus::Library {
@@ -229,6 +293,95 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
                 app.begin_edit();
             }
         }
+        KeyCode::Char('f') | KeyCode::Char('F') => app.begin_dedup(),
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            app.player.toggle_repeat();
+            let label = match app.player.repeat {
+                crate::player::RepeatMode::Off => "Repeat off.",
+                crate::player::RepeatMode::One => "Repeat one — track will loop.",
+            };
+            app.status_message = Some(label.into());
+        }
+        KeyCode::Char('z') | KeyCode::Char('Z') => {
+            app.library.cycle_sort();
+            app.status_message = Some(format!(
+                "Sort: {}",
+                app.library.sort_order.label()
+            ));
+        }
+
+        _ => {}
+    }
+}
+
+fn handle_dedup_key(app: &mut App, key: KeyCode) {
+    use crate::app::DedupFocus;
+    match key {
+        KeyCode::Esc => app.cancel_dedup(),
+        KeyCode::Enter => app.apply_dedup(),
+
+        KeyCode::Tab => {
+            if let Some(state) = &mut app.dedup_state {
+                state.focus = match state.focus {
+                    DedupFocus::Groups     => DedupFocus::Candidates,
+                    DedupFocus::Candidates => DedupFocus::Groups,
+                };
+            }
+        }
+
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(state) = &mut app.dedup_state {
+                match state.focus {
+                    DedupFocus::Groups     => state.move_group_up(),
+                    DedupFocus::Candidates => state.move_candidate_up(),
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(state) = &mut app.dedup_state {
+                match state.focus {
+                    DedupFocus::Groups     => state.move_group_down(),
+                    DedupFocus::Candidates => state.move_candidate_down(),
+                }
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(state) = &mut app.dedup_state {
+                for _ in 0..PAGE_SIZE {
+                    match state.focus {
+                        DedupFocus::Groups     => state.move_group_up(),
+                        DedupFocus::Candidates => state.move_candidate_up(),
+                    }
+                }
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(state) = &mut app.dedup_state {
+                for _ in 0..PAGE_SIZE {
+                    match state.focus {
+                        DedupFocus::Groups     => state.move_group_down(),
+                        DedupFocus::Candidates => state.move_candidate_down(),
+                    }
+                }
+            }
+        }
+
+        // Cycle action for the focused candidate
+        KeyCode::Char(' ') => {
+            if let Some(state) = &mut app.dedup_state {
+                if state.focus == DedupFocus::Candidates {
+                    state.toggle_focused_action();
+                }
+            }
+        }
+
+        // Auto-suggest across all groups
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            if let Some(state) = &mut app.dedup_state {
+                state.auto_suggest_all();
+                app.status_message = Some("Auto-suggested actions applied.".into());
+            }
+        }
 
         _ => {}
     }
@@ -254,6 +407,8 @@ fn handle_device_tracks_key(app: &mut App, key: KeyCode) {
         KeyCode::Esc | KeyCode::Char('q') => app.screen = Screen::Library,
         KeyCode::Up   | KeyCode::Char('k') => app.device_tracks_move_up(),
         KeyCode::Down | KeyCode::Char('j') => app.device_tracks_move_down(),
+        KeyCode::PageUp   => app.device_tracks_page_up(PAGE_SIZE),
+        KeyCode::PageDown => app.device_tracks_page_down(PAGE_SIZE),
         _ => {}
     }
 }
@@ -267,6 +422,8 @@ fn handle_repair_key(app: &mut App, key: KeyCode) {
         KeyCode::Char('f') | KeyCode::Char('F') => app.repair_all_issues(),
         KeyCode::Up | KeyCode::Char('k')  => app.repair_move_up(),
         KeyCode::Down | KeyCode::Char('j') => app.repair_move_down(),
+        KeyCode::PageUp   => app.repair_page_up(PAGE_SIZE),
+        KeyCode::PageDown => app.repair_page_down(PAGE_SIZE),
         _ => {}
     }
 }
@@ -276,6 +433,8 @@ fn handle_sources_key(app: &mut App, key: KeyCode) {
         KeyCode::Esc | KeyCode::Char('q') => app.screen = Screen::Library,
         KeyCode::Up | KeyCode::Char('k')  => app.sources_move_up(),
         KeyCode::Down | KeyCode::Char('j') => app.sources_move_down(),
+        KeyCode::PageUp   => app.sources_page_up(PAGE_SIZE),
+        KeyCode::PageDown => app.sources_page_down(PAGE_SIZE),
         KeyCode::Char('a') | KeyCode::Char('A') => {
             app.input_buffer.clear();
             app.screen = Screen::AddSource;
@@ -293,6 +452,8 @@ fn handle_playlists_key(app: &mut App, key: KeyCode) {
         KeyCode::Esc | KeyCode::Char('q') => app.screen = Screen::Library,
         KeyCode::Up | KeyCode::Char('k')  => app.playlists_move_up(),
         KeyCode::Down | KeyCode::Char('j') => app.playlists_move_down(),
+        KeyCode::PageUp   => app.playlists_page_up(PAGE_SIZE),
+        KeyCode::PageDown => app.playlists_page_down(PAGE_SIZE),
         KeyCode::Enter                    => app.load_selected_playlist(),
         KeyCode::Delete                   => app.delete_selected_playlist(),
         _ => {}
