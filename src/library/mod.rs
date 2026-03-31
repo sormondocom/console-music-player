@@ -33,6 +33,8 @@ pub enum SortOrder {
     GroupByYear,
     /// Grouped sections by month the file was added (mtime year + month).
     GroupByMonth,
+    /// Grouped sections by the track's first user-defined tag.
+    GroupByTag,
 }
 
 impl Default for SortOrder {
@@ -52,7 +54,8 @@ impl SortOrder {
             Self::GroupByExtension => Self::GroupByArtist,
             Self::GroupByArtist    => Self::GroupByYear,
             Self::GroupByYear      => Self::GroupByMonth,
-            Self::GroupByMonth     => Self::Original,
+            Self::GroupByMonth     => Self::GroupByTag,
+            Self::GroupByTag       => Self::Original,
         }
     }
 
@@ -68,6 +71,7 @@ impl SortOrder {
             Self::GroupByArtist    => "Group by Artist",
             Self::GroupByYear      => "Group by Year",
             Self::GroupByMonth     => "Group by Month",
+            Self::GroupByTag       => "Group by Tag",
         }
     }
 
@@ -77,6 +81,7 @@ impl SortOrder {
             self,
             Self::GroupByExtension | Self::GroupByArtist
             | Self::GroupByYear    | Self::GroupByMonth
+            | Self::GroupByTag
         )
     }
 
@@ -122,6 +127,7 @@ impl SortOrder {
                     }
                 })
             }
+            Self::GroupByTag => None, // handled by Library::section_key which has tag_sort_keys access
             _ => None,
         }
     }
@@ -143,6 +149,7 @@ fn unix_year_month(secs: u64) -> (i32, u32) {
     (year as i32, month)
 }
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::media::{MediaCapability, MediaFormat, MediaItem};
@@ -242,6 +249,8 @@ pub struct Library {
     pub sort_order: SortOrder,
     /// Paths in the original scan order — used to restore `SortOrder::Original`.
     original_paths: Vec<PathBuf>,
+    /// Primary tag per path, precomputed for GroupByTag sorting/sections.
+    tag_sort_keys: HashMap<PathBuf, String>,
 }
 
 impl Library {
@@ -254,6 +263,7 @@ impl Library {
             active_playlist: None,
             sort_order: SortOrder::default(),
             original_paths,
+            tag_sort_keys: HashMap::new(),
         }
     }
 
@@ -375,6 +385,39 @@ impl Library {
                     .then_with(|| a.title.cmp(&b.title))
                 });
             }
+            SortOrder::GroupByTag => {
+                // Clone to avoid simultaneous mutable/immutable borrow of self.
+                let tag_keys = self.tag_sort_keys.clone();
+                self.tracks.sort_by(|a, b| {
+                    // Untagged entries sort after all tagged groups.
+                    let ka = tag_keys.get(&a.path).map(String::as_str).unwrap_or("\u{FFFF}");
+                    let kb = tag_keys.get(&b.path).map(String::as_str).unwrap_or("\u{FFFF}");
+                    ka.cmp(kb)
+                        .then_with(|| a.artist.cmp(&b.artist))
+                        .then_with(|| a.title.cmp(&b.title))
+                });
+            }
+        }
+    }
+
+    /// Update the tag sort keys (called whenever the tag store changes).
+    pub fn set_tag_sort_keys(&mut self, keys: HashMap<PathBuf, String>) {
+        self.tag_sort_keys = keys;
+    }
+
+    /// Return the section header key for `track` under the current sort order.
+    /// Handles `GroupByTag` (which needs `tag_sort_keys`) in addition to all
+    /// `SortOrder::section_key` variants.
+    pub fn section_key(&self, track: &Track) -> Option<String> {
+        if self.sort_order == SortOrder::GroupByTag {
+            Some(
+                self.tag_sort_keys
+                    .get(&track.path)
+                    .cloned()
+                    .unwrap_or_else(|| "Untagged".into()),
+            )
+        } else {
+            self.sort_order.section_key(track)
         }
     }
 

@@ -9,7 +9,7 @@
             "options": {
                 "env": { "CARGO_TARGET_DIR": "${workspaceFolder}/target" }
             },
-            "group": { "kind": "build", "isDefault": true },
+            "group": "build",
             "problemMatcher": "$rustc",
             "presentation": { "reveal": "silent", "panel": "shared" }
         },
@@ -20,7 +20,7 @@
             "options": {
                 "env": { "CARGO_TARGET_DIR": "${workspaceFolder}/target" }
             },
-            "group": "build",
+            "group": { "kind": "build", "isDefault": true },
             "problemMatcher": "$rustc",
             "presentation": { "reveal": "silent", "panel": "shared" }
         },
@@ -48,7 +48,7 @@
                 "env": { "CARGO_TARGET_DIR": "${workspaceFolder}/target" }
             },
             "command": "cargo build; $exe = '${workspaceFolder}\\target\\debug\\cmp.exe'; Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)",
-            "group": { "kind": "test", "isDefault": true },
+            "group": "test",
             "problemMatcher": [],
             "presentation": { "reveal": "silent", "panel": "shared", "close": true }
         },
@@ -60,7 +60,7 @@
                 "env": { "CARGO_TARGET_DIR": "${workspaceFolder}/target" }
             },
             "command": "cargo build --features tracker; $exe = '${workspaceFolder}\\target\\debug\\cmp.exe'; Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)",
-            "group": "test",
+            "group": { "kind": "test", "isDefault": true },
             "problemMatcher": [],
             "presentation": { "reveal": "silent", "panel": "shared", "close": true }
         },

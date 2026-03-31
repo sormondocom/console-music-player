@@ -4,12 +4,14 @@ use humansize::{format_size, DECIMAL};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap,
     },
     Frame,
 };
+
+use std::path::PathBuf;
 
 use crate::app::{App, DedupFocus, EditState, Focus, Screen, EDIT_FIELD_LABELS};
 use crate::library::dedup::{DedupAction, DuplicateKind};
@@ -64,6 +66,11 @@ pub fn render(app: &App, frame: &mut Frame) {
             }
         }
         Screen::Dedup => render_dedup(app, frame, body_area),
+    }
+
+    // Tag edit overlay (renders on top of whatever screen is active)
+    if app.tag_edit_state.is_some() {
+        render_tag_edit_overlay(app, frame, body_area);
     }
 }
 
@@ -249,7 +256,6 @@ fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
     // are injected between groups.  Headers are not selectable, so we track a
     // separate visual_selected index that accounts for the offsets.
     let use_sections = app.library.sort_order.has_sections();
-    let sort_order   = app.library.sort_order;
 
     let mut items: Vec<ListItem> = Vec::with_capacity(app.library.tracks.len() + 8);
     let mut visual_selected: usize = app.library.selected_index;
@@ -258,7 +264,7 @@ fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
     for (i, track) in app.library.tracks.iter().enumerate() {
         // Inject a section header whenever the group key changes.
         if use_sections {
-            if let Some(key) = sort_order.section_key(track) {
+            if let Some(key) = app.library.section_key(track) {
                 if last_key.as_deref() != Some(&key) {
                     let dashes = "─".repeat(avail.saturating_sub(key.len() + 4));
                     let header_text = format!("── {key} {dashes}");
@@ -277,19 +283,24 @@ fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
         let is_focused = i == app.library.selected_index;
         let selected   = app.is_track_selected(i);
         let marker     = if selected { "◆ " } else { "  " };
-        let full       = track.info_line();
 
-        let display = if is_focused && full.chars().count() > avail {
+        // Compute badge spans and their total character width.
+        let (badge_spans, badge_width) = build_badges(app, &track.path);
+        let main_avail = avail.saturating_sub(badge_width);
+
+        let full = track.info_line();
+
+        let display = if is_focused && full.chars().count() > main_avail {
             let scroll = if app.marquee_tick > MARQUEE_DELAY {
                 ((app.marquee_tick - MARQUEE_DELAY) / MARQUEE_SPEED) as usize
             } else {
                 0
             };
-            let max_scroll = full.chars().count().saturating_sub(avail);
+            let max_scroll = full.chars().count().saturating_sub(main_avail);
             let offset = scroll.min(max_scroll);
-            full.chars().skip(offset).take(avail).collect::<String>()
+            full.chars().skip(offset).take(main_avail).collect::<String>()
         } else {
-            truncate(&full, avail)
+            truncate(&full, main_avail)
         };
 
         let (title_color, meta_color) = if is_focused {
@@ -298,27 +309,29 @@ fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
             (Color::White, CLR_DIM)
         };
 
-        let line = if let Some(sep) = display.find("  ·  ") {
+        if let Some(sep) = display.find("  ·  ") {
             let (title_part, rest) = display.split_at(sep);
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     marker,
                     Style::default().fg(if selected { CLR_SELECTED } else { Color::Reset }),
                 ),
                 Span::styled(title_part.to_string(), Style::default().fg(title_color).bold()),
                 Span::styled(rest.to_string(), Style::default().fg(meta_color)),
-            ])
+            ];
+            spans.extend(badge_spans);
+            items.push(ListItem::new(Line::from(spans)));
         } else {
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     marker,
                     Style::default().fg(if selected { CLR_SELECTED } else { Color::Reset }),
                 ),
                 Span::styled(display, Style::default().fg(title_color)),
-            ])
+            ];
+            spans.extend(badge_spans);
+            items.push(ListItem::new(Line::from(spans)));
         };
-
-        items.push(ListItem::new(line));
     }
 
     let mut state = ListState::default();
@@ -593,8 +606,9 @@ fn render_functions_pane(_app: &App, frame: &mut Frame, area: Rect) {
         Line::from(vec![key("S"), label("Sources  "), key("L"), label("Playlists")]),
         Line::from(vec![key("W"), label("Save PL  "), key("D"), label("Rescan devs")]),
         Line::from(vec![key("E"), label("Edit tags"), key("R"), label("Rescan")]),
-        Line::from(vec![key("F"), label("Find dupes"), key("Z"), label("Sort")]),
-        Line::from(vec![key("O"), label("Repeat one"), key("V"), label("Waveform")]),
+        Line::from(vec![key("F"), label("Find dupes"), key("G"), label("Tag")]),
+        Line::from(vec![key("Z"), label("Sort      "), key("O"), label("Repeat")]),
+        Line::from(vec![key("V"), label("Waveform")]),
         Line::from(vec![key("Q"), label("Quit")]),
     ];
 
@@ -1246,4 +1260,154 @@ fn truncate(s: &str, max_chars: usize) -> String {
         let t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{t}…")
     }
+}
+
+/// Build playlist + tag badge spans for a track, plus their total display width.
+///
+/// Playlist badges look like: `‹Name›` in blue
+/// Tag badges look like:       `#name`  in magenta
+fn build_badges<'a>(app: &'a App, path: &PathBuf) -> (Vec<Span<'a>>, usize) {
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut width: usize = 0;
+
+    // Playlist badges — cap at 2, show "+N" overflow indicator.
+    let playlists: &[String] = app.playlist_membership
+        .get(path)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let shown_pl = playlists.len().min(2);
+    for (i, pl) in playlists.iter().take(shown_pl).enumerate() {
+        if i > 0 { spans.push(Span::raw(" ")); width += 1; }
+        let badge = format!("‹{pl}›");
+        width += badge.chars().count();
+        spans.push(Span::styled(badge, Style::default().fg(Color::Blue).bold()));
+    }
+    if playlists.len() > 2 {
+        let more = format!("+{}", playlists.len() - 2);
+        spans.push(Span::raw(" "));
+        width += 1 + more.len();
+        spans.push(Span::styled(more, Style::default().fg(Color::Blue)));
+    }
+
+    // Tag badges — cap at 3, show "+N" overflow.
+    let tags = app.tag_store.tags_for(path);
+    if !tags.is_empty() {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+            width += 2;
+        }
+        let shown_tags = tags.len().min(3);
+        for (i, tag) in tags.iter().take(shown_tags).enumerate() {
+            if i > 0 { spans.push(Span::raw(" ")); width += 1; }
+            let badge = format!("#{tag}");
+            width += badge.chars().count();
+            spans.push(Span::styled(badge, Style::default().fg(Color::Magenta)));
+        }
+        if tags.len() > 3 {
+            let more = format!("+{}", tags.len() - 3);
+            spans.push(Span::raw(" "));
+            width += 1 + more.len();
+            spans.push(Span::styled(more, Style::default().fg(Color::Magenta)));
+        }
+    }
+
+    if !spans.is_empty() {
+        spans.insert(0, Span::raw("  "));
+        width += 2;
+    }
+
+    (spans, width)
+}
+
+// ---------------------------------------------------------------------------
+// Tag edit overlay
+// ---------------------------------------------------------------------------
+
+fn render_tag_edit_overlay(app: &App, frame: &mut Frame, parent: Rect) {
+    let Some(state) = &app.tag_edit_state else { return };
+
+    // Center the overlay: 60% wide, 12 rows tall.
+    let width  = (parent.width  * 60 / 100).max(50);
+    let height = 12u16;
+    let x = parent.x + (parent.width.saturating_sub(width))  / 2;
+    let y = parent.y + (parent.height.saturating_sub(height)) / 2;
+    let area = Rect { x, y, width, height };
+
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Tag Editor ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title_style(Style::default().fg(Color::Magenta).bold());
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Track display name
+    let name_line = Line::from(Span::styled(
+        truncate(&state.display_name, inner.width as usize),
+        Style::default().fg(Color::White).bold(),
+    ));
+
+    // Current tags as badges
+    let current_tags = app.tag_store.tags_for(&state.path);
+    let tag_spans: Vec<Span> = if current_tags.is_empty() {
+        vec![Span::styled("  (none)", Style::default().fg(CLR_DIM))]
+    } else {
+        let mut s = vec![Span::raw("  ")];
+        for (i, tag) in current_tags.iter().enumerate() {
+            if i > 0 { s.push(Span::raw("  ")); }
+            s.push(Span::styled(
+                format!("#{tag}"),
+                Style::default().fg(Color::Magenta).bold(),
+            ));
+        }
+        s
+    };
+    let tags_label = Line::from(vec![
+        Span::styled("Tags: ", Style::default().fg(CLR_DIM)),
+    ]);
+    let tags_line = Line::from(tag_spans);
+
+    // Input field
+    let input_label = Line::from(Span::styled(
+        "Edit (comma-separated):",
+        Style::default().fg(CLR_DIM),
+    ));
+    let input_w = inner.width.saturating_sub(4) as usize;
+    let input_display = if state.input.chars().count() > input_w {
+        let skip = state.input.chars().count() - input_w;
+        state.input.chars().skip(skip).collect::<String>()
+    } else {
+        state.input.clone()
+    };
+    let cursor = format!("{input_display}▌");
+    let input_line = Line::from(Span::styled(
+        format!(" {} ", cursor),
+        Style::default().fg(Color::White).bg(Color::DarkGray),
+    ));
+
+    // Controls
+    let ctrl = Line::from(vec![
+        Span::styled("[Enter]", Style::default().fg(Color::Magenta).bold()),
+        Span::raw(" Save  "),
+        Span::styled("[Esc]", Style::default().fg(CLR_DIM).bold()),
+        Span::raw(" Cancel"),
+    ]);
+
+    let content = Text::from(vec![
+        name_line,
+        Line::default(),
+        tags_label,
+        tags_line,
+        Line::default(),
+        input_label,
+        input_line,
+        Line::default(),
+        ctrl,
+    ]);
+
+    frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), inner);
 }

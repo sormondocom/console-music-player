@@ -1,0 +1,18 @@
+# Workspace-level Cargo configuration.
+
+# ---------------------------------------------------------------------------
+# Android / Termux
+# ---------------------------------------------------------------------------
+#
+# libopenmpt is a C++ library.  On Android the only available C++ runtime is
+# the *shared* one (libc++_shared.so).  The openmpt crate's build script may
+# emit a link directive for c++_static, which doesn't exist in Termux's NDK.
+# Adding c++_shared here ensures the linker finds it, and because the shared
+# variant satisfies the dependency the static-search error disappears.
+#
+# To build with tracker support on Termux:
+#   pkg install libopenmpt
+#   cargo build --features tracker
+
+[target.'cfg(target_os = "android")']
+rustflags = ["-C", "link-arg=-lc++_shared"]

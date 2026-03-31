@@ -1,5 +1,6 @@
 //! Top-level application state.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,8 +13,10 @@ use crate::device::MusicDevice;
 use crate::library::dedup::{self, DedupAction, DuplicateGroup};
 use crate::library::scanner;
 use crate::library::{Library, TrackEdit};
+use crate::media::MediaItem;
 use crate::player::Player;
 use crate::playlist::{ConflictCtx, Playlist};
+use crate::tags::TagStore;
 use crate::transfer::{TransferEngine, TransferEvent};
 
 // ---------------------------------------------------------------------------
@@ -154,6 +157,16 @@ impl DedupState {
     }
 }
 
+/// State for the tag-editing overlay.
+#[derive(Debug)]
+pub struct TagEditState {
+    pub path: PathBuf,
+    /// "Artist — Title" shown in the overlay header.
+    pub display_name: String,
+    /// Comma-separated tag string being edited.
+    pub input: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Focus {
     Library,
@@ -214,6 +227,13 @@ pub struct App {
     /// When `true`, the library pane is replaced by the oscilloscope.
     pub waveform_active: bool,
 
+    // --- tags ---
+    pub tag_store: TagStore,
+    /// Reverse index: track path → playlists that contain it.
+    pub playlist_membership: HashMap<PathBuf, Vec<String>>,
+    /// Active tag-editing overlay, if any.
+    pub tag_edit_state: Option<TagEditState>,
+
     // --- marquee scrolling ---
     /// Monotonically incrementing tick counter, reset whenever the focused
     /// library track changes.  The UI computes the scroll offset from this.
@@ -248,8 +268,13 @@ impl App {
             dedup_state: None,
             waveform_active: false,
             marquee_tick: 0,
+            tag_store: TagStore::load(),
+            playlist_membership: HashMap::new(),
+            tag_edit_state: None,
         };
         app.rescan();
+        app.rebuild_playlist_membership();
+        app.sync_tag_sort_keys();
         app
     }
 
@@ -271,6 +296,8 @@ impl App {
                     "Scanned {} source(s) — {n} tracks.",
                     self.source_dirs.len()
                 ));
+                self.rebuild_playlist_membership();
+                self.sync_tag_sort_keys();
             }
             Err(e) => self.status_message = Some(format!("Scan error: {e}")),
         }
@@ -382,6 +409,7 @@ impl App {
             Ok(_) => {
                 self.status_message = Some(format!("Deleted playlist '{name}'."));
                 self.refresh_playlist_names();
+                self.rebuild_playlist_membership();
             }
             Err(e) => self.status_message = Some(format!("Delete failed: {e}")),
         }
@@ -427,6 +455,7 @@ impl App {
                     self.clear_selection();
                     self.status_message = Some(format!("Playlist '{name}' saved."));
                     self.screen = Screen::Library;
+                    self.rebuild_playlist_membership();
                 }
                 Err(e) => {
                     self.status_message = Some(format!("Save failed: {e}"));
@@ -873,6 +902,69 @@ impl App {
         self.dedup_state = None;
         self.screen = Screen::Library;
         self.status_message = Some("Deduplication cancelled — no files deleted.".into());
+    }
+
+    // --- tags ---
+
+    /// Rebuild the path → [playlist name, …] reverse index from all saved playlists.
+    pub fn rebuild_playlist_membership(&mut self) {
+        let names = crate::playlist::Playlist::list_all();
+        let mut membership: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        for name in &names {
+            if let Ok(pl) = crate::playlist::Playlist::load(name) {
+                for path in pl.tracks {
+                    membership.entry(path).or_default().push(name.clone());
+                }
+            }
+        }
+        self.playlist_membership = membership;
+    }
+
+    /// Sync first-tag-per-track keys into the library (for GroupByTag sort/sections).
+    pub fn sync_tag_sort_keys(&mut self) {
+        let keys: HashMap<PathBuf, String> = self.library.all_tracks.iter()
+            .filter_map(|t| {
+                self.tag_store.tags_for(&t.path).into_iter().next()
+                    .map(|first| (t.path.clone(), first))
+            })
+            .collect();
+        self.library.set_tag_sort_keys(keys);
+    }
+
+    /// Open the tag-editing overlay for the currently focused track.
+    pub fn begin_tag_edit(&mut self) {
+        if let Some(track) = self.library.selected() {
+            let current = self.tag_store.tags_for(&track.path).join(", ");
+            let display_name = format!("{} — {}", track.display_artist(), track.display_title());
+            self.tag_edit_state = Some(TagEditState {
+                path: track.path.clone(),
+                display_name,
+                input: current,
+            });
+        }
+    }
+
+    /// Confirm and save the tag edit.
+    pub fn confirm_tag_edit(&mut self) {
+        if let Some(state) = self.tag_edit_state.take() {
+            let tags: Vec<String> = state.input
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            self.tag_store.set_tags(&state.path, tags);
+            self.tag_store.save();
+            self.sync_tag_sort_keys();
+            if self.library.sort_order == crate::library::SortOrder::GroupByTag {
+                self.library.apply_sort();
+            }
+            self.status_message = Some("Tags saved.".into());
+        }
+    }
+
+    /// Cancel the tag edit without saving.
+    pub fn cancel_tag_edit(&mut self) {
+        self.tag_edit_state = None;
     }
 
     // --- tick ---

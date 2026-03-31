@@ -9,6 +9,7 @@ mod library;
 mod media;
 mod player;
 mod playlist;
+mod tags;
 mod tracker;
 mod transfer;
 mod ui;
@@ -204,6 +205,12 @@ async fn run_event_loop(
 const PAGE_SIZE: usize = 10;
 
 fn handle_key(app: &mut App, key: KeyCode) {
+    // Tag edit overlay intercepts all keys.
+    if app.tag_edit_state.is_some() {
+        handle_tag_edit_key(app, key);
+        return;
+    }
+
     match app.screen {
         Screen::Library         => handle_library_key(app, key),
         Screen::EditTrack       => handle_edit_key(app, key),
@@ -301,6 +308,7 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
             }
         }
         KeyCode::Char('f') | KeyCode::Char('F') => app.begin_dedup(),
+        KeyCode::Char('g') | KeyCode::Char('G') => app.begin_tag_edit(),
         KeyCode::Char('v') | KeyCode::Char('V') => {
             app.waveform_active = !app.waveform_active;
         }
@@ -487,6 +495,24 @@ fn handle_transfer_key(app: &mut App, key: KeyCode) {
         KeyCode::Char('q') | KeyCode::Char('Q') => app.running = false,
         KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('L') => {
             app.screen = Screen::Library;
+        }
+        _ => {}
+    }
+}
+
+fn handle_tag_edit_key(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Enter => app.confirm_tag_edit(),
+        KeyCode::Esc   => app.cancel_tag_edit(),
+        KeyCode::Backspace => {
+            if let Some(state) = &mut app.tag_edit_state {
+                state.input.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(state) = &mut app.tag_edit_state {
+                state.input.push(c);
+            }
         }
         _ => {}
     }

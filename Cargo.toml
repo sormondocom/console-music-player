@@ -17,6 +17,8 @@ path = "src/main.rs"
 default = ["tracker"]
 # Enables MOD/XM/IT/S3M playback via libopenmpt.
 # Requires libopenmpt to be installed — see README.md.
+# On Windows: DLLs are bundled in deps/ and copied by build.rs.
+# On Android/Termux without libopenmpt: cargo build --no-default-features
 tracker = ["dep:openmpt"]
 
 [dependencies]
