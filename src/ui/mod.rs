@@ -13,7 +13,7 @@ use ratatui::{
 
 use std::path::PathBuf;
 
-use crate::app::{App, DedupFocus, EditState, Focus, Screen, EDIT_FIELD_LABELS};
+use crate::app::{AmazonFocus, AmazonOverlay, App, DedupFocus, EditState, Focus, Screen, EDIT_FIELD_LABELS};
 use crate::library::dedup::{DedupAction, DuplicateKind};
 use crate::media::MediaItem;
 use crate::player::PlaybackState;
@@ -66,6 +66,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             }
         }
         Screen::Dedup => render_dedup(app, frame, body_area),
+        Screen::Amazon => render_amazon(app, frame, body_area),
     }
 
     // Tag edit overlay (renders on top of whatever screen is active)
@@ -123,6 +124,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         Screen::DeviceTracks => " [↑↓] Navigate  [Esc/Q] Back",
         Screen::EditTrack => " [Tab/↑↓] Next field  [Enter] Save  [Esc] Cancel",
         Screen::Dedup => " [Tab] Panel  [↑↓] Navigate  [Space] Cycle action  [A] Auto  [Enter] Apply  [Esc] Cancel",
+        Screen::Amazon => " [Tab] Pane  [↑↓] Navigate  [D] Download  [R] Refresh  [Esc] Back",
     };
 
     let status = app.status_message.as_deref().unwrap_or(help);
@@ -1404,6 +1406,222 @@ fn render_tag_edit_overlay(app: &App, frame: &mut Frame, parent: Rect) {
         tags_line,
         Line::default(),
         input_label,
+        input_line,
+        Line::default(),
+        ctrl,
+    ]);
+
+    frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Music easter egg
+// ---------------------------------------------------------------------------
+
+fn render_amazon(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(state) = &app.amazon_state else { return };
+
+    // If an overlay is active, render it over a blank background.
+    if let Some(ov) = &state.overlay {
+        render_amazon_overlay(app, ov, frame, area);
+        return;
+    }
+
+    // Split into left (Amazon catalog) and right (local library) panes.
+    let [left_area, right_area] = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Percentage(50),
+    ])
+    .areas(area);
+
+    // ── Left: Amazon catalog ────────────────────────────────────────────────
+
+    let catalog_focused = state.focus == AmazonFocus::Catalog;
+    let catalog_border_style = if catalog_focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(CLR_DIM)
+    };
+
+    let catalog_title = if state.loading {
+        " Amazon Music  [loading…] "
+    } else {
+        " Amazon Music "
+    };
+
+    let catalog_block = Block::default()
+        .title(catalog_title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(catalog_border_style);
+
+    let inner_left = catalog_block.inner(left_area);
+    frame.render_widget(catalog_block, left_area);
+
+    // Status bar at the bottom of the catalog pane.
+    let [catalog_list_area, catalog_status_area] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(inner_left);
+
+    if !state.status.is_empty() {
+        let status_line = Line::from(vec![Span::styled(
+            state.status.as_str(),
+            Style::default().fg(CLR_DIM),
+        )]);
+        frame.render_widget(Paragraph::new(status_line), catalog_status_area);
+    }
+
+    // Track rows.
+    let items: Vec<ListItem> = state
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(i, track)| {
+            let indicator = if state.completed.contains(&track.asin) {
+                Span::styled("✓ ", Style::default().fg(CLR_SUCCESS))
+            } else if state.downloading.contains(&track.asin) {
+                // Show progress percentage if available.
+                let pct = state.progress.get(&track.asin).map(|(b, t)| {
+                    t.map(|total| if total > 0 { *b * 100 / total } else { 0 })
+                        .unwrap_or(0)
+                });
+                let label = format!("↓{:3}% ", pct.unwrap_or(0));
+                Span::styled(label, Style::default().fg(Color::Cyan))
+            } else {
+                Span::styled("◇ ", Style::default().fg(CLR_DIM))
+            };
+
+            let text = Line::from(vec![
+                indicator,
+                Span::raw(track.display_line()),
+            ]);
+
+            let style = if i == state.catalog_index && catalog_focused {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else if i == state.catalog_index {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    if !state.tracks.is_empty() {
+        list_state.select(Some(state.catalog_index));
+    }
+    frame.render_stateful_widget(List::new(items), catalog_list_area, &mut list_state);
+
+    // ── Right: local library ────────────────────────────────────────────────
+
+    let local_focused = state.focus == AmazonFocus::Local;
+    let local_border_style = if local_focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(CLR_DIM)
+    };
+
+    let local_block = Block::default()
+        .title(" Local Library ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(local_border_style);
+
+    let inner_right = local_block.inner(right_area);
+    frame.render_widget(local_block, right_area);
+
+    let local_items: Vec<ListItem> = app
+        .library
+        .tracks
+        .iter()
+        .enumerate()
+        .map(|(i, track)| {
+            let label = format!(
+                "{} — {}",
+                track.display_artist(),
+                track.display_title()
+            );
+            let style = if i == state.local_index && local_focused {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else if i == state.local_index {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            ListItem::new(label).style(style)
+        })
+        .collect();
+
+    let local_count = local_items.len();
+    let local_sel = state.local_index.min(local_count.saturating_sub(1));
+    let mut local_state = ListState::default();
+    if local_count > 0 {
+        local_state.select(Some(local_sel));
+    }
+    frame.render_stateful_widget(List::new(local_items), inner_right, &mut local_state);
+
+    // ── Footer hint ─────────────────────────────────────────────────────────
+    // (Rendered by render_footer already — the Amazon screen reuses it.)
+}
+
+/// Cookie / dir input overlays for the Amazon screen.
+fn render_amazon_overlay(app: &App, overlay: &AmazonOverlay, frame: &mut Frame, area: Rect) {
+    // Dim background.
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        area,
+    );
+
+    let (title, prompt) = match overlay {
+        AmazonOverlay::CookieInput => (
+            " Amazon Music — Cookie Setup ",
+            "Paste your amazon.com browser cookie string below.\n\
+             (DevTools → Application → Cookies → music.amazon.com → Copy all as header value)\n\
+             Your purchases remain private — the cookie is stored locally only.",
+        ),
+        AmazonOverlay::DirInput => (
+            " Amazon Music — Download Directory ",
+            "Enter the directory where downloaded MP3 files will be saved:",
+        ),
+    };
+
+    // Centered box.
+    let width = (area.width as f32 * 0.70) as u16;
+    let height = 12u16;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let box_area = Rect { x, y, width, height };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+
+    let input_line = Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::Yellow).bold()),
+        Span::raw(app.input_buffer.as_str()),
+        Span::styled("▌", Style::default().fg(Color::Yellow)),
+    ]);
+
+    let ctrl = Line::from(vec![
+        Span::styled("[Enter]", Style::default().fg(CLR_DIM).bold()),
+        Span::raw(" Confirm  "),
+        Span::styled("[Esc]", Style::default().fg(CLR_DIM).bold()),
+        Span::raw(" Cancel"),
+    ]);
+
+    let content = Text::from(vec![
+        Line::from(Span::styled(prompt, Style::default().fg(Color::Gray))),
+        Line::default(),
         input_line,
         Line::default(),
         ctrl,

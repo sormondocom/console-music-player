@@ -12,6 +12,38 @@ const OPENMPT_DLLS: &[&str] = &[
 ];
 
 fn main() {
+    // ── Android / Termux: stub out libc++_static ──────────────────────────────
+    // Some transitive deps (e.g. idevice) emit `cargo:rustc-link-lib=c++_static`
+    // even when no C++ code is compiled.  On Android the only C++ runtime
+    // available is libc++_shared.so; the static archive does not exist.
+    // We satisfy the linker by placing an empty archive named libc++_static.a in
+    // OUT_DIR, then telling Cargo to search OUT_DIR first.  The real symbols come
+    // from libc++_shared.so via -lc++_shared (injected via .cargo/config.toml).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        let out_dir = std::env::var("OUT_DIR").unwrap();
+        let stub = std::path::Path::new(&out_dir).join("libc++_static.a");
+        if !stub.exists() {
+            // `ar rcs <archive>` with no object files creates a valid empty archive.
+            let status = std::process::Command::new("ar")
+                .args(["rcs", stub.to_str().unwrap()])
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => println!(
+                    "cargo:warning=ar rcs for libc++_static.a stub exited with {s}"
+                ),
+                Err(e) => println!(
+                    "cargo:warning=Could not create libc++_static.a stub (ar not found?): {e}"
+                ),
+            }
+        }
+        // Prepend OUT_DIR to the native search path so this stub is found before
+        // any system paths are consulted.
+        println!("cargo:rustc-link-search=native={out_dir}");
+        // Pull in the real C++ runtime.
+        println!("cargo:rustc-link-lib=c++_shared");
+    }
+
     if std::env::var("CARGO_FEATURE_TRACKER").is_ok() {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
 

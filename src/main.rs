@@ -1,6 +1,7 @@
 //! console-music-player — entry point.
 #![allow(dead_code)]
 
+mod amazon;
 mod app;
 mod config;
 mod device;
@@ -144,7 +145,12 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Warning: no audio output device — playback unavailable.");
     }
 
-    let mut app = App::new(cfg.source_dirs.clone(), audio_handle);
+    let mut app = App::new(
+        cfg.source_dirs.clone(),
+        audio_handle,
+        cfg.amazon_cookie.clone(),
+        cfg.amazon_download_dir.clone(),
+    );
     refresh_devices(&mut app);
 
     enable_raw_mode()?;
@@ -153,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_event_loop(&mut app, &mut terminal).await;
+    let result = run_event_loop(&mut app, &mut terminal, &mut cfg).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -169,12 +175,25 @@ async fn main() -> anyhow::Result<()> {
 async fn run_event_loop(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    cfg: &mut Config,
 ) -> anyhow::Result<()> {
     const TICK: Duration = Duration::from_millis(100);
-
     while app.running {
         terminal.draw(|frame| ui::render(app, frame))?;
         app.tick();
+
+        // Spawn an Amazon catalog fetch when amazon_state.needs_fetch is set.
+        // We clear the flag immediately so we only spawn once per request.
+        if let Some(state) = &mut app.amazon_state {
+            if state.needs_fetch && state.overlay.is_none() {
+                state.needs_fetch = false;
+                if let Some(cookie) = &app.amazon_cookie {
+                    let client = amazon::AmazonClient::new(cookie.clone());
+                    let inbox = app.amazon_inbox.clone();
+                    tokio::spawn(async move { client.fetch_catalog(inbox).await });
+                }
+            }
+        }
 
         if event::poll(TICK)? {
             if let Event::Key(key) = event::read()? {
@@ -184,12 +203,12 @@ async fn run_event_loop(
                 // Don't wipe status while the user is typing
                 let is_input_screen = matches!(
                     app.screen,
-                    Screen::AddSource | Screen::SavePlaylist | Screen::EditTrack
+                    Screen::AddSource | Screen::SavePlaylist | Screen::EditTrack | Screen::Amazon
                 );
                 if !is_input_screen {
                     app.status_message = None;
                 }
-                handle_key(app, key.code);
+                handle_key(app, key.code, cfg);
             }
         }
     }
@@ -204,7 +223,7 @@ async fn run_event_loop(
 /// Number of items to jump on PageUp / PageDown.
 const PAGE_SIZE: usize = 10;
 
-fn handle_key(app: &mut App, key: KeyCode) {
+fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
     // Tag edit overlay intercepts all keys.
     if app.tag_edit_state.is_some() {
         handle_tag_edit_key(app, key);
@@ -231,7 +250,51 @@ fn handle_key(app: &mut App, key: KeyCode) {
         Screen::Transfer        => handle_transfer_key(app, key),
         Screen::RepairIpod      => handle_repair_key(app, key),
         Screen::DeviceTracks    => handle_device_tracks_key(app, key),
+        Screen::Amazon          => handle_amazon_key(app, key, cfg),
     }
+}
+
+/// Advance the A→C→E easter-egg key sequence.
+/// Returns `true` if the key was consumed by the sequence tracker.
+fn advance_amazon_seq(app: &mut App, c: char) -> bool {
+    const SEQ: [char; 3] = ['a', 'c', 'e'];
+    let lc = c.to_ascii_lowercase();
+    let seq_len = app.amazon_key_seq.len();
+
+    // Expire a stale partial sequence after 2 seconds.
+    if seq_len > 0 {
+        let expired = app
+            .amazon_key_seq_time
+            .map(|t| t.elapsed().as_secs() >= 2)
+            .unwrap_or(true);
+        if expired {
+            app.amazon_key_seq.clear();
+            app.amazon_key_seq_time = None;
+        }
+    }
+
+    let seq_len = app.amazon_key_seq.len();
+
+    if seq_len < SEQ.len() && lc == SEQ[seq_len] {
+        if seq_len == 0 {
+            app.amazon_key_seq_time = Some(std::time::Instant::now());
+        }
+        app.amazon_key_seq.push(lc);
+        if app.amazon_key_seq.len() == SEQ.len() {
+            // Complete! Activate the easter egg.
+            app.amazon_key_seq.clear();
+            app.amazon_key_seq_time = None;
+            app.activate_amazon();
+        }
+        return true; // key consumed
+    }
+
+    // Wrong key — reset any in-progress sequence (but don't consume the key).
+    if seq_len > 0 {
+        app.amazon_key_seq.clear();
+        app.amazon_key_seq_time = None;
+    }
+    false
 }
 
 fn handle_library_key(app: &mut App, key: KeyCode) {
@@ -239,6 +302,16 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
     if key == KeyCode::Esc && app.waveform_active {
         app.waveform_active = false;
         return;
+    }
+
+    // Easter egg: A→C→E rapid sequence opens the Amazon Music screen.
+    // 'A' and 'C' are unbound in the library, so consuming them is safe.
+    // 'E' normally opens the tag editor — it's only consumed when completing
+    // the sequence (i.e. 'A' and 'C' were already pressed within 2 seconds).
+    if let KeyCode::Char(c) = key {
+        if advance_amazon_seq(app, c) {
+            return;
+        }
     }
 
     match key {
@@ -518,6 +591,116 @@ fn handle_tag_edit_key(app: &mut App, key: KeyCode) {
     }
 }
 
+fn handle_amazon_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
+    use crate::app::{AmazonFocus, AmazonOverlay};
+
+    // If an overlay is active, handle text input for it.
+    let overlay = app.amazon_state.as_ref().and_then(|s| s.overlay.clone());
+    if let Some(ov) = overlay {
+        match key {
+            KeyCode::Esc => {
+                // Cancel → back to library (abandon amazon screen entirely).
+                app.amazon_state = None;
+                app.input_buffer.clear();
+                app.screen = Screen::Library;
+            }
+            KeyCode::Enter => match ov {
+                AmazonOverlay::CookieInput => app.confirm_amazon_cookie(cfg),
+                AmazonOverlay::DirInput    => app.confirm_amazon_dir(cfg),
+            },
+            KeyCode::Backspace => { app.input_buffer.pop(); }
+            KeyCode::Char(c)   => app.input_buffer.push(c),
+            _ => {}
+        }
+        return;
+    }
+
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.amazon_state = None;
+            app.screen = Screen::Library;
+        }
+
+        KeyCode::Tab => {
+            if let Some(state) = &mut app.amazon_state {
+                state.focus = match state.focus {
+                    AmazonFocus::Catalog => AmazonFocus::Local,
+                    AmazonFocus::Local   => AmazonFocus::Catalog,
+                };
+            }
+        }
+
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(state) = &mut app.amazon_state {
+                match state.focus {
+                    AmazonFocus::Catalog => state.move_catalog_up(),
+                    AmazonFocus::Local   => state.move_local_up(1),
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(state) = &mut app.amazon_state {
+                match state.focus {
+                    AmazonFocus::Catalog => state.move_catalog_down(),
+                    AmazonFocus::Local   => state.move_local_down(1),
+                }
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(state) = &mut app.amazon_state {
+                match state.focus {
+                    AmazonFocus::Catalog => {
+                        for _ in 0..PAGE_SIZE { state.move_catalog_up(); }
+                    }
+                    AmazonFocus::Local => state.move_local_up(PAGE_SIZE),
+                }
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(state) = &mut app.amazon_state {
+                match state.focus {
+                    AmazonFocus::Catalog => {
+                        for _ in 0..PAGE_SIZE { state.move_catalog_down(); }
+                    }
+                    AmazonFocus::Local => state.move_local_down(PAGE_SIZE),
+                }
+            }
+        }
+
+        // [D] — download the focused Amazon track.
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            let (cookie, download_dir) = (app.amazon_cookie.clone(), app.amazon_download_dir.clone());
+            if let (Some(cookie), Some(dir), Some(state)) =
+                (cookie, download_dir, &mut app.amazon_state)
+            {
+                if let Some(track) = state.tracks.get(state.catalog_index).cloned() {
+                    if !state.downloading.contains(&track.asin)
+                        && !state.completed.contains(&track.asin)
+                    {
+                        state.downloading.insert(track.asin.clone());
+                        let inbox = app.amazon_inbox.clone();
+                        let client = amazon::AmazonClient::new(cookie);
+                        tokio::spawn(async move {
+                            client.download_track(track, dir, inbox).await;
+                        });
+                    }
+                }
+            }
+        }
+
+        // [R] — refresh / re-fetch catalog.
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            if let Some(state) = &mut app.amazon_state {
+                state.loading = true;
+                state.needs_fetch = true;
+                state.status = "Fetching catalog…".into();
+            }
+        }
+
+        _ => {}
+    }
+}
+
 /// Generic text-input handler. `on_enter` is called when the user presses Enter.
 fn handle_text_input_key(app: &mut App, key: KeyCode, on_enter: impl Fn(&mut App)) {
     match key {
@@ -537,7 +720,12 @@ fn handle_text_input_key(app: &mut App, key: KeyCode, on_enter: impl Fn(&mut App
 // ---------------------------------------------------------------------------
 
 fn persist_sources(app: &App) {
-    Config { source_dirs: app.source_dirs.clone() }.save();
+    Config {
+        source_dirs: app.source_dirs.clone(),
+        amazon_cookie: app.amazon_cookie.clone(),
+        amazon_download_dir: app.amazon_download_dir.clone(),
+    }
+    .save();
 }
 
 fn refresh_devices(app: &mut App) {

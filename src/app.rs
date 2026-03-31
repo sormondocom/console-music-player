@@ -16,6 +16,7 @@ use crate::library::{Library, TrackEdit};
 use crate::media::MediaItem;
 use crate::player::Player;
 use crate::playlist::{ConflictCtx, Playlist};
+use crate::amazon::{AmazonMsg, AmazonTrack};
 use crate::tags::TagStore;
 use crate::transfer::{TransferEngine, TransferEvent};
 
@@ -43,6 +44,8 @@ pub enum Screen {
     EditTrack,
     /// Interactive duplicate-track finder and resolver.
     Dedup,
+    /// Amazon Music easter egg — download owned DRM-free MP3s.
+    Amazon,
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +170,111 @@ pub struct TagEditState {
     pub input: String,
 }
 
+// ---------------------------------------------------------------------------
+// Amazon state
+// ---------------------------------------------------------------------------
+
+/// Which overlay (if any) is showing inside the Amazon screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmazonOverlay {
+    /// Prompting the user to paste their amazon.com cookie string.
+    CookieInput,
+    /// Prompting the user to enter a download directory path.
+    DirInput,
+}
+
+/// Which pane has focus in the Amazon side-by-side view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmazonFocus {
+    /// Amazon catalog pane (left).
+    Catalog,
+    /// Local library pane (right).
+    Local,
+}
+
+/// All mutable state for the Amazon easter egg screen.
+pub struct AmazonState {
+    /// Tracks fetched from the Amazon catalog.
+    pub tracks: Vec<AmazonTrack>,
+    /// Selected row in the Amazon catalog pane.
+    pub catalog_index: usize,
+    /// Selected row in the local library pane.
+    pub local_index: usize,
+    /// Which pane currently has keyboard focus.
+    pub focus: AmazonFocus,
+    /// ASINs currently being downloaded.
+    pub downloading: std::collections::HashSet<String>,
+    /// Download progress: ASIN → (bytes received, total bytes).
+    pub progress: std::collections::HashMap<String, (u64, Option<u64>)>,
+    /// ASINs already confirmed present on disk.
+    pub completed: std::collections::HashSet<String>,
+    /// Status / error message shown at the bottom of the pane.
+    pub status: String,
+    /// True while the initial catalog fetch is running.
+    pub loading: bool,
+    /// Set to true to signal the event loop to spawn a catalog fetch task.
+    pub needs_fetch: bool,
+    /// Active text-input overlay, if any.
+    pub overlay: Option<AmazonOverlay>,
+}
+
+impl AmazonState {
+    pub fn new_loading() -> Self {
+        Self {
+            tracks: Vec::new(),
+            catalog_index: 0,
+            local_index: 0,
+            focus: AmazonFocus::Catalog,
+            downloading: Default::default(),
+            progress: Default::default(),
+            completed: Default::default(),
+            status: "Fetching catalog…".into(),
+            loading: true,
+            needs_fetch: true,
+            overlay: None,
+        }
+    }
+
+    pub fn new_with_overlay(overlay: AmazonOverlay) -> Self {
+        Self {
+            tracks: Vec::new(),
+            catalog_index: 0,
+            local_index: 0,
+            focus: AmazonFocus::Catalog,
+            downloading: Default::default(),
+            progress: Default::default(),
+            completed: Default::default(),
+            status: String::new(),
+            loading: false,
+            needs_fetch: false,
+            overlay: Some(overlay),
+        }
+    }
+
+    pub fn move_catalog_up(&mut self) {
+        if self.catalog_index > 0 {
+            self.catalog_index -= 1;
+        }
+    }
+
+    pub fn move_catalog_down(&mut self) {
+        if !self.tracks.is_empty() && self.catalog_index + 1 < self.tracks.len() {
+            self.catalog_index += 1;
+        }
+    }
+
+    pub fn move_local_up(&mut self, count: usize) {
+        if self.local_index > 0 {
+            self.local_index = self.local_index.saturating_sub(count.max(1));
+        }
+    }
+
+    pub fn move_local_down(&mut self, count: usize) {
+        // upper bound set by caller using actual track count
+        self.local_index = self.local_index.saturating_add(count.max(1));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Focus {
     Library,
@@ -238,10 +346,30 @@ pub struct App {
     /// Monotonically incrementing tick counter, reset whenever the focused
     /// library track changes.  The UI computes the scroll offset from this.
     pub marquee_tick: u32,
+
+    // --- Amazon easter egg ---
+    /// Key sequence buffer for the A→C→E activation chord.
+    pub amazon_key_seq: Vec<char>,
+    /// Timestamp of the first key in the current sequence.
+    pub amazon_key_seq_time: Option<std::time::Instant>,
+    /// Active Amazon screen state (Some while Screen::Amazon is active).
+    pub amazon_state: Option<AmazonState>,
+    /// Shared inbox: async download tasks push messages here; the event loop
+    /// drains it each tick and applies updates.
+    pub amazon_inbox: std::sync::Arc<std::sync::Mutex<Vec<AmazonMsg>>>,
+    /// Cookie string persisted from Config.
+    pub amazon_cookie: Option<String>,
+    /// Directory where downloaded MP3s are saved, persisted from Config.
+    pub amazon_download_dir: Option<PathBuf>,
 }
 
 impl App {
-    pub fn new(source_dirs: Vec<PathBuf>, audio_handle: Option<OutputStreamHandle>) -> Self {
+    pub fn new(
+        source_dirs: Vec<PathBuf>,
+        audio_handle: Option<OutputStreamHandle>,
+        amazon_cookie: Option<String>,
+        amazon_download_dir: Option<PathBuf>,
+    ) -> Self {
         let mut app = Self {
             running: true,
             screen: Screen::Library,
@@ -271,6 +399,12 @@ impl App {
             tag_store: TagStore::load(),
             playlist_membership: HashMap::new(),
             tag_edit_state: None,
+            amazon_key_seq: Vec::new(),
+            amazon_key_seq_time: None,
+            amazon_state: None,
+            amazon_inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            amazon_cookie,
+            amazon_download_dir,
         };
         app.rescan();
         app.rebuild_playlist_membership();
@@ -967,11 +1101,109 @@ impl App {
         self.tag_edit_state = None;
     }
 
+    // --- Amazon easter egg ---
+
+    /// Called when the A→C→E sequence completes.
+    /// Shows the cookie input overlay if no cookie is set, the dir prompt if no
+    /// download dir is set, otherwise opens the catalog view and starts fetching.
+    pub fn activate_amazon(&mut self) {
+        if self.amazon_cookie.is_none() {
+            self.input_buffer.clear();
+            self.amazon_state = Some(AmazonState::new_with_overlay(AmazonOverlay::CookieInput));
+        } else if self.amazon_download_dir.is_none() {
+            self.input_buffer.clear();
+            self.amazon_state = Some(AmazonState::new_with_overlay(AmazonOverlay::DirInput));
+        } else {
+            self.amazon_state = Some(AmazonState::new_loading());
+        }
+        self.screen = Screen::Amazon;
+    }
+
+    /// Confirm the cookie string entered in the overlay.
+    pub fn confirm_amazon_cookie(&mut self, cfg: &mut crate::config::Config) {
+        let cookie = self.input_buffer.trim().to_string();
+        self.input_buffer.clear();
+        if cookie.is_empty() {
+            return;
+        }
+        self.amazon_cookie = Some(cookie.clone());
+        cfg.amazon_cookie = Some(cookie);
+        cfg.save();
+
+        if let Some(state) = &mut self.amazon_state {
+            if self.amazon_download_dir.is_none() {
+                state.overlay = Some(AmazonOverlay::DirInput);
+            } else {
+                state.overlay = None;
+                state.loading = true;
+                state.needs_fetch = true;
+                state.status = "Fetching catalog…".into();
+            }
+        }
+    }
+
+    /// Confirm the download directory entered in the overlay.
+    pub fn confirm_amazon_dir(&mut self, cfg: &mut crate::config::Config) {
+        let dir = PathBuf::from(self.input_buffer.trim());
+        self.input_buffer.clear();
+        if dir.as_os_str().is_empty() {
+            return;
+        }
+        self.amazon_download_dir = Some(dir.clone());
+        cfg.amazon_download_dir = Some(dir);
+        cfg.save();
+
+        if let Some(state) = &mut self.amazon_state {
+            state.overlay = None;
+            state.loading = true;
+            state.needs_fetch = true;
+            state.status = "Fetching catalog…".into();
+        }
+    }
+
+    /// Drain the amazon_inbox and apply any pending messages to amazon_state.
+    pub fn drain_amazon_inbox(&mut self) {
+        let msgs: Vec<AmazonMsg> = {
+            let mut q = match self.amazon_inbox.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            q.drain(..).collect()
+        };
+
+        let Some(state) = &mut self.amazon_state else { return };
+
+        for msg in msgs {
+            match msg {
+                AmazonMsg::Tracks(tracks) => {
+                    state.loading = false;
+                    let n = tracks.len();
+                    state.tracks = tracks;
+                    state.status = format!("{n} tracks in your Amazon library.");
+                }
+                AmazonMsg::Progress { asin, bytes, total } => {
+                    state.progress.insert(asin, (bytes, total));
+                }
+                AmazonMsg::Downloaded { asin, path } => {
+                    state.downloading.remove(&asin);
+                    state.progress.remove(&asin);
+                    state.completed.insert(asin);
+                    state.status = format!("Downloaded: {}", path.file_name().unwrap_or_default().to_string_lossy());
+                }
+                AmazonMsg::Error(e) => {
+                    state.loading = false;
+                    state.status = format!("Error: {e}");
+                }
+            }
+        }
+    }
+
     // --- tick ---
 
     pub fn tick(&mut self) {
         self.player.tick();
         self.tick_transfer();
+        self.drain_amazon_inbox();
         self.marquee_tick = self.marquee_tick.wrapping_add(1);
     }
 
