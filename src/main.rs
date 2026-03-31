@@ -12,6 +12,7 @@ mod playlist;
 mod tracker;
 mod transfer;
 mod ui;
+mod visualizer;
 
 use std::io;
 use std::path::PathBuf;
@@ -227,6 +228,12 @@ fn handle_key(app: &mut App, key: KeyCode) {
 }
 
 fn handle_library_key(app: &mut App, key: KeyCode) {
+    // Esc closes the waveform overlay if it's active.
+    if key == KeyCode::Esc && app.waveform_active {
+        app.waveform_active = false;
+        return;
+    }
+
     match key {
         KeyCode::Char('q') | KeyCode::Char('Q') => app.running = false,
 
@@ -294,6 +301,9 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
             }
         }
         KeyCode::Char('f') | KeyCode::Char('F') => app.begin_dedup(),
+        KeyCode::Char('v') | KeyCode::Char('V') => {
+            app.waveform_active = !app.waveform_active;
+        }
         KeyCode::Char('o') | KeyCode::Char('O') => {
             app.player.toggle_repeat();
             let label = match app.player.repeat {

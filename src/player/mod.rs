@@ -4,12 +4,13 @@ use std::fs::File;
 use std::io::BufReader;
 use std::time::{Duration, Instant};
 
-use rodio::{Decoder, OutputStreamHandle, Sink};
+use rodio::{Decoder, OutputStreamHandle, Sink, Source};
 use tracing::{info, warn};
 
 use crate::library::Track;
 use crate::media::MediaItem;
 use crate::tracker;
+use crate::visualizer::{self, SampleCapture, WaveBuffer};
 
 // ---------------------------------------------------------------------------
 // State
@@ -71,6 +72,9 @@ pub struct Player {
     /// Volume 0.0..=1.0
     pub volume: f32,
 
+    /// Shared sample ring-buffer fed by the audio thread, read by the UI.
+    pub wave_buffer: WaveBuffer,
+
     /// Wall-clock moment the current play/resume started.
     started_at: Option<Instant>,
     /// Accumulated playback time before the last pause.
@@ -86,6 +90,7 @@ impl Player {
             state: PlaybackState::Stopped,
             repeat: RepeatMode::Off,
             volume: 0.8,
+            wave_buffer: visualizer::new_wave_buffer(),
             started_at: None,
             elapsed_before_pause: Duration::ZERO,
         }
@@ -137,9 +142,10 @@ impl Player {
         let file = File::open(&track.path)
             .map_err(|e| format!("Cannot open '{}': {e}", track.path.display()))?;
         let source = Decoder::new(BufReader::new(file))
-            .map_err(|e| format!("Cannot decode '{}': {e}", track.path.display()))?;
+            .map_err(|e| format!("Cannot decode '{}': {e}", track.path.display()))?
+            .convert_samples::<f32>();
         sink.set_volume(self.volume);
-        sink.append(source);
+        sink.append(SampleCapture::new(source, self.wave_buffer.clone()));
         Ok(())
     }
 
@@ -152,7 +158,10 @@ impl Player {
             match crate::tracker::TrackerSource::from_bytes(&data) {
                 Some(source) => {
                     sink.set_volume(self.volume);
-                    sink.append(source);
+                    sink.append(SampleCapture::new(
+                        source.convert_samples::<f32>(),
+                        self.wave_buffer.clone(),
+                    ));
                     Ok(())
                 }
                 None => Err(format!(

@@ -210,6 +210,10 @@ pub struct App {
     // --- deduplication ---
     pub dedup_state: Option<DedupState>,
 
+    // --- waveform visualizer ---
+    /// When `true`, the library pane is replaced by the oscilloscope.
+    pub waveform_active: bool,
+
     // --- marquee scrolling ---
     /// Monotonically incrementing tick counter, reset whenever the focused
     /// library track changes.  The UI computes the scroll offset from this.
@@ -242,6 +246,7 @@ impl App {
             device_tracks_selected: 0,
             edit_state: None,
             dedup_state: None,
+            waveform_active: false,
             marquee_tick: 0,
         };
         app.rescan();

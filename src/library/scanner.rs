@@ -75,6 +75,25 @@ pub fn scan_directory(root: &Path) -> Result<Vec<Track>> {
             continue;
         }
 
+        // Verify the file's magic bytes match the declared extension.
+        match super::magic::verify(path, &ext) {
+            super::magic::MagicVerdict::Ok => {}
+            super::magic::MagicVerdict::Mismatch { detected } => {
+                warn!(
+                    "Skipping '{}': extension .{} but magic bytes indicate {}",
+                    path.display(), ext, detected
+                );
+                continue;
+            }
+            super::magic::MagicVerdict::Unknown => {
+                warn!(
+                    "Skipping '{}': extension .{} — magic bytes unrecognised (corrupt or encrypted?)",
+                    path.display(), ext
+                );
+                continue;
+            }
+        }
+
         let file_size = match std::fs::metadata(path) {
             Ok(m) => m.len(),
             Err(e) => {

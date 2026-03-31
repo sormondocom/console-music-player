@@ -13,9 +13,9 @@ use ratatui::{
 
 use crate::app::{App, DedupFocus, EditState, Focus, Screen, EDIT_FIELD_LABELS};
 use crate::library::dedup::{DedupAction, DuplicateKind};
-use crate::library::SortOrder;
 use crate::media::MediaItem;
 use crate::player::PlaybackState;
+use crate::visualizer;
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -142,10 +142,51 @@ fn render_main(app: &App, frame: &mut Frame, area: Rect) {
     ])
     .areas(right);
 
-    render_library_pane(app, frame, left);
+    if app.waveform_active {
+        render_waveform_pane(app, frame, left);
+    } else {
+        render_library_pane(app, frame, left);
+    }
     render_player_pane(app, frame, player_area);
     render_devices_pane(app, frame, devices_area);
     render_functions_pane(app, frame, functions_area);
+}
+
+// ---------------------------------------------------------------------------
+// Waveform pane
+// ---------------------------------------------------------------------------
+
+fn render_waveform_pane(app: &App, frame: &mut Frame, area: Rect) {
+    let title = if let Some(track) = &app.player.current_track {
+        format!(" ◈ {} — {} ", track.display_title(), track.display_artist())
+    } else {
+        " ◈ Waveform — no track playing ".into()
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(CLR_ACCENT))
+        .title_style(Style::default().fg(CLR_ACCENT).bold());
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width  = inner.width  as usize;
+    let height = inner.height as usize;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let rows = visualizer::render_waveform(&app.player.wave_buffer, width, height);
+
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .map(|row| Line::from(Span::styled(row, Style::default().fg(CLR_ACCENT))))
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,64 +245,84 @@ fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
     const MARQUEE_DELAY: u32 = 15;
     const MARQUEE_SPEED: u32 = 4;
 
-    let items: Vec<ListItem> = app
-        .library
-        .tracks
-        .iter()
-        .enumerate()
-        .map(|(i, track)| {
-            let is_focused = i == app.library.selected_index;
-            let selected   = app.is_track_selected(i);
-            let marker     = if selected { "◆ " } else { "  " };
-            let full       = track.info_line();
+    // Build the display list.  For GroupBy sort orders, section header rows
+    // are injected between groups.  Headers are not selectable, so we track a
+    // separate visual_selected index that accounts for the offsets.
+    let use_sections = app.library.sort_order.has_sections();
+    let sort_order   = app.library.sort_order;
 
-            let display = if is_focused && full.chars().count() > avail {
-                // Compute scroll offset from the monotonic tick counter.
-                let scroll = if app.marquee_tick > MARQUEE_DELAY {
-                    ((app.marquee_tick - MARQUEE_DELAY) / MARQUEE_SPEED) as usize
-                } else {
-                    0
-                };
-                let max_scroll = full.chars().count().saturating_sub(avail);
-                let offset = scroll.min(max_scroll);
-                full.chars().skip(offset).take(avail).collect::<String>()
+    let mut items: Vec<ListItem> = Vec::with_capacity(app.library.tracks.len() + 8);
+    let mut visual_selected: usize = app.library.selected_index;
+    let mut last_key: Option<String> = None;
+
+    for (i, track) in app.library.tracks.iter().enumerate() {
+        // Inject a section header whenever the group key changes.
+        if use_sections {
+            if let Some(key) = sort_order.section_key(track) {
+                if last_key.as_deref() != Some(&key) {
+                    let dashes = "─".repeat(avail.saturating_sub(key.len() + 4));
+                    let header_text = format!("── {key} {dashes}");
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        header_text,
+                        Style::default().fg(CLR_ACCENT).add_modifier(Modifier::BOLD),
+                    ))));
+                    last_key = Some(key);
+                    if i <= app.library.selected_index {
+                        visual_selected += 1;
+                    }
+                }
+            }
+        }
+
+        let is_focused = i == app.library.selected_index;
+        let selected   = app.is_track_selected(i);
+        let marker     = if selected { "◆ " } else { "  " };
+        let full       = track.info_line();
+
+        let display = if is_focused && full.chars().count() > avail {
+            let scroll = if app.marquee_tick > MARQUEE_DELAY {
+                ((app.marquee_tick - MARQUEE_DELAY) / MARQUEE_SPEED) as usize
             } else {
-                truncate(&full, avail)
+                0
             };
+            let max_scroll = full.chars().count().saturating_sub(avail);
+            let offset = scroll.min(max_scroll);
+            full.chars().skip(offset).take(avail).collect::<String>()
+        } else {
+            truncate(&full, avail)
+        };
 
-            let (title_color, meta_color) = if is_focused {
-                (Color::White, Color::Gray)
-            } else {
-                (Color::White, CLR_DIM)
-            };
+        let (title_color, meta_color) = if is_focused {
+            (Color::White, Color::Gray)
+        } else {
+            (Color::White, CLR_DIM)
+        };
 
-            // Split at the first "  ·  " to colour title and meta separately.
-            let line = if let Some(sep) = display.find("  ·  ") {
-                let (title_part, rest) = display.split_at(sep);
-                Line::from(vec![
-                    Span::styled(
-                        marker,
-                        Style::default().fg(if selected { CLR_SELECTED } else { Color::Reset }),
-                    ),
-                    Span::styled(title_part.to_string(), Style::default().fg(title_color).bold()),
-                    Span::styled(rest.to_string(), Style::default().fg(meta_color)),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled(
-                        marker,
-                        Style::default().fg(if selected { CLR_SELECTED } else { Color::Reset }),
-                    ),
-                    Span::styled(display, Style::default().fg(title_color)),
-                ])
-            };
+        let line = if let Some(sep) = display.find("  ·  ") {
+            let (title_part, rest) = display.split_at(sep);
+            Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(if selected { CLR_SELECTED } else { Color::Reset }),
+                ),
+                Span::styled(title_part.to_string(), Style::default().fg(title_color).bold()),
+                Span::styled(rest.to_string(), Style::default().fg(meta_color)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(if selected { CLR_SELECTED } else { Color::Reset }),
+                ),
+                Span::styled(display, Style::default().fg(title_color)),
+            ])
+        };
 
-            ListItem::new(line)
-        })
-        .collect();
+        items.push(ListItem::new(line));
+    }
 
     let mut state = ListState::default();
-    state.select(Some(app.library.selected_index));
+    state.select(Some(visual_selected));
 
     let list = List::new(items)
         .block(block)
@@ -533,7 +594,7 @@ fn render_functions_pane(_app: &App, frame: &mut Frame, area: Rect) {
         Line::from(vec![key("W"), label("Save PL  "), key("D"), label("Rescan devs")]),
         Line::from(vec![key("E"), label("Edit tags"), key("R"), label("Rescan")]),
         Line::from(vec![key("F"), label("Find dupes"), key("Z"), label("Sort")]),
-        Line::from(vec![key("O"), label("Repeat one")]),
+        Line::from(vec![key("O"), label("Repeat one"), key("V"), label("Waveform")]),
         Line::from(vec![key("Q"), label("Quit")]),
     ];
 

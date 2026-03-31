@@ -1,47 +1,146 @@
 pub mod dedup;
+pub mod magic;
 pub mod scanner;
 
 // ---------------------------------------------------------------------------
-// Sort order
+// Sort order / group-by
 // ---------------------------------------------------------------------------
 
 /// Preset sort orders for the library list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Variants prefixed with `GroupBy` render visual section-separator headers
+/// between groups (see [`SortOrder::has_sections`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrder {
-    #[default]
-    /// Artist → Album → Title  (the default scan order)
+    /// Restore the original scan order (artist / album / title).
+    Original,
+    #[allow(dead_code)]
+    /// Artist → Album → Title (the default view).
     ArtistAlbumTitle,
-    /// Title alphabetical
+    /// Title alphabetical.
     Title,
-    /// Album → Track title
+    /// Album → Track title.
     Album,
-    /// Longest first
+    /// Longest first.
     DurationDesc,
-    /// Most recently added (highest inode / OS-assigned order, approximation)
+    /// Most recently added (file modification time, newest first).
     DateAdded,
+    /// Grouped sections by verified file extension (MP3, FLAC, XM, …).
+    GroupByExtension,
+    /// Grouped sections by artist name.
+    GroupByArtist,
+    /// Grouped sections by release year.
+    GroupByYear,
+    /// Grouped sections by month the file was added (mtime year + month).
+    GroupByMonth,
+}
+
+impl Default for SortOrder {
+    fn default() -> Self { Self::ArtistAlbumTitle }
 }
 
 impl SortOrder {
-    /// Cycle to the next preset.
+    /// Cycle to the next preset, wrapping back to `Original`.
     pub fn next(self) -> Self {
         match self {
+            Self::Original         => Self::ArtistAlbumTitle,
             Self::ArtistAlbumTitle => Self::Title,
             Self::Title            => Self::Album,
             Self::Album            => Self::DurationDesc,
             Self::DurationDesc     => Self::DateAdded,
-            Self::DateAdded        => Self::ArtistAlbumTitle,
+            Self::DateAdded        => Self::GroupByExtension,
+            Self::GroupByExtension => Self::GroupByArtist,
+            Self::GroupByArtist    => Self::GroupByYear,
+            Self::GroupByYear      => Self::GroupByMonth,
+            Self::GroupByMonth     => Self::Original,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Original         => "Original Order",
             Self::ArtistAlbumTitle => "Artist / Album",
             Self::Title            => "Title",
             Self::Album            => "Album",
             Self::DurationDesc     => "Duration ↓",
             Self::DateAdded        => "Date Added",
+            Self::GroupByExtension => "Group by Extension",
+            Self::GroupByArtist    => "Group by Artist",
+            Self::GroupByYear      => "Group by Year",
+            Self::GroupByMonth     => "Group by Month",
         }
     }
+
+    /// Whether this sort order renders visual section separators between groups.
+    pub fn has_sections(self) -> bool {
+        matches!(
+            self,
+            Self::GroupByExtension | Self::GroupByArtist
+            | Self::GroupByYear    | Self::GroupByMonth
+        )
+    }
+
+    /// Return the section-header key for `track` under this sort order.
+    /// Returns `None` for sort orders that don't use section headers.
+    pub fn section_key(self, track: &Track) -> Option<String> {
+        match self {
+            Self::GroupByExtension => Some(
+                track.path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_uppercase())
+                    .unwrap_or_else(|| "OTHER".into()),
+            ),
+            Self::GroupByArtist => Some(
+                if track.artist.is_empty() {
+                    "Unknown Artist".into()
+                } else {
+                    track.artist.clone()
+                },
+            ),
+            Self::GroupByYear => Some(
+                track.year
+                    .map(|y| y.to_string())
+                    .unwrap_or_else(|| "Unknown Year".into()),
+            ),
+            Self::GroupByMonth => {
+                let secs = std::fs::metadata(&track.path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                Some(match secs {
+                    None => "Unknown Date".into(),
+                    Some(s) => {
+                        let (y, mo) = unix_year_month(s);
+                        const MONTHS: [&str; 12] = [
+                            "January", "February", "March",     "April",   "May",      "June",
+                            "July",    "August",   "September", "October", "November", "December",
+                        ];
+                        let name = MONTHS.get(mo.saturating_sub(1) as usize).copied().unwrap_or("?");
+                        format!("{y} · {name}")
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Convert a UNIX timestamp (seconds) to `(year, month)` using the
+/// proleptic Gregorian calendar.  Month is 1-based (1 = January).
+fn unix_year_month(secs: u64) -> (i32, u32) {
+    // Howard Hinnant's civil_from_days algorithm
+    let days = (secs / 86_400) as i64;
+    let z    = days + 719_468;
+    let era  = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe  = (z - era * 146_097) as u32;
+    let yoe  = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy  = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp   = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year  = yoe as i64 + era * 400 + if month <= 2 { 1 } else { 0 };
+    (year as i32, month)
 }
 
 use std::path::{Path, PathBuf};
@@ -141,16 +240,20 @@ pub struct Library {
     pub active_playlist: Option<String>,
     /// Current sort preset applied to `tracks`.
     pub sort_order: SortOrder,
+    /// Paths in the original scan order — used to restore `SortOrder::Original`.
+    original_paths: Vec<PathBuf>,
 }
 
 impl Library {
     pub fn new(tracks: Vec<Track>) -> Self {
+        let original_paths = tracks.iter().map(|t| t.path.clone()).collect();
         Self {
             all_tracks: tracks.clone(),
             tracks,
             selected_index: 0,
             active_playlist: None,
             sort_order: SortOrder::default(),
+            original_paths,
         }
     }
 
@@ -184,6 +287,12 @@ impl Library {
     /// Re-sort `tracks` according to the current `sort_order`.
     pub fn apply_sort(&mut self) {
         match self.sort_order {
+            SortOrder::Original => {
+                // Restore the order tracks had when they were first scanned.
+                let pos: std::collections::HashMap<&PathBuf, usize> =
+                    self.original_paths.iter().enumerate().map(|(i, p)| (p, i)).collect();
+                self.tracks.sort_by_key(|t| pos.get(&t.path).copied().unwrap_or(usize::MAX));
+            }
             SortOrder::ArtistAlbumTitle => {
                 self.tracks.sort_by(|a, b| {
                     a.artist.cmp(&b.artist)
@@ -200,20 +309,70 @@ impl Library {
                 });
             }
             SortOrder::DurationDesc => {
-                self.tracks.sort_by(|a, b| {
-                    b.duration_secs.cmp(&a.duration_secs)
-                });
+                self.tracks.sort_by(|a, b| b.duration_secs.cmp(&a.duration_secs));
             }
             SortOrder::DateAdded => {
                 // Best available proxy on all platforms: file modification time.
                 // Newer files sort first.
                 self.tracks.sort_by(|a, b| {
-                    let mt = |p: &std::path::PathBuf| {
-                        std::fs::metadata(p)
-                            .and_then(|m| m.modified())
-                            .ok()
+                    let mt = |p: &PathBuf| {
+                        std::fs::metadata(p).and_then(|m| m.modified()).ok()
                     };
                     mt(&b.path).cmp(&mt(&a.path))
+                });
+            }
+            SortOrder::GroupByExtension => {
+                self.tracks.sort_by(|a, b| {
+                    let ext = |t: &Track| {
+                        t.path.extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| e.to_lowercase())
+                            .unwrap_or_default()
+                    };
+                    ext(a).cmp(&ext(b))
+                        .then_with(|| a.artist.cmp(&b.artist))
+                        .then_with(|| a.album.cmp(&b.album))
+                        .then_with(|| a.title.cmp(&b.title))
+                });
+            }
+            SortOrder::GroupByArtist => {
+                self.tracks.sort_by(|a, b| {
+                    a.artist.cmp(&b.artist)
+                        .then_with(|| a.album.cmp(&b.album))
+                        .then_with(|| a.title.cmp(&b.title))
+                });
+            }
+            SortOrder::GroupByYear => {
+                self.tracks.sort_by(|a, b| {
+                    // None (unknown year) sorts last.
+                    match (a.year, b.year) {
+                        (None,    None)    => std::cmp::Ordering::Equal,
+                        (None,    Some(_)) => std::cmp::Ordering::Greater,
+                        (Some(_), None)    => std::cmp::Ordering::Less,
+                        (Some(ya), Some(yb)) => ya.cmp(&yb),
+                    }
+                    .then_with(|| a.artist.cmp(&b.artist))
+                    .then_with(|| a.title.cmp(&b.title))
+                });
+            }
+            SortOrder::GroupByMonth => {
+                self.tracks.sort_by(|a, b| {
+                    let month_key = |t: &Track| {
+                        std::fs::metadata(&t.path)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|st| st.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| unix_year_month(d.as_secs()))
+                    };
+                    // None (unreadable mtime) sorts last.
+                    match (month_key(a), month_key(b)) {
+                        (None, None)       => std::cmp::Ordering::Equal,
+                        (None, Some(_))    => std::cmp::Ordering::Greater,
+                        (Some(_), None)    => std::cmp::Ordering::Less,
+                        (Some(ka), Some(kb)) => ka.cmp(&kb),
+                    }
+                    .then_with(|| a.artist.cmp(&b.artist))
+                    .then_with(|| a.title.cmp(&b.title))
                 });
             }
         }
