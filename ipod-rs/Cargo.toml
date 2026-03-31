@@ -1,0 +1,16 @@
+[package]
+name = "ipod-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust library for reading and writing iPod media databases (iTunesDB / iTunesSD) and transferring tracks to all legacy iPod models via USB Mass Storage"
+license = "GPL-3.0"
+keywords = ["ipod", "itunesdb", "itunessd", "music", "legacy"]
+categories = ["multimedia", "filesystem"]
+
+[[bin]]
+name = "dump-itunesdb"
+path = "src/bin/dump_itunesdb.rs"
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"

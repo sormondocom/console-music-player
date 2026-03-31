@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find ~/.cargo/registry/src -name *.rs -path */openmpt-0.3.1/*)",
+      "Bash(where vcpkg:*)",
+      "Read(//c//**)",
+      "Read(//d//**)",
+      "Read(//c/Users/Shawn/**)",
+      "Bash(winget --version)",
+      "Bash(choco --version)",
+      "Bash(scoop --version)",
+      "Bash(choco search:*)",
+      "Bash(winget search:*)",
+      "WebFetch(domain:lib.openmpt.org)",
+      "Bash(powershell -Command \":*)"
+    ]
+  }
+}

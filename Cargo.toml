@@ -1,0 +1,68 @@
+[workspace]
+members = [".", "ipod-rs"]
+resolver = "2"
+
+[package]
+name = "console-music-player"
+version = "0.1.0"
+edition = "2021"
+description = "A cross-platform console music player with iPhone/iPod support"
+license = "GPL-3.0"
+
+[[bin]]
+name = "cmp"
+path = "src/main.rs"
+
+[features]
+default = ["tracker"]
+# Enables MOD/XM/IT/S3M playback via libopenmpt.
+# Requires libopenmpt to be installed — see README.md.
+tracker = ["dep:openmpt"]
+
+[dependencies]
+# iPod support library (workspace crate)
+ipod-rs = { path = "ipod-rs" }
+
+# MOD tracker playback (optional — requires libopenmpt C++ library)
+openmpt = { version = "0.3", optional = true }
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Apple device support (pure Rust, no C deps)
+# API unstable until 0.2.0 — pinned to avoid breaking changes
+idevice = "=0.1.53"
+
+# Audio metadata
+lofty = "0.22"
+
+# Filesystem traversal
+walkdir = "2"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Audio playback — symphonia-all covers mp3/aac/flac/ogg/opus/wav/aiff
+rodio = { version = "0.19", features = ["symphonia-all"] }
+
+# Human-readable file sizes
+humansize = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
