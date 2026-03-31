@@ -1579,13 +1579,13 @@ fn render_amazon_overlay(app: &App, overlay: &AmazonOverlay, frame: &mut Frame, 
     let (title, prompt) = match overlay {
         AmazonOverlay::CookieInput => (
             " Amazon Music — Cookie Setup ",
-            "Paste your amazon.com browser cookie string below.\n\
-             (DevTools → Application → Cookies → music.amazon.com → Copy all as header value)\n\
-             Your purchases remain private — the cookie is stored locally only.",
+            "Paste your amazon.com request cookie (Ctrl+V).\n\
+             How: open music.amazon.com → F12 → Network tab → click any request\n\
+             → Headers → Request Headers → right-click \"cookie:\" value → Copy value.",
         ),
         AmazonOverlay::DirInput => (
             " Amazon Music — Download Directory ",
-            "Enter the directory where downloaded MP3 files will be saved:",
+            "Enter or paste (Ctrl+V) the folder where MP3 downloads will be saved:",
         ),
     };
 

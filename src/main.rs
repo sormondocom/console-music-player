@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -200,6 +200,24 @@ async fn run_event_loop(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+
+                // Ctrl+V — paste clipboard text into whichever input field is active.
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('v')
+                {
+                    let text = clipboard_paste().unwrap_or_default();
+                    let clean: String = text.chars().filter(|c| !c.is_control() || *c == ' ').collect();
+                    if !clean.is_empty() {
+                        // Tag edit overlay has its own input field.
+                        if let Some(state) = &mut app.tag_edit_state {
+                            state.input.push_str(&clean);
+                        } else {
+                            app.input_buffer.push_str(&clean);
+                        }
+                    }
+                    continue;
+                }
+
                 // Don't wipe status while the user is typing
                 let is_input_screen = matches!(
                     app.screen,
@@ -698,6 +716,18 @@ fn handle_amazon_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
         }
 
         _ => {}
+    }
+}
+
+/// Read the system clipboard and return its text content, if available.
+fn clipboard_paste() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+/// Append clipboard text to `buf`, stripping control characters except space.
+fn paste_into(buf: &mut String) {
+    if let Some(text) = clipboard_paste() {
+        buf.extend(text.chars().filter(|c| !c.is_control() || *c == ' '));
     }
 }
 
