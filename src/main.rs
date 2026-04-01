@@ -4,6 +4,7 @@
 mod amazon;
 mod app;
 mod config;
+mod util;
 mod device;
 mod error;
 mod library;
@@ -311,7 +312,7 @@ fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
         Screen::Dedup           => handle_dedup_key(app, key),
         Screen::Sources         => handle_sources_key(app, key),
         Screen::AddSource       => handle_text_input_key(app, key, |app| {
-            let path = PathBuf::from(app.input_buffer.trim());
+            let path = util::expand_tilde(app.input_buffer.trim());
             app.input_buffer.clear();
             app.screen = Screen::Sources;
             app.add_source(path);

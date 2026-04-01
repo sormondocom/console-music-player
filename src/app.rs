@@ -1152,7 +1152,7 @@ impl App {
 
     /// Confirm the download directory entered in the overlay.
     pub fn confirm_amazon_dir(&mut self, cfg: &mut crate::config::Config) {
-        let dir = PathBuf::from(self.input_buffer.trim());
+        let dir = crate::util::expand_tilde(self.input_buffer.trim());
         self.input_buffer.clear();
         if dir.as_os_str().is_empty() {
             return;
