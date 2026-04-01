@@ -13,7 +13,7 @@ use ratatui::{
 
 use std::path::PathBuf;
 
-use crate::app::{AmazonFocus, AmazonOverlay, App, DedupFocus, EditState, Focus, Screen, EDIT_FIELD_LABELS};
+use crate::app::{AmazonFocus, AmazonOverlay, App, DedupFocus, EditState, Focus, Screen, SearchState, EDIT_FIELD_LABELS};
 use crate::library::dedup::{DedupAction, DuplicateKind};
 use crate::media::MediaItem;
 use crate::player::PlaybackState;
@@ -73,6 +73,11 @@ pub fn render(app: &App, frame: &mut Frame) {
     if app.tag_edit_state.is_some() {
         render_tag_edit_overlay(app, frame, body_area);
     }
+
+    // Search overlay — topmost layer
+    if let Some(state) = &app.search_state {
+        render_search_overlay(state, frame, body_area);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -101,30 +106,34 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let library_hint;
-    let help = match app.screen {
-        Screen::Library => {
-            let r_hint = if app.library.active_playlist.is_some() {
-                "[R] Library"
-            } else {
-                "[R] Rescan"
-            };
-            library_hint = format!(
-                " [↑↓/jk] Nav  [PgUp/Dn] Page  [Enter] Play  [P] Pause  [O] Repeat  \
-                 [Z] Sort  []/[ Vol  [Space] Sel  [Tab] Pane  {r_hint}"
-            );
-            library_hint.as_str()
+    let help = if app.search_state.is_some() {
+        " [↑↓/jk] Navigate  [PgUp/Dn] Page  [Enter] Jump to track  [Esc] Close  — type to filter"
+    } else {
+        match app.screen {
+            Screen::Library => {
+                let r_hint = if app.library.active_playlist.is_some() {
+                    "[R] Library"
+                } else {
+                    "[R] Rescan"
+                };
+                library_hint = format!(
+                    " [↑↓/jk] Nav  [PgUp/Dn] Page  [Enter] Play  [P] Pause  [O] Repeat  \
+                     [Z] Sort  []/[ Vol  [Space] Sel  [G] Tag  [/] Search  [Tab] Pane  {r_hint}"
+                );
+                library_hint.as_str()
+            }
+            Screen::Sources => " [↑↓] Navigate  [A] Add  [Del] Remove  [Esc] Back",
+            Screen::AddSource => " [Enter] Confirm  [Esc] Cancel",
+            Screen::Playlists => " [↑↓] Navigate  [Enter] Load  [Del] Delete  [Esc] Back",
+            Screen::SavePlaylist => " Type a name, then [Enter] to save  [Esc] Cancel",
+            Screen::PlaylistConflict => " [O] Overwrite  [N] New dated  [C] Cancel",
+            Screen::Transfer => " [Esc/L] Back to library  [Q] Quit",
+            Screen::RepairIpod => " [F] Fix all  [↑↓] Navigate  [Esc] Back",
+            Screen::DeviceTracks => " [↑↓] Navigate  [Esc/Q] Back",
+            Screen::EditTrack => " [Tab/↑↓] Next field  [Enter] Save  [Esc] Cancel",
+            Screen::Dedup => " [Tab] Panel  [↑↓] Navigate  [Space] Cycle action  [A] Auto  [Enter] Apply  [Esc] Cancel",
+            Screen::Amazon => " [Tab] Pane  [↑↓] Navigate  [D] Download  [R] Refresh  [Esc] Back",
         }
-        Screen::Sources => " [↑↓] Navigate  [A] Add  [Del] Remove  [Esc] Back",
-        Screen::AddSource => " [Enter] Confirm  [Esc] Cancel",
-        Screen::Playlists => " [↑↓] Navigate  [Enter] Load  [Del] Delete  [Esc] Back",
-        Screen::SavePlaylist => " Type a name, then [Enter] to save  [Esc] Cancel",
-        Screen::PlaylistConflict => " [O] Overwrite  [N] New dated  [C] Cancel",
-        Screen::Transfer => " [Esc/L] Back to library  [Q] Quit",
-        Screen::RepairIpod => " [F] Fix all  [↑↓] Navigate  [Esc] Back",
-        Screen::DeviceTracks => " [↑↓] Navigate  [Esc/Q] Back",
-        Screen::EditTrack => " [Tab/↑↓] Next field  [Enter] Save  [Esc] Cancel",
-        Screen::Dedup => " [Tab] Panel  [↑↓] Navigate  [Space] Cycle action  [A] Auto  [Enter] Apply  [Esc] Cancel",
-        Screen::Amazon => " [Tab] Pane  [↑↓] Navigate  [D] Download  [R] Refresh  [Esc] Back",
     };
 
     let status = app.status_message.as_deref().unwrap_or(help);
@@ -336,8 +345,11 @@ fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
         };
     }
 
-    let mut state = ListState::default();
-    state.select(Some(visual_selected));
+    let mut state = centered_list_state(
+        visual_selected,
+        items.len(),
+        area.height.saturating_sub(2),
+    );
 
     let list = List::new(items)
         .block(block)
@@ -567,8 +579,11 @@ fn render_devices_pane(app: &App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    let mut state = ListState::default();
-    state.select(Some(app.selected_device));
+    let mut state = centered_list_state(
+        app.selected_device,
+        items.len(),
+        area.height.saturating_sub(2),
+    );
 
     let list = List::new(items)
         .block(block)
@@ -650,8 +665,11 @@ fn render_sources(app: &App, frame: &mut Frame, area: Rect) {
             .map(|p| ListItem::new(p.display().to_string()))
             .collect();
 
-        let mut state = ListState::default();
-        state.select(Some(app.sources_selected));
+        let mut state = centered_list_state(
+            app.sources_selected,
+            items.len(),
+            area.height.saturating_sub(2),
+        );
 
         let list = List::new(items)
             .block(block)
@@ -701,8 +719,11 @@ fn render_playlists(app: &App, frame: &mut Frame, area: Rect) {
         .map(|name| ListItem::new(name.as_str()))
         .collect();
 
-    let mut state = ListState::default();
-    state.select(Some(app.playlists_selected));
+    let mut state = centered_list_state(
+        app.playlists_selected,
+        items.len(),
+        area.height.saturating_sub(2),
+    );
 
     let list = List::new(items)
         .block(block)
@@ -870,8 +891,11 @@ fn render_repair(app: &App, frame: &mut Frame, area: Rect) {
         }
     }
 
-    let mut state = ListState::default();
-    state.select(Some(app.repair_selected));
+    let mut state = centered_list_state(
+        app.repair_selected,
+        items.len(),
+        area.height.saturating_sub(2),
+    );
 
     let list = List::new(items)
         .block(block)
@@ -979,8 +1003,11 @@ fn render_device_tracks(app: &App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    let mut state = ListState::default();
-    state.select(Some(app.device_tracks_selected));
+    let mut state = centered_list_state(
+        app.device_tracks_selected,
+        items.len(),
+        area.height.saturating_sub(2),
+    );
 
     let list = List::new(items)
         .block(block)
@@ -1155,8 +1182,11 @@ fn render_dedup(app: &App, frame: &mut Frame, area: Rect) {
             .border_style(Style::default().fg(left_border)),
     );
 
-    let mut list_state = ListState::default();
-    list_state.select(Some(state.group_index));
+    let mut list_state = centered_list_state(
+        state.group_index,
+        state.group_count(),
+        left.height.saturating_sub(2),
+    );
     frame.render_stateful_widget(groups_widget, left, &mut list_state);
 
     // ── Right: candidate detail ──────────────────────────────────────────────
@@ -1258,6 +1288,24 @@ fn render_dedup(app: &App, frame: &mut Frame, area: Rect) {
             .wrap(Wrap { trim: false });
         frame.render_widget(detail, right);
     }
+}
+
+/// Build a `ListState` that keeps `selected` vertically centered in `visible_height` rows.
+///
+/// When the list is shorter than the viewport nothing is offset.  Near the
+/// top/bottom edges the cursor hugs the edge rather than centering (just like
+/// vim's `scrolloff` set to half the screen height).
+fn centered_list_state(selected: usize, total: usize, visible_height: u16) -> ListState {
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    let visible = visible_height as usize;
+    if total > visible {
+        let half = visible / 2;
+        let ideal = selected.saturating_sub(half);
+        let max_offset = total.saturating_sub(visible);
+        *state.offset_mut() = ideal.min(max_offset);
+    }
+    state
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -1514,10 +1562,11 @@ fn render_amazon(app: &App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    let mut list_state = ListState::default();
-    if !state.tracks.is_empty() {
-        list_state.select(Some(state.catalog_index));
-    }
+    let mut list_state = if !state.tracks.is_empty() {
+        centered_list_state(state.catalog_index, state.tracks.len(), catalog_list_area.height)
+    } else {
+        ListState::default()
+    };
     frame.render_stateful_widget(List::new(items), catalog_list_area, &mut list_state);
 
     // ── Right: local library ────────────────────────────────────────────────
@@ -1562,10 +1611,11 @@ fn render_amazon(app: &App, frame: &mut Frame, area: Rect) {
 
     let local_count = local_items.len();
     let local_sel = state.local_index.min(local_count.saturating_sub(1));
-    let mut local_state = ListState::default();
-    if local_count > 0 {
-        local_state.select(Some(local_sel));
-    }
+    let mut local_state = if local_count > 0 {
+        centered_list_state(local_sel, local_count, inner_right.height)
+    } else {
+        ListState::default()
+    };
     frame.render_stateful_widget(List::new(local_items), inner_right, &mut local_state);
 
     // ── Footer hint ─────────────────────────────────────────────────────────
@@ -1633,4 +1683,110 @@ fn render_amazon_overlay(app: &App, overlay: &AmazonOverlay, frame: &mut Frame, 
     ]);
 
     frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), inner);
+}
+
+
+// ---------------------------------------------------------------------------
+// Search overlay
+// ---------------------------------------------------------------------------
+
+fn render_search_overlay(state: &SearchState, frame: &mut Frame, area: Rect) {
+    let width = (area.width as f32 * 0.80) as u16;
+    let max_results = 16usize;
+    let result_rows = state.results.len().min(max_results) as u16;
+    let height = (result_rows + 5).max(7).min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let box_area = Rect { x, y, width, height };
+
+    let result_count = state.results.len();
+    let title = if state.query.is_empty() {
+        " Search ".to_string()
+    } else if result_count == 0 {
+        " Search — no results ".to_string()
+    } else {
+        format!(" Search — {result_count} result{} ", if result_count == 1 { "" } else { "s" })
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(CLR_ACCENT));
+
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+
+    let [input_area, results_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+
+    let input_line = Line::from(vec![
+        Span::styled("/", Style::default().fg(CLR_ACCENT).bold()),
+        Span::raw(" "),
+        Span::raw(state.query.as_str()),
+        Span::styled("▌", Style::default().fg(CLR_ACCENT)),
+    ]);
+    frame.render_widget(Paragraph::new(input_line), input_area);
+
+    if state.results.is_empty() {
+        if !state.query.trim().is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled("No matches found.", Style::default().fg(CLR_DIM))),
+                results_area,
+            );
+        }
+        return;
+    }
+
+    let avail_width = results_area.width as usize;
+
+    let items: Vec<ListItem> = state
+        .results
+        .iter()
+        .take(max_results)
+        .enumerate()
+        .map(|(i, result)| {
+            let selected = i == state.selected;
+            let badge = format!("[{}]", result.matched_fields.join(" · "));
+            let badge_width = badge.chars().count();
+            let main_text = format!(
+                "{} — {}",
+                result.track.display_artist(),
+                result.track.display_title()
+            );
+            let max_main = avail_width.saturating_sub(badge_width + 2);
+            let main_truncated: String = main_text.chars().take(max_main).collect();
+            let padding = avail_width.saturating_sub(main_truncated.chars().count() + badge_width);
+
+            let main_style = if selected {
+                Style::default().fg(Color::White).bg(Color::DarkGray).bold()
+            } else {
+                Style::default()
+            };
+            let badge_style = if selected {
+                Style::default().fg(CLR_ACCENT).bg(Color::DarkGray).bold()
+            } else {
+                Style::default().fg(CLR_ACCENT).add_modifier(Modifier::DIM)
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(main_truncated, main_style),
+                Span::styled(" ".repeat(padding), main_style),
+                Span::styled(badge, badge_style),
+            ]))
+        })
+        .collect();
+
+    let display_count = state.results.len().min(max_results);
+    let sel = state.selected.min(display_count.saturating_sub(1));
+    let mut list_state = centered_list_state(sel, display_count, results_area.height);
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(Style::default().bg(Color::DarkGray)),
+        results_area,
+        &mut list_state,
+    );
 }

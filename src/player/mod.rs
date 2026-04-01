@@ -6,7 +6,9 @@ use std::io::BufReader;
 use std::time::{Duration, Instant};
 
 use rodio::{Decoder, OutputStreamHandle, Sink, Source};
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(unix)]
+use tracing::warn;
 
 use crate::library::Track;
 use crate::media::MediaItem;

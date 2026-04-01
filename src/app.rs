@@ -160,6 +160,56 @@ impl DedupState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Search state
+// ---------------------------------------------------------------------------
+
+/// A single match returned by the library search.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    /// Index into `Library::all_tracks` so we can jump to it.
+    pub track_index: usize,
+    /// Clone of the matched track (avoids borrow against the library).
+    pub track: crate::library::Track,
+    /// Human-readable labels for every field that matched the query,
+    /// e.g. `["Artist", "Tag"]`.
+    pub matched_fields: Vec<&'static str>,
+}
+
+/// Live-search overlay state.
+#[derive(Debug)]
+pub struct SearchState {
+    /// Current query string (updated on every keystroke).
+    pub query: String,
+    /// Results for the current query, ordered by relevance then track order.
+    pub results: Vec<SearchResult>,
+    /// Selected row index within `results`.
+    pub selected: usize,
+}
+
+impl SearchState {
+    pub fn new() -> Self {
+        Self { query: String::new(), results: Vec::new(), selected: 0 }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.selected > 0 { self.selected -= 1; }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.selected + 1 < self.results.len() { self.selected += 1; }
+    }
+
+    pub fn page_up(&mut self, n: usize) {
+        self.selected = self.selected.saturating_sub(n);
+    }
+
+    pub fn page_down(&mut self, n: usize) {
+        let max = self.results.len().saturating_sub(1);
+        self.selected = (self.selected + n).min(max);
+    }
+}
+
 /// State for the tag-editing overlay.
 #[derive(Debug)]
 pub struct TagEditState {
@@ -342,6 +392,10 @@ pub struct App {
     /// Active tag-editing overlay, if any.
     pub tag_edit_state: Option<TagEditState>,
 
+    // --- search ---
+    /// Live search overlay; `Some` while the search UI is open.
+    pub search_state: Option<SearchState>,
+
     // --- marquee scrolling ---
     /// Monotonically incrementing tick counter, reset whenever the focused
     /// library track changes.  The UI computes the scroll offset from this.
@@ -399,6 +453,7 @@ impl App {
             tag_store: TagStore::load(),
             playlist_membership: HashMap::new(),
             tag_edit_state: None,
+            search_state: None,
             amazon_key_seq: Vec::new(),
             amazon_key_seq_time: None,
             amazon_state: None,
@@ -1107,6 +1162,130 @@ impl App {
     /// Cancel the tag edit without saving.
     pub fn cancel_tag_edit(&mut self) {
         self.tag_edit_state = None;
+    }
+
+    // --- search ---
+
+    /// Open the search overlay with an empty query.
+    pub fn begin_search(&mut self) {
+        self.search_state = Some(SearchState::new());
+    }
+
+    /// Append a character to the query and re-run the search.
+    pub fn search_push(&mut self, c: char) {
+        if let Some(state) = &mut self.search_state {
+            state.query.push(c);
+            state.selected = 0;
+        }
+        self.run_search();
+    }
+
+    /// Remove the last character from the query and re-run the search.
+    pub fn search_pop(&mut self) {
+        if let Some(state) = &mut self.search_state {
+            state.query.pop();
+            state.selected = 0;
+        }
+        self.run_search();
+    }
+
+    /// Navigate to the selected result in the library and close the overlay.
+    pub fn confirm_search(&mut self) {
+        let Some(state) = &self.search_state else { return };
+        let Some(result) = state.results.get(state.selected) else {
+            self.search_state = None;
+            return;
+        };
+        let target_path = result.track.path.clone();
+        if let Some(pos) = self.library.tracks.iter().position(|t| t.path == target_path) {
+            self.library.selected_index = pos;
+            self.reset_marquee();
+        } else {
+            // Track filtered out by playlist — clear filter first.
+            self.library.clear_playlist();
+            if let Some(pos) = self.library.tracks.iter().position(|t| t.path == target_path) {
+                self.library.selected_index = pos;
+                self.reset_marquee();
+            }
+        }
+        self.search_state = None;
+    }
+
+    /// Close the search overlay without navigating.
+    pub fn cancel_search(&mut self) {
+        self.search_state = None;
+    }
+
+    /// Run the current query against all tracks and update results.
+    fn run_search(&mut self) {
+        let Some(state) = &mut self.search_state else { return };
+        let query = state.query.trim().to_lowercase();
+
+        if query.is_empty() {
+            state.results.clear();
+            return;
+        }
+
+        let mut results: Vec<SearchResult> = self
+            .library
+            .all_tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, track)| {
+                let mut fields: Vec<&'static str> = Vec::new();
+
+                if track.title.to_lowercase().contains(&query) { fields.push("Title"); }
+                if track.artist.to_lowercase().contains(&query) { fields.push("Artist"); }
+                if track.album.to_lowercase().contains(&query) { fields.push("Album"); }
+                if track.year.map(|y| y.to_string()).as_deref().unwrap_or("").contains(&query) {
+                    fields.push("Year");
+                }
+                // File stem — only shown if title didn't already match
+                if !fields.contains(&"Title") {
+                    if track.path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_lowercase().contains(&query))
+                        .unwrap_or(false)
+                    {
+                        fields.push("File");
+                    }
+                }
+                // User tags
+                if self.tag_store.tags_for(&track.path)
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(&query))
+                {
+                    fields.push("Tag");
+                }
+                // Playlist membership
+                if self.playlist_membership
+                    .get(&track.path)
+                    .map(|plists| plists.iter().any(|p| p.to_lowercase().contains(&query)))
+                    .unwrap_or(false)
+                {
+                    fields.push("Playlist");
+                }
+
+                if fields.is_empty() {
+                    None
+                } else {
+                    Some(SearchResult {
+                        track_index: idx,
+                        track: track.clone(),
+                        matched_fields: fields,
+                    })
+                }
+            })
+            .collect();
+
+        // Exact title match → top; exact artist → next; rest in scan order.
+        results.sort_by_key(|r| {
+            let exact_title  = r.track.title.to_lowercase()  == query;
+            let exact_artist = r.track.artist.to_lowercase() == query;
+            (!exact_title, !exact_artist, r.track_index)
+        });
+
+        state.results = results;
     }
 
     // --- Amazon easter egg ---

@@ -15,7 +15,8 @@ MOD tracker playback, written in Rust.
 - Local library scanner: MP3, M4A, AAC, FLAC, OGG, Opus, WAV, AIFF
 - **Magic-byte format verification** — extension mismatches rejected at import time
 - **MOD tracker support**: MOD, XM, IT, S3M, MO3 and 20+ legacy formats (optional — see below)
-- Real-time **waveform oscilloscope** (`[V]`)
+- Real-time **waveform oscilloscope** (`[V]`) — Unicode half-block characters (▀ ▄ █)
+- **Live search** (`[/]`) — searches title, artist, album, year, tags, playlists, and filename; shows matched fields inline
 - **Sort & group presets** (`[Z]`): by artist, album, year, month, file extension, or user tags
 - **Duplicate finder** (`[F]`): exact-content and metadata-match detection with per-track keep/delete UI
 - **User tag library** (`[G]`): tag any track with custom keywords; filter and group by tag
@@ -25,7 +26,7 @@ MOD tracker playback, written in Rust.
 - iTunesDB & iTunesSD read/write — no iTunes required
 - iPod health scan and database repair
 - Playlists saved as JSON; single-track repeat
-- **Ctrl+V paste** in all text input fields
+- **Ctrl+V paste** in all text input fields (desktop platforms)
 - **mpv fallback** for audio playback on Termux (when the native backend is unavailable)
 
 ---
@@ -133,15 +134,19 @@ ready-to-use symlinks:
 | `~/storage/downloads` | `/storage/emulated/0/Download` |
 | `~/storage/dcim` | `/storage/emulated/0/DCIM` |
 
-On first launch **`cmp` automatically detects and adds `~/storage/music`** (or
-`~/storage/shared/Music`) as a source directory — no manual setup needed.
+On first launch **`cmp` automatically detects and adds** a music source in this
+priority order:
 
-To add other folders, press `[S]` → `[A]` and enter the path, for example:
+1. `~/storage/music` — the dedicated Music symlink (preferred)
+2. `~/storage/shared/Music` — the Music folder inside full Internal Storage
+3. `~/Music` — home directory Music folder (fallback)
+
+To add other folders, press `[S]` → `[A]` and enter the path.  Tilde paths
+are expanded automatically, so you can type either:
 
 ```
-/storage/emulated/0/Download
+~/storage/shared/Podcasts
 /storage/emulated/0/Podcasts
-~/storage/shared/Albums
 ```
 
 > If you see *"Not a directory"* when entering a `/storage/...` path, run
@@ -201,10 +206,11 @@ cargo run -- --library /path/to/Music
 | `[` / `]` | Volume down / up |
 | `O` | Toggle single-track repeat |
 | `V` | Toggle waveform oscilloscope |
+| `/` | Open live search overlay |
 | `Z` | Cycle sort / group-by preset |
-| `Tab` | Switch focus Library ↔ Devices |
-| `E` | Edit tags (title, artist, album, year, genre) |
-| `G` | Edit user tags / keywords for focused track |
+| `Tab` | Switch focus: Library ↔ Device pane |
+| `E` | Edit metadata tags (title, artist, album, year, genre) |
+| `G` | Edit user keyword tags for focused track |
 | `F` | Find duplicates |
 | `S` | Manage source directories |
 | `L` | Browse / load playlists |
@@ -212,10 +218,10 @@ cargo run -- --library /path/to/Music
 | `R` | Rescan library (or clear active playlist filter) |
 | `D` | Rescan connected devices |
 | `T` | Transfer selected tracks to iPod |
-| `I` | Browse iPod library |
+| `I` | Browse iPod track library |
 | `X` | Scan iPod health |
 | `N` | Initialise fresh iTunesDB on iPod |
-| `U` | Dump iTunesDB contents to log |
+| `U` | Dump iTunesDB contents to transfer log |
 | `Q` | Quit |
 
 ### Sort / Group-by presets (`Z`)
@@ -236,7 +242,38 @@ Pressing `Z` cycles through these presets in order:
 | Group by Month | Sections per mtime year · month |
 | Group by Tag | Sections per user tag (untagged last) |
 
-### Tag editor overlay (`G`)
+### Live search overlay (`/`)
+
+Results update on every keystroke.  Each result shows the track and a badge
+indicating which fields matched, e.g. `[Artist · Tag]`.
+
+Fields searched: **Title, Artist, Album, Year, user Tags, Playlist name, File name**
+
+| Key | Action |
+|-----|--------|
+| Any character | Append to search query |
+| `Backspace` | Delete last character |
+| `Ctrl+V` | Paste from clipboard |
+| `↑` / `↓` or `k` / `j` | Navigate results |
+| `Page Up` / `Page Down` | Jump 10 results |
+| `Enter` | Jump to selected track in library |
+| `Esc` | Close without navigating |
+
+Results are ranked: exact title matches first, then exact artist matches, then
+remaining matches in scan order.
+
+### Metadata tag editor (`E`)
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `↓` / `j` | Next field |
+| `↑` / `k` | Previous field |
+| `Enter` | Save tags to file |
+| `Esc` | Cancel, discard changes |
+
+Fields: Title, Artist, Album, Year, Genre.
+
+### User tag editor (`G`)
 
 | Key | Action |
 |-----|--------|
@@ -250,37 +287,28 @@ Tags are comma-separated keywords (e.g. `rock, 80s, favourite`).  They are
 normalised to lowercase and deduplicated on save.  Tags appear as `#tag` badges
 inline in the track list and can be grouped with `Z → Group by Tag`.
 
-### Tag editor overlay (`E`)
-
-| Key | Action |
-|-----|--------|
-| `Tab` / `↓` / `j` | Next field |
-| `↑` / `k` | Previous field |
-| `Enter` | Save tags to file |
-| `Esc` | Cancel, discard changes |
-
 ### Duplicate finder (`F`)
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` | Navigate duplicate groups (left panel) |
+| `↑` / `↓` or `k` / `j` | Navigate duplicate groups (left panel) |
 | `Tab` | Switch focus: group list ↔ candidates |
-| `Space` | Cycle action for focused candidate (Keep / Delete / ?) |
+| `Space` | Cycle action for focused candidate (Keep / Delete) |
 | `A` | Auto-suggest best action for all groups |
-| `Enter` | Execute all Delete actions (moves to Trash) |
+| `Enter` | Execute all Delete actions |
 | `Esc` | Cancel, return to library |
 
 ### Waveform oscilloscope (`V`)
 
 Replaces the library pane with a real-time oscilloscope trace of the playing
-audio.  Uses Unicode half-block characters (▀ ▄ █) for double vertical
+audio.  Uses Unicode half-block characters (▀ ▄ █ space) for double vertical
 resolution.  Press `V` or `Esc` to return to the library.
 
 > Not available when using the mpv fallback backend (Termux without native audio).
 
 ### Text input fields
 
-All text input overlays (Add Source, Save Playlist, tag editors) support:
+All text input overlays (Add Source, Save Playlist, tag editors, search) support:
 
 | Key | Action |
 |-----|--------|
@@ -290,9 +318,8 @@ All text input overlays (Add Source, Save Playlist, tag editors) support:
 | `Enter` | Confirm |
 | `Esc` | Cancel |
 
-> Clipboard paste is not available on Android/Termux (no system clipboard
-> service in a terminal process).  Type or use a Termux keyboard shortcut to
-> paste instead.
+> Clipboard paste (`Ctrl+V`) is not available on Android/Termux — no system
+> clipboard service exists in a terminal process.
 
 ---
 
@@ -362,21 +389,29 @@ GPL-3.0 — see [LICENSE](LICENSE).
 ```
 console-music-player/
 ├── src/
-│   ├── main.rs             # Entry point, event loop, DLL probe
-│   ├── app.rs              # App state machine
+│   ├── main.rs             # Entry point, event loop, key dispatch, DLL probe
+│   ├── app.rs              # App state machine (12 screens, all overlay states)
 │   ├── config.rs           # Persistent config (source dirs, Amazon settings)
+│   ├── util.rs             # Cross-cutting helpers (tilde expansion)
+│   ├── error.rs            # AppError / Result types
 │   ├── ui/mod.rs           # Ratatui rendering (all screens + overlays)
-│   ├── player/mod.rs       # rodio backend + mpv fallback + waveform tap
+│   ├── player/mod.rs       # rodio backend + mpv subprocess fallback + waveform tap
 │   ├── visualizer.rs       # SampleCapture source wrapper + oscilloscope renderer
 │   ├── tracker/mod.rs      # libopenmpt wrapper + pure-Rust metadata parsers
-│   ├── amazon/mod.rs       # Amazon Music easter egg (AmazonClient, download)
+│   ├── amazon/mod.rs       # Amazon Music easter egg (AmazonClient, catalog, download)
 │   ├── tags.rs             # User keyword tag store (tags.json)
 │   ├── library/
-│   │   ├── mod.rs          # Library state, sort/group-by presets, Track struct
+│   │   ├── mod.rs          # Library state, 11 sort/group-by presets, Track struct
 │   │   ├── scanner.rs      # Filesystem scan, lofty tag reader/writer, magic-byte gate
 │   │   ├── dedup.rs        # Duplicate detection (exact-content + metadata match)
 │   │   └── magic.rs        # Magic-byte format verification
-│   └── ...
+│   ├── device/
+│   │   ├── mod.rs          # MusicDevice trait + enumeration
+│   │   ├── ipod_ums.rs     # USB Mass Storage iPod implementation
+│   │   └── apple.rs        # iTunes AFC protocol
+│   ├── transfer/mod.rs     # Batch upload engine + progress events
+│   ├── playlist/mod.rs     # JSON playlist persistence
+│   └── media/mod.rs        # MediaItem trait
 ├── ipod-rs/                # Workspace crate: iTunesDB / iTunesSD / detect
 │   └── src/
 │       ├── itunesdb.rs     # Binary DB read/write (atomic via .tmp rename)
@@ -422,9 +457,11 @@ found, all playback routes through an `mpv` subprocess:
 - **Spawn:** `mpv --no-terminal --no-video --input-ipc-server=<sock> <file>`
 - **Control:** JSON commands over a Unix socket (`{"command":["set_property","pause",true]}`)
 - **End-of-track:** detected via `process.try_wait()`
-- **Volume:** `set_property volume <0-100>` sent over the socket
+- **Volume:** `set_property volume <0–100>` sent over the socket
 
-The socket file is created in the OS temp dir and cleaned up on stop.
+The socket file is created in the OS temp dir (`std::env::temp_dir()`) and
+cleaned up on stop.  No extra crates are required — `std::os::unix::net` handles
+the socket communication.
 
 ### Android / Termux — C++ runtime details
 
@@ -450,17 +487,21 @@ Error: unable to find library lc++_static   → fixed automatically (build.rs st
 ### Android / Termux — Internal Storage access
 
 `~/storage/` symlinks are created by `termux-setup-storage`.  On first launch
-`cmp` checks for `~/storage/music` and `~/storage/shared/Music` in that order
-and seeds whichever exists as the initial source directory.
+`cmp` checks these paths in order and seeds the first one that exists:
 
-The `add_source` path in `app.rs` detects Android targets and appends a hint
-to the "Not a directory" error when the user types a `/storage/...` or
-`/sdcard/...` path before running `termux-setup-storage`.
+1. `~/storage/music` — Termux symlink directly to the Music folder
+2. `~/storage/shared/Music` — Music folder inside full Internal Storage
+3. `~/Music` — standard home directory fallback
+
+The `add_source` path validates tilde-expanded paths and appends a
+`termux-setup-storage` hint when a `/storage/...` or `/sdcard/...` path doesn't
+exist yet.  Tilde expansion (`~` → `$HOME`) is handled by `util::expand_tilde`
+and applied to all path input fields (Add Source, Amazon download dir).
 
 Clipboard (`arboard`) is excluded on Android via a
 `[target.'cfg(not(target_os = "android"))'.dependencies]` entry in
-`Cargo.toml`.  The `clipboard_paste()` function in `main.rs` returns `None`
-on Android via `#[cfg(target_os = "android")]`.
+`Cargo.toml`.  The `clipboard_paste()` function returns `None` on Android via
+`#[cfg(target_os = "android")]`.
 
 ### Windows DLL handling
 
@@ -551,11 +592,19 @@ Start the app first via a run task, then attach.
 
 ### Data files
 
-| File | Location | Contents |
-|------|----------|----------|
-| `config.json` | `%APPDATA%\console-music-player\` (Win) / `~/.config/console-music-player/` (Linux/macOS) / `~/.config/console-music-player/` (Termux) | Source directories, Amazon cookie & download dir |
-| `tags.json` | same directory | User keyword tags per track path |
-| `*.json` (playlists) | same directory | Track path lists per named playlist |
+All three files live in the same platform-specific config directory:
+
+| Platform | Directory |
+|----------|-----------|
+| Windows | `%APPDATA%\console-music-player\` |
+| Linux / macOS | `~/.config/console-music-player/` |
+| Termux | `~/.config/console-music-player/` |
+
+| File | Contents |
+|------|----------|
+| `config.json` | Source directories, Amazon cookie and download dir |
+| `tags.json` | User keyword tags per track path |
+| `playlists/{name}.json` | Track path list per named playlist (one file each) |
 
 ### iTunesDB / iTunesSD internals
 

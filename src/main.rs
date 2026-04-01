@@ -266,8 +266,9 @@ async fn run_event_loop(
                     let text = clipboard_paste().unwrap_or_default();
                     let clean: String = text.chars().filter(|c| !c.is_control() || *c == ' ').collect();
                     if !clean.is_empty() {
-                        // Tag edit overlay has its own input field.
-                        if let Some(state) = &mut app.tag_edit_state {
+                        if app.search_state.is_some() {
+                            for c in clean.chars() { app.search_push(c); }
+                        } else if let Some(state) = &mut app.tag_edit_state {
                             state.input.push_str(&clean);
                         } else {
                             app.input_buffer.push_str(&clean);
@@ -280,7 +281,7 @@ async fn run_event_loop(
                 let is_input_screen = matches!(
                     app.screen,
                     Screen::AddSource | Screen::SavePlaylist | Screen::EditTrack | Screen::Amazon
-                );
+                ) || app.search_state.is_some();
                 if !is_input_screen {
                     app.status_message = None;
                 }
@@ -300,6 +301,11 @@ async fn run_event_loop(
 const PAGE_SIZE: usize = 10;
 
 fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
+    // Search overlay intercepts all keys when open.
+    if app.search_state.is_some() {
+        handle_search_key(app, key);
+        return;
+    }
     // Tag edit overlay intercepts all keys.
     if app.tag_edit_state.is_some() {
         handle_tag_edit_key(app, key);
@@ -477,6 +483,32 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
             ));
         }
 
+        KeyCode::Char('/') => app.begin_search(),
+
+        _ => {}
+    }
+}
+
+fn handle_search_key(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc => app.cancel_search(),
+        KeyCode::Enter => app.confirm_search(),
+
+        KeyCode::Up   | KeyCode::Char('k') => {
+            if let Some(s) = &mut app.search_state { s.move_up(); }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(s) = &mut app.search_state { s.move_down(); }
+        }
+        KeyCode::PageUp => {
+            if let Some(s) = &mut app.search_state { s.page_up(PAGE_SIZE); }
+        }
+        KeyCode::PageDown => {
+            if let Some(s) = &mut app.search_state { s.page_down(PAGE_SIZE); }
+        }
+
+        KeyCode::Backspace => app.search_pop(),
+        KeyCode::Char(c)   => app.search_push(c),
         _ => {}
     }
 }
