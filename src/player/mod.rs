@@ -1,4 +1,5 @@
-//! Audio playback engine wrapping `rodio`.
+//! Audio playback engine wrapping `rodio`, with an `mpv` subprocess fallback
+//! for platforms where rodio/cpal cannot access the audio system (e.g. Termux).
 
 use std::fs::File;
 use std::io::BufReader;
@@ -11,6 +12,128 @@ use crate::library::Track;
 use crate::media::MediaItem;
 use crate::tracker;
 use crate::visualizer::{self, SampleCapture, WaveBuffer};
+
+// ---------------------------------------------------------------------------
+// External player (mpv subprocess via IPC socket)
+// ---------------------------------------------------------------------------
+
+/// Returns the name of an external audio player binary found in PATH, or None.
+/// Only `mpv` is supported (it provides a Unix IPC socket for control).
+pub fn probe_external_player() -> Option<String> {
+    #[cfg(unix)]
+    {
+        for candidate in &["mpv"] {
+            if std::process::Command::new("which")
+                .arg(candidate)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A running `mpv` process controlled over its IPC socket.
+#[cfg(unix)]
+struct ExternalHandle {
+    process: std::process::Child,
+    /// Path to the Unix socket mpv is listening on.
+    sock_path: std::path::PathBuf,
+    started_at: Option<Instant>,
+    elapsed_before_pause: Duration,
+    paused: bool,
+}
+
+#[cfg(unix)]
+impl ExternalHandle {
+    fn spawn(file: &std::path::Path, volume_pct: u32) -> Result<Self, String> {
+        // Place the socket in the OS temp dir so it's always writable.
+        let sock_path = std::env::temp_dir()
+            .join(format!("cmp-mpv-{}.sock", std::process::id()));
+
+        let process = std::process::Command::new("mpv")
+            .args([
+                "--no-terminal",
+                "--no-video",
+                "--really-quiet",
+                &format!("--input-ipc-server={}", sock_path.display()),
+                &format!("--volume={volume_pct}"),
+                file.to_str().unwrap_or(""),
+            ])
+            .spawn()
+            .map_err(|e| format!("Could not spawn mpv: {e}"))?;
+
+        Ok(Self {
+            process,
+            sock_path,
+            started_at: Some(Instant::now()),
+            elapsed_before_pause: Duration::ZERO,
+            paused: false,
+        })
+    }
+
+    /// Send a JSON command to the mpv IPC socket.
+    /// Retries briefly to allow mpv time to create the socket after startup.
+    fn send(&self, json: &str) {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        for attempt in 0..20 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if let Ok(mut s) = UnixStream::connect(&self.sock_path) {
+                let _ = write!(s, "{json}\n");
+                return;
+            }
+        }
+        warn!("mpv IPC: could not connect to {:?}", self.sock_path);
+    }
+
+    fn pause(&mut self) {
+        self.send(r#"{"command":["set_property","pause",true]}"#);
+        if !self.paused {
+            if let Some(t) = self.started_at.take() {
+                self.elapsed_before_pause += t.elapsed();
+            }
+            self.paused = true;
+        }
+    }
+
+    fn resume(&mut self) {
+        self.send(r#"{"command":["set_property","pause",false]}"#);
+        if self.paused {
+            self.started_at = Some(Instant::now());
+            self.paused = false;
+        }
+    }
+
+    fn stop(&mut self) {
+        self.send(r#"{"command":["quit"]}"#);
+        let _ = self.process.wait();
+        let _ = std::fs::remove_file(&self.sock_path);
+    }
+
+    fn is_finished(&mut self) -> bool {
+        self.process.try_wait().map(|r| r.is_some()).unwrap_or(false)
+    }
+
+    fn elapsed(&self) -> Duration {
+        if self.paused {
+            self.elapsed_before_pause
+        } else {
+            self.elapsed_before_pause
+                + self.started_at.map(|t| t.elapsed()).unwrap_or_default()
+        }
+    }
+
+    fn set_volume(&self, volume_pct: u32) {
+        self.send(&format!(r#"{{"command":["set_property","volume",{volume_pct}]}}"#));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -75,14 +198,25 @@ pub struct Player {
     /// Shared sample ring-buffer fed by the audio thread, read by the UI.
     pub wave_buffer: WaveBuffer,
 
-    /// Wall-clock moment the current play/resume started.
+    /// Wall-clock moment the current play/resume started (rodio path).
     started_at: Option<Instant>,
-    /// Accumulated playback time before the last pause.
+    /// Accumulated playback time before the last pause (rodio path).
     elapsed_before_pause: Duration,
+
+    /// External mpv process, used when rodio is unavailable (e.g. Termux).
+    #[cfg(unix)]
+    ext: Option<ExternalHandle>,
+    /// Name of the detected external player binary, e.g. "mpv".
+    pub ext_player: Option<String>,
 }
 
 impl Player {
     pub fn new(handle: Option<OutputStreamHandle>) -> Self {
+        let ext_player = if handle.is_none() {
+            probe_external_player()
+        } else {
+            None
+        };
         Self {
             handle,
             sink: None,
@@ -93,6 +227,9 @@ impl Player {
             wave_buffer: visualizer::new_wave_buffer(),
             started_at: None,
             elapsed_before_pause: Duration::ZERO,
+            #[cfg(unix)]
+            ext: None,
+            ext_player,
         }
     }
 
@@ -107,34 +244,50 @@ impl Player {
     pub fn play(&mut self, track: &Track) -> Result<(), String> {
         self.stop_internal();
 
-        let Some(handle) = &self.handle else {
-            return Err("No audio output device — playback unavailable.".into());
-        };
+        // ── rodio path ────────────────────────────────────────────────────
+        if let Some(handle) = &self.handle {
+            let sink = Sink::try_new(handle)
+                .map_err(|e| format!("Cannot create audio sink: {e}"))?;
 
-        let sink = Sink::try_new(handle)
-            .map_err(|e| format!("Cannot create audio sink: {e}"))?;
+            let ext = track
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
 
-        let ext = track
-            .path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
+            if tracker::is_tracker_ext(&ext) {
+                self.play_tracker(track, &sink)?;
+            } else {
+                self.play_standard(track, &sink)?;
+            }
 
-        if tracker::is_tracker_ext(&ext) {
-            self.play_tracker(track, &sink)?;
-        } else {
-            self.play_standard(track, &sink)?;
+            self.sink = Some(sink);
+            self.current_track = Some(track.clone());
+            self.state = PlaybackState::Playing;
+            self.started_at = Some(Instant::now());
+            self.elapsed_before_pause = Duration::ZERO;
+            info!("Playing (rodio): {} — {}", track.display_artist(), track.display_title());
+            return Ok(());
         }
 
-        self.sink = Some(sink);
-        self.current_track = Some(track.clone());
-        self.state = PlaybackState::Playing;
-        self.started_at = Some(Instant::now());
-        self.elapsed_before_pause = Duration::ZERO;
+        // ── external player path (e.g. mpv on Termux) ────────────────────
+        #[cfg(unix)]
+        {
+            if self.ext_player.is_some() {
+                let vol_pct = (self.volume * 100.0).round() as u32;
+                let handle = ExternalHandle::spawn(&track.path, vol_pct)
+                    .map_err(|e| e.to_string())?;
+                self.ext = Some(handle);
+                self.current_track = Some(track.clone());
+                self.state = PlaybackState::Playing;
+                info!("Playing (mpv): {} — {}", track.display_artist(), track.display_title());
+                return Ok(());
+            }
+        }
 
-        info!("Playing: {} — {}", track.display_artist(), track.display_title());
-        Ok(())
+        Err("No audio output device and no external player found.\n\
+             On Termux, run:  pkg install mpv".into())
     }
 
     /// Decode and append a standard audio file (MP3, FLAC, etc.) via rodio/symphonia.
@@ -207,12 +360,20 @@ impl Player {
         if let Some(sink) = &self.sink {
             sink.set_volume(self.volume);
         }
+        #[cfg(unix)]
+        if let Some(ext) = &self.ext {
+            ext.set_volume((self.volume * 100.0).round() as u32);
+        }
     }
 
     // --- queries ---
 
     /// Elapsed playback time for the current track.
     pub fn elapsed(&self) -> Duration {
+        #[cfg(unix)]
+        if let Some(ext) = &self.ext {
+            return ext.elapsed();
+        }
         match self.state {
             PlaybackState::Stopped => Duration::ZERO,
             PlaybackState::Paused  => self.elapsed_before_pause,
@@ -251,18 +412,29 @@ impl Player {
 
     /// Called every tick — detects natural end-of-track and handles repeat.
     pub fn tick(&mut self) {
-        if self.state == PlaybackState::Playing {
-            if self.sink.as_ref().map(|s| s.empty()).unwrap_or(false) {
-                if self.repeat == RepeatMode::One {
-                    // Re-queue the same track without going through app state.
-                    if let Some(track) = self.current_track.clone() {
-                        let _ = self.play(&track);
-                        return;
-                    }
+        if self.state != PlaybackState::Playing {
+            return;
+        }
+
+        let finished = self.sink.as_ref().map(|s| s.empty()).unwrap_or(false)
+            || {
+                #[cfg(unix)]
+                { self.ext.as_mut().map(|e| e.is_finished()).unwrap_or(false) }
+                #[cfg(not(unix))]
+                { false }
+            };
+
+        if finished {
+            if self.repeat == RepeatMode::One {
+                if let Some(track) = self.current_track.clone() {
+                    let _ = self.play(&track);
+                    return;
                 }
-                self.state = PlaybackState::Stopped;
-                self.started_at = None;
             }
+            self.state = PlaybackState::Stopped;
+            self.started_at = None;
+            #[cfg(unix)]
+            { self.ext = None; }
         }
     }
 
@@ -276,6 +448,11 @@ impl Player {
             }
             self.state = PlaybackState::Paused;
         }
+        #[cfg(unix)]
+        if let Some(ext) = &mut self.ext {
+            ext.pause();
+            self.state = PlaybackState::Paused;
+        }
     }
 
     fn resume(&mut self) {
@@ -284,11 +461,20 @@ impl Player {
             self.started_at = Some(Instant::now());
             self.state = PlaybackState::Playing;
         }
+        #[cfg(unix)]
+        if let Some(ext) = &mut self.ext {
+            ext.resume();
+            self.state = PlaybackState::Playing;
+        }
     }
 
     fn stop_internal(&mut self) {
         if let Some(sink) = self.sink.take() {
             sink.stop();
+        }
+        #[cfg(unix)]
+        if let Some(mut ext) = self.ext.take() {
+            ext.stop();
         }
         self.state = PlaybackState::Stopped;
         self.started_at = None;

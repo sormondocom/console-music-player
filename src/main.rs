@@ -148,7 +148,13 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|r| r.ok());
     let audio_handle = _audio_stream.as_ref().map(|(_, h)| h.clone());
     if audio_handle.is_none() {
-        eprintln!("Warning: no audio output device — playback unavailable.");
+        match crate::player::probe_external_player() {
+            Some(ref cmd) => eprintln!("Info: rodio unavailable — will use {cmd} for playback."),
+            None => eprintln!(
+                "Warning: no audio output device and no external player found.\n\
+                 On Termux, run:  pkg install mpv"
+            ),
+        }
     }
 
     let mut app = App::new(
