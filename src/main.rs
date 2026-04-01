@@ -139,7 +139,13 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(all(feature = "tracker", target_os = "windows"))]
     check_openmpt_dll();
 
-    let _audio_stream = rodio::OutputStream::try_default().ok();
+    // On Android/Termux, cpal calls ndk-context to obtain the Java AudioManager.
+    // No JavaVM exists in a plain terminal process, so the call panics instead of
+    // returning Err.  catch_unwind turns that panic into a None so the app starts
+    // cleanly without audio rather than crashing.
+    let _audio_stream = std::panic::catch_unwind(rodio::OutputStream::try_default)
+        .ok()
+        .and_then(|r| r.ok());
     let audio_handle = _audio_stream.as_ref().map(|(_, h)| h.clone());
     if audio_handle.is_none() {
         eprintln!("Warning: no audio output device — playback unavailable.");
