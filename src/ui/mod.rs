@@ -662,7 +662,12 @@ fn render_sources(app: &App, frame: &mut Frame, area: Rect) {
     }
 
     if app.screen == Screen::AddSource {
-        render_input_overlay("Add Source Directory", &app.input_buffer, frame, area);
+        // On Android show a helpful path example in the overlay title.
+        #[cfg(target_os = "android")]
+        let overlay_title = "Add Source Directory  (e.g. /storage/emulated/0/Music)";
+        #[cfg(not(target_os = "android"))]
+        let overlay_title = "Add Source Directory";
+        render_input_overlay(overlay_title, &app.input_buffer, frame, area);
     }
 }
 

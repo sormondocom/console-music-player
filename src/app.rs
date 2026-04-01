@@ -441,7 +441,15 @@ impl App {
 
     pub fn add_source(&mut self, path: PathBuf) {
         if !path.is_dir() {
-            self.status_message = Some(format!("Not a directory: {}", path.display()));
+            #[cfg(target_os = "android")]
+            let hint = if path.starts_with("/storage") || path.starts_with("/sdcard") {
+                "  Tip: run 'termux-setup-storage' in Termux first, then retry."
+            } else {
+                ""
+            };
+            #[cfg(not(target_os = "android"))]
+            let hint = "";
+            self.status_message = Some(format!("Not a directory: {}{hint}", path.display()));
             return;
         }
         if self.source_dirs.contains(&path) {

@@ -97,12 +97,54 @@ fn parse_initial_library_arg() -> Option<PathBuf> {
     }
 }
 
-fn default_music_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME")
+/// Candidate music directories to seed on first run, in priority order.
+/// Returns all paths that actually exist as directories.
+fn default_music_dirs() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Android / Termux: ~/storage/ symlinks are created by `termux-setup-storage`.
+    // Prefer internal storage Music folder, then the shared root itself.
+    #[cfg(target_os = "android")]
+    if let Ok(home) = std::env::var("HOME") {
+        let storage = PathBuf::from(&home).join("storage");
+        // ~/storage/music  — Termux symlink directly to Music folder
+        candidates.push(storage.join("music"));
+        // ~/storage/shared/Music  — standard Android Music directory
+        candidates.push(storage.join("shared").join("Music"));
+        // ~/storage/shared  — full internal storage root (fallback)
+        candidates.push(storage.join("shared"));
+    }
+
+    // Standard desktop path: ~/Music
+    if let Some(home) = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    Some(PathBuf::from(home).join("Music"))
+        .ok()
+    {
+        candidates.push(PathBuf::from(home).join("Music"));
+    }
+
+    candidates.into_iter().filter(|p| p.is_dir()).collect()
 }
+
+/// Emit a hint to stderr if running on Android and storage isn't set up yet.
+#[cfg(target_os = "android")]
+fn check_android_storage() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let shared = PathBuf::from(&home).join("storage").join("shared");
+    if !shared.exists() {
+        eprintln!(
+            "\nHint: To access Internal Storage from Termux, run once:\n\
+             \n  termux-setup-storage\n\
+             \n\
+             Then restart cmp. It will automatically find your Music folder.\n\
+             You can also press [S] inside cmp and add a path manually, e.g.:\n\
+             \n  /storage/emulated/0/Music\n"
+        );
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn check_android_storage() {}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -123,13 +165,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     if cfg.source_dirs.is_empty() {
-        if let Some(d) = default_music_dir() {
-            if d.is_dir() {
-                info!("Seeding default source: {}", d.display());
-                cfg.source_dirs.push(d);
-            }
+        for d in default_music_dirs() {
+            info!("Seeding default source: {}", d.display());
+            cfg.source_dirs.push(d);
+            // On Android, only seed the first (most specific) match so we don't
+            // double-scan when the Music symlink is inside the shared root.
+            #[cfg(target_os = "android")]
+            break;
         }
     }
+    check_android_storage();
     cfg.save();
 
     // On Windows, libopenmpt.dll is a load-time dependency when the tracker
