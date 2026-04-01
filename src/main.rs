@@ -720,15 +720,12 @@ fn handle_amazon_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
 }
 
 /// Read the system clipboard and return its text content, if available.
+/// Returns None on Android/Termux where no clipboard service exists.
 fn clipboard_paste() -> Option<String> {
-    arboard::Clipboard::new().ok()?.get_text().ok()
-}
-
-/// Append clipboard text to `buf`, stripping control characters except space.
-fn paste_into(buf: &mut String) {
-    if let Some(text) = clipboard_paste() {
-        buf.extend(text.chars().filter(|c| !c.is_control() || *c == ' '));
-    }
+    #[cfg(not(target_os = "android"))]
+    { arboard::Clipboard::new().ok()?.get_text().ok() }
+    #[cfg(target_os = "android")]
+    { None }
 }
 
 /// Generic text-input handler. `on_enter` is called when the user presses Enter.

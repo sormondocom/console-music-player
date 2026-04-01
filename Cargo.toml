@@ -66,7 +66,9 @@ humansize = "2"
 # HTTP client for Amazon Music easter egg (pure-Rust TLS, no OpenSSL dep)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
-# Clipboard read/write (Ctrl+V paste support in text fields)
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# Clipboard read/write (Ctrl+V paste support in text fields).
+# arboard requires a display server — not available on Android/Termux.
 arboard = "3"
 
 [profile.release]

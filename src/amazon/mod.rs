@@ -45,6 +45,8 @@ pub struct AmazonTrack {
     pub album: String,
     /// Track duration in seconds.
     pub duration_secs: u32,
+    /// Purchase date string from Amazon (e.g. "2023-11-15").
+    pub purchase_date: Option<String>,
     /// Pre-resolved download URL, if already fetched from metadata endpoint.
     pub download_url: Option<String>,
 }
@@ -116,21 +118,25 @@ impl AmazonClient {
     }
 
     async fn fetch_page(&self, offset: usize) -> anyhow::Result<(Vec<AmazonTrack>, usize)> {
+        // Filter to PURCHASED tracks only — these are the DRM-free MP3s
+        // visible at music.amazon.com/recently/purchased.
+        // sortColumn=purchaseDate DESC gives newest purchases first.
         let body = format!(
             "Operation=searchLibrary\
              &ContentType=JSON\
              &customerInfo.marketplaceId=ATVPDKIKX0DER\
-             &searchCriteria.member.1.attributeName=primaryArtist\
-             &searchCriteria.member.1.comparisonType=LIKE\
-             &searchCriteria.member.1.attributeValue=\
+             &searchCriteria.member.1.attributeName=assetType\
+             &searchCriteria.member.1.comparisonType=EQUALS\
+             &searchCriteria.member.1.attributeValue=PURCHASED\
              &selectCriteria.member.1=albumArtistName\
              &selectCriteria.member.2=albumName\
              &selectCriteria.member.3=asin\
              &selectCriteria.member.4=duration\
              &selectCriteria.member.5=title\
              &selectCriteria.member.6=primaryArtist\
-             &sortCriteriaList.member.1.sortColumn=sortArtist\
-             &sortCriteriaList.member.1.sortType=ASC\
+             &selectCriteria.member.7=purchaseDate\
+             &sortCriteriaList.member.1.sortColumn=purchaseDate\
+             &sortCriteriaList.member.1.sortType=DESC\
              &maxResults={PAGE_SIZE}\
              &nextResultsToken={offset}"
         );
@@ -180,7 +186,15 @@ impl AmazonClient {
                     .to_owned();
                 let album = t["albumName"].as_str().unwrap_or("").to_owned();
                 let duration_secs = t["duration"].as_u64().unwrap_or(0) as u32;
-                Some(AmazonTrack { asin, title, artist, album, duration_secs, download_url: None })
+                // purchaseDate arrives as epoch millis or an ISO string depending
+                // on the marketplace; take up to the first 10 chars for the date.
+                let purchase_date = t["purchaseDate"]
+                    .as_str()
+                    .map(|s| s.chars().take(10).collect());
+                Some(AmazonTrack {
+                    asin, title, artist, album, duration_secs, purchase_date,
+                    download_url: None,
+                })
             })
             .collect();
 
