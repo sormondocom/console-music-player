@@ -25,6 +25,8 @@ MOD tracker playback, written in Rust.
 - iTunesDB & iTunesSD read/write — no iTunes required
 - iPod health scan and database repair
 - Playlists saved as JSON; single-track repeat
+- **Ctrl+V paste** in all text input fields
+- **mpv fallback** for audio playback on Termux (when the native backend is unavailable)
 
 ---
 
@@ -35,7 +37,7 @@ MOD tracker playback, written in Rust.
 | **Windows 10/11** (x86-64) | ✅ | ✅ (DLLs bundled) | ✅ |
 | **Linux** (x86-64, aarch64) | ✅ | ✅ (`apt`/`dnf`/`pacman`) | ✅ |
 | **macOS** (x86-64, Apple Silicon) | ✅ | ✅ (`brew`) | ✅ |
-| **Android — Termux** (aarch64) | ✅ | ✅ (`pkg install libopenmpt`) | ⚠️ (USB limited) |
+| **Android — Termux** (aarch64) | ✅ via `mpv` | ✅ (`pkg install libopenmpt`) | ⚠️ (USB limited) |
 
 > iPod transfer on Android depends on the device exposing the iPod as USB Mass
 > Storage. Many modern Android phones require a USB-OTG adapter and a file
@@ -91,6 +93,74 @@ pkg install libopenmpt
 libopenmpt links against Android's shared C++ runtime (`libc++_shared.so`).
 The project's `.cargo/config.toml` adds the correct linker flag automatically —
 no extra steps needed after the `pkg install`.
+
+---
+
+## Android / Termux setup
+
+### Audio playback
+
+The native audio backend (`cpal`/`rodio`) cannot reach the Android audio system
+from a plain Termux terminal process.  `cmp` automatically falls back to **mpv**
+as an external audio process.  Install it once:
+
+```bash
+pkg install mpv
+```
+
+That's it.  When `cmp` starts it probes `PATH` for `mpv` and routes all
+playback through it.  Pause, resume, stop, and volume control all work normally.
+
+> **Note:** The waveform oscilloscope (`[V]`) requires the native rodio backend
+> and is unavailable on the mpv path.
+
+### Accessing Internal Storage
+
+Android sandboxes Termux away from `/storage/emulated/0` (Internal Storage) by
+default.  Run this once to grant access and create the storage symlinks:
+
+```bash
+termux-setup-storage
+```
+
+Accept the permission popup when prompted.  This creates `~/storage/` with
+ready-to-use symlinks:
+
+| Symlink | Points to |
+|---------|-----------|
+| `~/storage/shared` | `/storage/emulated/0` (full Internal Storage) |
+| `~/storage/music` | `/storage/emulated/0/Music` |
+| `~/storage/downloads` | `/storage/emulated/0/Download` |
+| `~/storage/dcim` | `/storage/emulated/0/DCIM` |
+
+On first launch **`cmp` automatically detects and adds `~/storage/music`** (or
+`~/storage/shared/Music`) as a source directory — no manual setup needed.
+
+To add other folders, press `[S]` → `[A]` and enter the path, for example:
+
+```
+/storage/emulated/0/Download
+/storage/emulated/0/Podcasts
+~/storage/shared/Albums
+```
+
+> If you see *"Not a directory"* when entering a `/storage/...` path, run
+> `termux-setup-storage` first and restart `cmp`.
+
+### Quick-start on Termux
+
+```bash
+# 1. One-time setup (do this once, ever)
+pkg install rust mpv
+termux-setup-storage   # accept the permissions popup
+
+# 2. Optional: tracker support
+pkg install libopenmpt
+
+# 3. Build and run
+cargo build --release
+./target/release/cmp
+```
 
 ---
 
@@ -172,6 +242,7 @@ Pressing `Z` cycles through these presets in order:
 |-----|--------|
 | Any character | Append to tag input |
 | `Backspace` | Delete last character |
+| `Ctrl+V` | Paste from clipboard |
 | `Enter` | Save tags to disk |
 | `Esc` | Cancel, discard changes |
 
@@ -204,6 +275,24 @@ inline in the track list and can be grouped with `Z → Group by Tag`.
 Replaces the library pane with a real-time oscilloscope trace of the playing
 audio.  Uses Unicode half-block characters (▀ ▄ █) for double vertical
 resolution.  Press `V` or `Esc` to return to the library.
+
+> Not available when using the mpv fallback backend (Termux without native audio).
+
+### Text input fields
+
+All text input overlays (Add Source, Save Playlist, tag editors) support:
+
+| Key | Action |
+|-----|--------|
+| Any character | Append |
+| `Backspace` | Delete last character |
+| `Ctrl+V` | Paste from system clipboard |
+| `Enter` | Confirm |
+| `Esc` | Cancel |
+
+> Clipboard paste is not available on Android/Termux (no system clipboard
+> service in a terminal process).  Type or use a Termux keyboard shortcut to
+> paste instead.
 
 ---
 
@@ -275,16 +364,18 @@ console-music-player/
 ├── src/
 │   ├── main.rs             # Entry point, event loop, DLL probe
 │   ├── app.rs              # App state machine
+│   ├── config.rs           # Persistent config (source dirs, Amazon settings)
 │   ├── ui/mod.rs           # Ratatui rendering (all screens + overlays)
-│   ├── player/mod.rs       # rodio audio backend + waveform sample capture
+│   ├── player/mod.rs       # rodio backend + mpv fallback + waveform tap
 │   ├── visualizer.rs       # SampleCapture source wrapper + oscilloscope renderer
 │   ├── tracker/mod.rs      # libopenmpt wrapper + pure-Rust metadata parsers
+│   ├── amazon/mod.rs       # Amazon Music easter egg (AmazonClient, download)
+│   ├── tags.rs             # User keyword tag store (tags.json)
 │   ├── library/
 │   │   ├── mod.rs          # Library state, sort/group-by presets, Track struct
 │   │   ├── scanner.rs      # Filesystem scan, lofty tag reader/writer, magic-byte gate
 │   │   ├── dedup.rs        # Duplicate detection (exact-content + metadata match)
 │   │   └── magic.rs        # Magic-byte format verification
-│   ├── tags.rs             # User keyword tag store (tags.json)
 │   └── ...
 ├── ipod-rs/                # Workspace crate: iTunesDB / iTunesSD / detect
 │   └── src/
@@ -296,8 +387,8 @@ console-music-player/
 │   ├── libopenmpt.dll      # Main runtime DLL
 │   └── openmpt-*.dll       # Companion DLLs (mpg123, ogg, vorbis, zlib)
 ├── .cargo/config.toml      # Target-specific linker flags (Android c++_shared)
-├── build.rs                # Copies DLLs to output dir; adds /DELAYLOAD on MSVC
-├── Cargo.toml              # `tracker` feature gates the openmpt dep (opt-in)
+├── build.rs                # Copies DLLs; /DELAYLOAD on MSVC; libc++_static stub on Android
+├── Cargo.toml              # `tracker` feature gates openmpt; platform-conditional deps
 └── .vscode/
     ├── tasks.json          # Build + run tasks (tracker variants are default)
     └── launch.json         # Attach-only configs (launch via tasks, not F5)
@@ -318,21 +409,58 @@ platforms.  Platform-specific build commands:
 | Android / Termux with libopenmpt | `pkg install libopenmpt` then `cargo build` |
 | Android / Termux without libopenmpt | `cargo build --no-default-features` |
 
+### Android / Termux — audio backend details
+
+The `cpal` audio backend calls into `ndk-context` to obtain the Android
+`AudioManager` Java object.  In a Termux shell process there is no JavaVM, so
+this call panics rather than returning an error.  `main()` wraps the call in
+`std::panic::catch_unwind` and falls back to `None` (no audio handle).
+
+`Player::new()` detects the missing handle and probes `PATH` for `mpv`.  If
+found, all playback routes through an `mpv` subprocess:
+
+- **Spawn:** `mpv --no-terminal --no-video --input-ipc-server=<sock> <file>`
+- **Control:** JSON commands over a Unix socket (`{"command":["set_property","pause",true]}`)
+- **End-of-track:** detected via `process.try_wait()`
+- **Volume:** `set_property volume <0-100>` sent over the socket
+
+The socket file is created in the OS temp dir and cleaned up on stop.
+
 ### Android / Termux — C++ runtime details
 
 libopenmpt is a C++ library.  On Android the only available C++ runtime is the
 *shared* one (`libc++_shared.so`); the static variant (`libc++_static`) does
-not exist in the Termux NDK environment.  The `openmpt` crate's build script
-may emit a link directive for `c++_static`, causing a linker error.
+not exist in the Termux NDK environment.  Some transitive dependencies emit a
+link directive for `c++_static` even when no C++ code is compiled directly.
 
-`.cargo/config.toml` adds `-lc++_shared` for all `android` targets, which
-satisfies the C++ runtime requirement through the shared library.  No manual
-environment variable configuration is needed.
+Two mechanisms work together to fix this:
+
+1. **`.cargo/config.toml`** — adds `-lc++_shared` for all `android` targets,
+   satisfying the C++ runtime requirement through the shared library.
+2. **`build.rs`** — when `CARGO_CFG_TARGET_OS == "android"`, creates an empty
+   `libc++_static.a` archive stub in `OUT_DIR` using `ar rcs`, then adds
+   `OUT_DIR` to the native link search path.  This satisfies any `link-lib=c++_static`
+   directive from transitive deps without providing conflicting symbols.
 
 ```
 Error: unable to find library -lopenmpt     → pkg install libopenmpt
-Error: unable to find library lc++_static   → fixed automatically by .cargo/config.toml
+Error: unable to find library lc++_static   → fixed automatically (build.rs stub)
 ```
+
+### Android / Termux — Internal Storage access
+
+`~/storage/` symlinks are created by `termux-setup-storage`.  On first launch
+`cmp` checks for `~/storage/music` and `~/storage/shared/Music` in that order
+and seeds whichever exists as the initial source directory.
+
+The `add_source` path in `app.rs` detects Android targets and appends a hint
+to the "Not a directory" error when the user types a `/storage/...` or
+`/sdcard/...` path before running `termux-setup-storage`.
+
+Clipboard (`arboard`) is excluded on Android via a
+`[target.'cfg(not(target_os = "android"))'.dependencies]` entry in
+`Cargo.toml`.  The `clipboard_paste()` function in `main.rs` returns `None`
+on Android via `#[cfg(target_os = "android")]`.
 
 ### Windows DLL handling
 
@@ -425,7 +553,7 @@ Start the app first via a run task, then attach.
 
 | File | Location | Contents |
 |------|----------|----------|
-| `config.json` | `%APPDATA%\console-music-player\` (Win) / `~/.config/console-music-player/` | Source directories |
+| `config.json` | `%APPDATA%\console-music-player\` (Win) / `~/.config/console-music-player/` (Linux/macOS) / `~/.config/console-music-player/` (Termux) | Source directories, Amazon cookie & download dir |
 | `tags.json` | same directory | User keyword tags per track path |
 | `*.json` (playlists) | same directory | Track path lists per named playlist |
 
