@@ -477,6 +477,8 @@ pub struct App {
     // --- gematria shuffle ---
     /// Active gematria selection overlay; `Some` while the input box is open.
     pub gematria_state: Option<GematriaState>,
+    /// The phrase from the last gematria session — pre-filled on next open.
+    pub last_gematria_phrase: String,
 }
 
 impl App {
@@ -523,6 +525,7 @@ impl App {
             amazon_cookie,
             amazon_download_dir,
             gematria_state: None,
+            last_gematria_phrase: String::new(),
         };
         app.rescan();
         app.rebuild_playlist_membership();
@@ -1353,9 +1356,13 @@ impl App {
 
     // --- Gematria shuffle ---
 
-    /// Open the gematria selection overlay.
+    /// Open the gematria selection overlay, pre-filling the last phrase.
     pub fn begin_gematria(&mut self) {
-        self.gematria_state = Some(GematriaState::new());
+        let mut state = GematriaState::new();
+        state.phrase = self.last_gematria_phrase.clone();
+        let count = self.library.tracks.len();
+        state.compute(count);
+        self.gematria_state = Some(state);
     }
 
     pub fn gematria_push(&mut self, c: char) {
@@ -1386,6 +1393,7 @@ impl App {
         let Some(s) = &self.gematria_state else { return };
         if let Some(idx) = s.track_index {
             self.library.selected_index = idx.min(self.library.tracks.len().saturating_sub(1));
+            self.last_gematria_phrase = s.phrase.clone();
             self.reset_marquee();
             self.play_focused();
         }
@@ -1393,6 +1401,11 @@ impl App {
     }
 
     pub fn cancel_gematria(&mut self) {
+        if let Some(s) = &self.gematria_state {
+            if !s.phrase.is_empty() {
+                self.last_gematria_phrase = s.phrase.clone();
+            }
+        }
         self.gematria_state = None;
     }
 
