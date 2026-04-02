@@ -98,6 +98,11 @@ pub fn render(app: &App, frame: &mut Frame) {
     if let Some(state) = &app.search_state {
         overlays::render_search_overlay(state, frame, body_area);
     }
+
+    // Gematria overlay — above everything.
+    if let Some(state) = &app.gematria_state {
+        overlays::render_gematria_overlay(app, state, frame, body_area);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +131,9 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let library_hint;
-    let help = if app.search_state.is_some() {
+    let help = if app.gematria_state.is_some() {
+        " Type a phrase  [Tab] Cycle system  [Enter] Play selected track  [Esc] Cancel"
+    } else if app.search_state.is_some() {
         " [↑↓/jk] Navigate  [PgUp/Dn] Page  [Enter] Jump to track  [Esc] Close  — type to filter"
     } else {
         match app.screen {
@@ -138,7 +145,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
                 };
                 library_hint = format!(
                     " [↑↓/jk] Nav  [PgUp/Dn] Page  [Enter] Play  [P] Pause  [O] Repeat  \
-                     [Z] Sort  []/[ Vol  [Space] Sel  [G] Tag  [/] Search  [Tab] Pane  {r_hint}"
+                     [Z] Sort  []/[ Vol  [Space] Sel  [G] Tag  [/] Search  [\\] Gematria  [Tab] Pane  {r_hint}"
                 );
                 library_hint.as_str()
             }
@@ -152,7 +159,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             Screen::DeviceTracks => " [↑↓] Navigate  [Esc/Q] Back",
             Screen::EditTrack  => " [Tab/↑↓] Next field  [Enter] Save  [Esc] Cancel",
             Screen::Dedup      => " [Tab] Panel  [↑↓] Navigate  [Space] Cycle action  [A] Auto  [Enter] Apply  [Esc] Cancel",
-            Screen::Amazon     => " [Tab] Pane  [↑↓] Navigate  [D] Download  [R] Refresh  [Esc] Back",
+            Screen::Amazon     => " [Tab] Pane  [↑↓] Navigate  [D] Download  [R] Refresh  [?] Diagnostic log  [Esc] Back",
         }
     };
 

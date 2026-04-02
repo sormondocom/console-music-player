@@ -221,6 +221,55 @@ pub struct TagEditState {
 }
 
 // ---------------------------------------------------------------------------
+// Gematria shuffle state
+// ---------------------------------------------------------------------------
+
+/// State for the gematria track-selection overlay.
+pub struct GematriaState {
+    /// The phrase the user has typed so far.
+    pub phrase: String,
+    /// Computed results (one per system), populated after the user presses Enter.
+    pub results: Vec<crate::gematria::SystemResult>,
+    /// Which system is currently highlighted (cycled with Tab).
+    pub selected_system: usize,
+    /// Index of the track that would be selected by the highlighted system.
+    pub track_index: Option<usize>,
+}
+
+impl GematriaState {
+    pub fn new() -> Self {
+        Self {
+            phrase: String::new(),
+            results: Vec::new(),
+            selected_system: 0,
+            track_index: None,
+        }
+    }
+
+    /// Recompute results for the current phrase against `track_count`.
+    pub fn compute(&mut self, track_count: usize) {
+        if self.phrase.trim().is_empty() {
+            self.results.clear();
+            self.track_index = None;
+            return;
+        }
+        self.results = crate::gematria::compute(&self.phrase);
+        self.selected_system = self.selected_system.min(self.results.len().saturating_sub(1));
+        self.track_index = self.results.get(self.selected_system).map(|r| {
+            crate::gematria::select_index(r.total, track_count)
+        });
+    }
+
+    pub fn cycle_system(&mut self, track_count: usize) {
+        if self.results.is_empty() { return; }
+        self.selected_system = (self.selected_system + 1) % self.results.len();
+        self.track_index = self.results.get(self.selected_system).map(|r| {
+            crate::gematria::select_index(r.total, track_count)
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Amazon state
 // ---------------------------------------------------------------------------
 
@@ -266,6 +315,11 @@ pub struct AmazonState {
     pub needs_fetch: bool,
     /// Active text-input overlay, if any.
     pub overlay: Option<AmazonOverlay>,
+    /// Full diagnostic records from failed API calls, newest last.
+    /// Rendered as a scrollable log when non-empty.
+    pub diagnostic_log: Vec<crate::amazon::ApiDiagnostic>,
+    /// When true, the full diagnostic log view is shown instead of the catalog.
+    pub show_diagnostic: bool,
 }
 
 impl AmazonState {
@@ -282,6 +336,8 @@ impl AmazonState {
             loading: true,
             needs_fetch: true,
             overlay: None,
+            diagnostic_log: Vec::new(),
+            show_diagnostic: false,
         }
     }
 
@@ -298,6 +354,8 @@ impl AmazonState {
             loading: false,
             needs_fetch: false,
             overlay: Some(overlay),
+            diagnostic_log: Vec::new(),
+            show_diagnostic: false,
         }
     }
 
@@ -415,6 +473,10 @@ pub struct App {
     pub amazon_cookie: Option<String>,
     /// Directory where downloaded MP3s are saved, persisted from Config.
     pub amazon_download_dir: Option<PathBuf>,
+
+    // --- gematria shuffle ---
+    /// Active gematria selection overlay; `Some` while the input box is open.
+    pub gematria_state: Option<GematriaState>,
 }
 
 impl App {
@@ -460,6 +522,7 @@ impl App {
             amazon_inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             amazon_cookie,
             amazon_download_dir,
+            gematria_state: None,
         };
         app.rescan();
         app.rebuild_playlist_membership();
@@ -1288,21 +1351,66 @@ impl App {
         state.results = results;
     }
 
+    // --- Gematria shuffle ---
+
+    /// Open the gematria selection overlay.
+    pub fn begin_gematria(&mut self) {
+        self.gematria_state = Some(GematriaState::new());
+    }
+
+    pub fn gematria_push(&mut self, c: char) {
+        if let Some(s) = &mut self.gematria_state {
+            s.phrase.push(c);
+            let count = self.library.tracks.len();
+            s.compute(count);
+        }
+    }
+
+    pub fn gematria_pop(&mut self) {
+        if let Some(s) = &mut self.gematria_state {
+            s.phrase.pop();
+            let count = self.library.tracks.len();
+            s.compute(count);
+        }
+    }
+
+    pub fn gematria_cycle_system(&mut self) {
+        let count = self.library.tracks.len();
+        if let Some(s) = &mut self.gematria_state {
+            s.cycle_system(count);
+        }
+    }
+
+    /// Accept the current selection: jump to the track and play it.
+    pub fn confirm_gematria(&mut self) {
+        let Some(s) = &self.gematria_state else { return };
+        if let Some(idx) = s.track_index {
+            self.library.selected_index = idx.min(self.library.tracks.len().saturating_sub(1));
+            self.reset_marquee();
+            self.play_focused();
+        }
+        self.gematria_state = None;
+    }
+
+    pub fn cancel_gematria(&mut self) {
+        self.gematria_state = None;
+    }
+
     // --- Amazon easter egg ---
 
     /// Called when the A→C→E sequence completes.
     /// Shows the cookie input overlay if no cookie is set, the dir prompt if no
     /// download dir is set, otherwise opens the catalog view and starts fetching.
     pub fn activate_amazon(&mut self) {
-        if self.amazon_cookie.is_none() {
-            self.input_buffer.clear();
-            self.amazon_state = Some(AmazonState::new_with_overlay(AmazonOverlay::CookieInput));
-        } else if self.amazon_download_dir.is_none() {
-            self.input_buffer.clear();
-            self.amazon_state = Some(AmazonState::new_with_overlay(AmazonOverlay::DirInput));
-        } else {
-            self.amazon_state = Some(AmazonState::new_loading());
-        }
+        // Always prompt for a fresh cookie each session — cookies expire and
+        // the endpoint will 404 with a stale one.  Pre-fill with the saved
+        // value so the user can press Enter to reuse it or paste a new one.
+        self.input_buffer = self
+            .amazon_cookie
+            .clone()
+            .unwrap_or_default();
+        self.amazon_cookie = None; // cleared until the user re-confirms this session
+        self.amazon_state = Some(AmazonState::new_with_overlay(AmazonOverlay::CookieInput));
         self.screen = Screen::Amazon;
     }
 
@@ -1380,6 +1488,14 @@ impl App {
                 AmazonMsg::Error(e) => {
                     state.loading = false;
                     state.status = format!("Error: {e}");
+                }
+                AmazonMsg::Diagnostic(diag) => {
+                    state.loading = false;
+                    state.status = format!(
+                        "API error: HTTP {} on {} — press [?] for diagnostic log",
+                        diag.status, diag.operation
+                    );
+                    state.diagnostic_log.push(diag);
                 }
             }
         }

@@ -4,19 +4,20 @@
   <img src="assets/mascot.svg" alt="console-music-player mascot — an iPod Classic showing the TUI" width="200"/>
 </p>
 
-A cross-platform terminal music player with iPod Classic / Shuffle support and
-MOD tracker playback, written in Rust.
+A cross-platform terminal music player with iPod Classic / Shuffle support,
+MOD tracker playback, and a numerology-based track selector, written in Rust.
 
 ---
 
 ## Features
 
-- Full-featured TUI (ratatui): library browser, player pane, device pane
+- Full-featured TUI (ratatui): library browser, player pane, waveform pane, device pane
 - Local library scanner: MP3, M4A, AAC, FLAC, OGG, Opus, WAV, AIFF
 - **Magic-byte format verification** — extension mismatches rejected at import time
 - **MOD tracker support**: MOD, XM, IT, S3M, MO3 and 20+ legacy formats (optional — see below)
 - Real-time **waveform oscilloscope** (`[V]`) — Unicode half-block characters (▀ ▄ █)
 - **Live search** (`[/]`) — searches title, artist, album, year, tags, playlists, and filename; shows matched fields inline
+- **Gematria track selector** (`[\]`) — type any word or phrase; classic numerology systems compute a value and select a track to play; inspired by [cosmic-knowledge](https://github.com/sormondocom/cosmic-knowledge)
 - **Sort & group presets** (`[Z]`): by artist, album, year, month, file extension, or user tags
 - **Duplicate finder** (`[F]`): exact-content and metadata-match detection with per-track keep/delete UI
 - **User tag library** (`[G]`): tag any track with custom keywords; filter and group by tag
@@ -25,6 +26,7 @@ MOD tracker playback, written in Rust.
 - iPod Classic / Nano / Mini / Shuffle upload via USB Mass Storage
 - iTunesDB & iTunesSD read/write — no iTunes required
 - iPod health scan and database repair
+- **Amazon Music** easter egg — catalog browser and MP3 downloader (session-cookie based)
 - Playlists saved as JSON; single-track repeat
 - **Ctrl+V paste** in all text input fields (desktop platforms)
 - **mpv fallback** for audio playback on Termux (when the native backend is unavailable)
@@ -207,6 +209,7 @@ cargo run -- --library /path/to/Music
 | `O` | Toggle single-track repeat |
 | `V` | Toggle waveform oscilloscope |
 | `/` | Open live search overlay |
+| `\` | Open gematria track selector |
 | `Z` | Cycle sort / group-by preset |
 | `Tab` | Switch focus: Library ↔ Device pane |
 | `E` | Edit metadata tags (title, artist, album, year, genre) |
@@ -262,6 +265,39 @@ Fields searched: **Title, Artist, Album, Year, user Tags, Playlist name, File na
 Results are ranked: exact title matches first, then exact artist matches, then
 remaining matches in scan order.
 
+### Gematria track selector (`\`)
+
+Select a track to play using numerological values derived from a word or phrase.
+The system is ported from the [cosmic-knowledge](https://github.com/sormondocom/cosmic-knowledge)
+numerology module.
+
+Type any word, name, or phrase — the overlay computes the gematria value
+across four classical systems and maps each result to a track in your library.
+
+| System | Method |
+|--------|--------|
+| **Hebrew Gematria** (Mispar Hechrachi) | Traditional Hebrew letter values (A=1, B=2, K=20, L=30 …) |
+| **Pythagorean** | Western cyclical assignment (A/J/S=1, B/K/T=2 …) |
+| **Chaldean** | Babylonian vibrational system (values 1–8 only, no 9) |
+| **Simple Ordinal** | A=1 through Z=26 |
+
+The phrase total (not the reduced root) is used as the track index
+(`total mod library_size`) so the full numeric value spreads across your entire
+library.  The digital root (1–9, preserving master numbers 11, 22, 33) is shown
+alongside an interpretive meaning.
+
+| Key | Action |
+|-----|--------|
+| Any character | Append to phrase |
+| `Backspace` | Delete last character |
+| `Ctrl+V` | Paste from clipboard |
+| `Tab` | Cycle through the four systems |
+| `Enter` | Jump to the selected track and play it |
+| `Esc` | Cancel, return to library |
+
+The overlay updates live as you type, showing all four system results at once
+with the active system highlighted.
+
 ### Metadata tag editor (`E`)
 
 | Key | Action |
@@ -306,9 +342,39 @@ resolution.  Press `V` or `Esc` to return to the library.
 
 > Not available when using the mpv fallback backend (Termux without native audio).
 
+### Amazon Music (easter egg)
+
+Type the key sequence `A` → `C` → `E` within 2 seconds from the library screen
+to open the Amazon Music catalog browser.  This feature requires a valid
+`music.amazon.com` session cookie — you will be prompted to paste one on each
+session start (cookies are session-scoped and expire).
+
+**How to get your cookie:**
+1. Open `music.amazon.com` in a browser and sign in
+2. Press `F12` → Network tab → click any request
+3. Under Request Headers, right-click the `cookie:` value → Copy value
+4. Paste it into `cmp` with `Ctrl+V` when prompted
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Switch focus: Amazon catalog ↔ Local library |
+| `↑` / `↓` or `k` / `j` | Navigate tracks |
+| `Page Up` / `Page Down` | Jump 10 tracks |
+| `D` | Download focused Amazon track as MP3 |
+| `R` | Refresh / re-fetch catalog |
+| `?` | Open diagnostic log (full HTTP exchange dump) |
+| `Esc` | Close diagnostic log / return to library |
+
+The diagnostic log (`?`) shows the complete untruncated HTTP exchange for any
+failed request — method, URL, all request headers, HTTP status code, all
+response headers, and the full response body.  This is especially useful for
+diagnosing expired-cookie 404 responses where Amazon returns an HTML error page
+instead of JSON.
+
 ### Text input fields
 
-All text input overlays (Add Source, Save Playlist, tag editors, search) support:
+All text input overlays (Add Source, Save Playlist, tag editors, search,
+gematria) support:
 
 | Key | Action |
 |-----|--------|
@@ -373,6 +439,16 @@ models when connected.
 
 ---
 
+## Related projects
+
+- **[cosmic-knowledge](https://github.com/sormondocom/cosmic-knowledge)** —
+  numerology and esoteric knowledge toolkit in Rust.  The gematria track
+  selector in `cmp` is ported from its numerology module: Hebrew, Pythagorean,
+  Chaldean, and Simple Ordinal letter tables, digital-root reduction, and
+  master-number preservation (11 / 22 / 33).
+
+---
+
 ## License
 
 GPL-3.0 — see [LICENSE](LICENSE).
@@ -392,9 +468,19 @@ console-music-player/
 │   ├── main.rs             # Entry point, event loop, key dispatch, DLL probe
 │   ├── app.rs              # App state machine (12 screens, all overlay states)
 │   ├── config.rs           # Persistent config (source dirs, Amazon settings)
+│   ├── gematria.rs         # Numerology engine (4 systems, digital root, track selector)
 │   ├── util.rs             # Cross-cutting helpers (tilde expansion)
 │   ├── error.rs            # AppError / Result types
-│   ├── ui/mod.rs           # Ratatui rendering (all screens + overlays)
+│   ├── ui/
+│   │   ├── mod.rs          # Render dispatcher + palette constants + shared helpers
+│   │   ├── library.rs      # Library browser, player pane, waveform, devices pane
+│   │   ├── overlays.rs     # Edit, tag-edit, input, search, and gematria overlays
+│   │   ├── playlists.rs    # Playlist browser and conflict dialog
+│   │   ├── sources.rs      # Source directory manager
+│   │   ├── transfer.rs     # Transfer progress screen
+│   │   ├── repair.rs       # iPod health / repair screens
+│   │   ├── dedup.rs        # Duplicate-finder two-pane screen
+│   │   └── amazon.rs       # Amazon catalog browser + diagnostic log view
 │   ├── player/mod.rs       # rodio backend + mpv subprocess fallback + waveform tap
 │   ├── visualizer.rs       # SampleCapture source wrapper + oscilloscope renderer
 │   ├── tracker/mod.rs      # libopenmpt wrapper + pure-Rust metadata parsers
@@ -443,6 +529,26 @@ platforms.  Platform-specific build commands:
 | Windows / Linux / macOS | `cargo build` (tracker included — install libopenmpt first) |
 | Android / Termux with libopenmpt | `pkg install libopenmpt` then `cargo build` |
 | Android / Termux without libopenmpt | `cargo build --no-default-features` |
+
+### Gematria module
+
+`src/gematria.rs` is a self-contained numerology engine ported from the
+[cosmic-knowledge](https://github.com/sormondocom/cosmic-knowledge) project.
+It has no external dependencies beyond the Rust standard library.
+
+**Public API:**
+
+| Symbol | Description |
+|--------|-------------|
+| `compute(phrase) -> Vec<SystemResult>` | Run all four systems against a phrase; returns one result per system |
+| `digital_root(n) -> u32` | Reduce to 1–9, preserving master numbers 11, 22, 33 |
+| `select_index(total, track_count) -> usize` | Map a system total to a 0-based track index via `total % track_count` |
+| `meaning_of(root) -> &str` | Interpretive text for roots 1–9 and master numbers |
+| `SystemResult { name, total, root }` | A single system's result |
+
+The `App` state machine in `app.rs` wraps this behind `GematriaState`, which
+recomputes live on every keypress and exposes the selected track index directly
+to the UI and playback layers.
 
 ### Android / Termux — audio backend details
 

@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{AmazonFocus, AmazonOverlay, App};
+use crate::app::{AmazonFocus, AmazonOverlay, AmazonState, App};
 use crate::media::MediaItem;
 
 pub(super) fn render_amazon(app: &App, frame: &mut Frame, area: Rect) {
@@ -16,6 +16,12 @@ pub(super) fn render_amazon(app: &App, frame: &mut Frame, area: Rect) {
 
     if let Some(ov) = &state.overlay {
         render_amazon_overlay(app, ov, frame, area);
+        return;
+    }
+
+    // Diagnostic log view — shown when [?] is pressed and errors exist.
+    if state.show_diagnostic {
+        render_diagnostic_log(state, frame, area);
         return;
     }
 
@@ -154,12 +160,19 @@ fn render_amazon_overlay(app: &App, overlay: &AmazonOverlay, frame: &mut Frame, 
         area,
     );
 
+    let cookie_prefilled = !app.input_buffer.is_empty();
     let (title, prompt) = match overlay {
         AmazonOverlay::CookieInput => (
-            " Amazon Music — Cookie Setup ",
-            "Paste your amazon.com request cookie (Ctrl+V).\n\
-             How: open music.amazon.com → F12 → Network tab → click any request\n\
-             → Headers → Request Headers → right-click \"cookie:\" value → Copy value.",
+            " Amazon Music — Session Cookie ",
+            if cookie_prefilled {
+                "Cookie pre-filled from last session — press Enter to reuse or Ctrl+V to paste a fresh one.\n\
+                 Cookies expire; if the catalog fails with a 404 or HTML error, paste a new cookie.\n\
+                 How: music.amazon.com → F12 → Network → any request → Headers → right-click \"cookie:\" → Copy value."
+            } else {
+                "Paste your amazon.com request cookie (Ctrl+V) — required every session.\n\
+                 How: open music.amazon.com → F12 → Network tab → click any request\n\
+                 → Headers → Request Headers → right-click \"cookie:\" value → Copy value."
+            },
         ),
         AmazonOverlay::DirInput => (
             " Amazon Music — Download Directory ",
@@ -205,4 +218,137 @@ fn render_amazon_overlay(app: &App, overlay: &AmazonOverlay, frame: &mut Frame, 
     ]);
 
     frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic log view
+// ---------------------------------------------------------------------------
+
+fn render_diagnostic_log(state: &AmazonState, frame: &mut Frame, area: Rect) {
+    let count = state.diagnostic_log.len();
+    let title = format!(" Amazon Diagnostic Log — {count} record{} ", if count == 1 { "" } else { "s" });
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Red));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if state.diagnostic_log.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("No diagnostics recorded.", Style::default().fg(super::CLR_DIM))),
+            inner,
+        );
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (idx, diag) in state.diagnostic_log.iter().enumerate() {
+        // ── Record separator ───────────────────────────────────────────────
+        lines.push(Line::from(Span::styled(
+            format!("─── Record {} ─────────────────────────────────────────────", idx + 1),
+            Style::default().fg(Color::Red),
+        )));
+
+        // Operation + request line
+        lines.push(Line::from(vec![
+            Span::styled("Operation : ", Style::default().fg(super::CLR_DIM)),
+            Span::styled(&diag.operation, Style::default().fg(Color::White).bold()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Request   : ", Style::default().fg(super::CLR_DIM)),
+            Span::styled(&diag.request_line, Style::default().fg(Color::White)),
+        ]));
+
+        // Request headers
+        lines.push(Line::from(Span::styled("Req Headers:", Style::default().fg(super::CLR_DIM))));
+        for (k, v) in &diag.request_headers {
+            lines.push(Line::from(Span::styled(
+                format!("  {k}: {v}"),
+                Style::default().fg(super::CLR_DIM),
+            )));
+        }
+
+        // HTTP status
+        let status_color = if diag.status < 300 { super::CLR_SUCCESS } else { Color::Red };
+        lines.push(Line::from(vec![
+            Span::styled("Status    : ", Style::default().fg(super::CLR_DIM)),
+            Span::styled(diag.status.to_string(), Style::default().fg(status_color).bold()),
+        ]));
+
+        // Response headers
+        lines.push(Line::from(Span::styled("Resp Headers:", Style::default().fg(super::CLR_DIM))));
+        for (k, v) in &diag.response_headers {
+            // Highlight Content-Type — it's the first clue for HTML vs JSON
+            let style = if k.eq_ignore_ascii_case("content-type") {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(super::CLR_DIM)
+            };
+            lines.push(Line::from(Span::styled(format!("  {k}: {v}"), style)));
+        }
+
+        // Context / analysis note
+        if let Some(ctx) = &diag.context {
+            lines.push(Line::from(Span::styled("Note:", Style::default().fg(Color::Yellow))));
+            for ctx_line in ctx.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {ctx_line}"),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+        }
+
+        // Full response body
+        lines.push(Line::from(Span::styled(
+            format!("Body ({} bytes):", diag.body.len()),
+            Style::default().fg(super::CLR_DIM),
+        )));
+        for body_line in diag.body.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("  {body_line}"),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        // If body had no newlines (e.g. minified HTML/JSON), it shows as one line above —
+        // add a blank separator anyway.
+        lines.push(Line::default());
+    }
+
+    // Hint line at the bottom
+    let hint = Line::from(vec![
+        Span::styled("[?/Esc]", Style::default().fg(super::CLR_DIM).bold()),
+        Span::styled(" Close  ", Style::default().fg(super::CLR_DIM)),
+        Span::styled("[↑↓/jk]", Style::default().fg(super::CLR_DIM).bold()),
+        Span::styled(" Scroll  Body is untruncated — scroll to see full response.", Style::default().fg(super::CLR_DIM)),
+    ]);
+
+    let [log_area, hint_area] = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Min(0),
+        ratatui::layout::Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    frame.render_widget(hint_area_widget(hint), hint_area);
+
+    // Scrollable paragraph — scroll from the bottom so the latest record is
+    // visible first.
+    let total_lines = lines.len() as u16;
+    let visible = log_area.height;
+    let scroll_offset = total_lines.saturating_sub(visible);
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll_offset, 0))
+            .wrap(Wrap { trim: false }),
+        log_area,
+    );
+}
+
+fn hint_area_widget(line: Line<'_>) -> Paragraph<'_> {
+    Paragraph::new(line).style(Style::default().bg(Color::DarkGray))
 }

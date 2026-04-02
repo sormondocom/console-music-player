@@ -4,6 +4,7 @@
 mod amazon;
 mod app;
 mod config;
+mod gematria;
 mod util;
 mod device;
 mod error;
@@ -266,7 +267,9 @@ async fn run_event_loop(
                     let text = clipboard_paste().unwrap_or_default();
                     let clean: String = text.chars().filter(|c| !c.is_control() || *c == ' ').collect();
                     if !clean.is_empty() {
-                        if app.search_state.is_some() {
+                        if app.gematria_state.is_some() {
+                            for c in clean.chars() { app.gematria_push(c); }
+                        } else if app.search_state.is_some() {
                             for c in clean.chars() { app.search_push(c); }
                         } else if let Some(state) = &mut app.tag_edit_state {
                             state.input.push_str(&clean);
@@ -301,6 +304,11 @@ async fn run_event_loop(
 const PAGE_SIZE: usize = 10;
 
 fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
+    // Gematria overlay intercepts all keys when open.
+    if app.gematria_state.is_some() {
+        handle_gematria_key(app, key);
+        return;
+    }
     // Search overlay intercepts all keys when open.
     if app.search_state.is_some() {
         handle_search_key(app, key);
@@ -484,6 +492,7 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
         }
 
         KeyCode::Char('/') => app.begin_search(),
+        KeyCode::Char('\\') => app.begin_gematria(),
 
         _ => {}
     }
@@ -509,6 +518,17 @@ fn handle_search_key(app: &mut App, key: KeyCode) {
 
         KeyCode::Backspace => app.search_pop(),
         KeyCode::Char(c)   => app.search_push(c),
+        _ => {}
+    }
+}
+
+fn handle_gematria_key(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc        => app.cancel_gematria(),
+        KeyCode::Enter      => app.confirm_gematria(),
+        KeyCode::Tab        => app.gematria_cycle_system(),
+        KeyCode::Backspace  => app.gematria_pop(),
+        KeyCode::Char(c)    => app.gematria_push(c),
         _ => {}
     }
 }
@@ -723,8 +743,32 @@ fn handle_amazon_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
         return;
     }
 
+    // [?] toggles the diagnostic log view regardless of focus.
+    if key == KeyCode::Char('?') {
+        if let Some(state) = &mut app.amazon_state {
+            if !state.diagnostic_log.is_empty() || state.show_diagnostic {
+                state.show_diagnostic = !state.show_diagnostic;
+            }
+        }
+        return;
+    }
+
+    // Esc closes the diagnostic view first before exiting the screen.
+    if key == KeyCode::Esc {
+        if let Some(state) = &mut app.amazon_state {
+            if state.show_diagnostic {
+                state.show_diagnostic = false;
+                return;
+            }
+        }
+        app.amazon_state = None;
+        app.screen = Screen::Library;
+        return;
+    }
+
     match key {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => unreachable!(), // handled above
+        KeyCode::Char('q') => {
             app.amazon_state = None;
             app.screen = Screen::Library;
         }

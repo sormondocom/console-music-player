@@ -29,8 +29,32 @@ pub enum AmazonMsg {
     Progress { asin: String, bytes: u64, total: Option<u64> },
     /// A track finished downloading.
     Downloaded { asin: String, path: PathBuf },
-    /// Non-fatal error (shown as status text).
+    /// Non-fatal error (shown as status text in the UI).
     Error(String),
+    /// Full diagnostic dump for errors that benefit from detailed inspection
+    /// (bad HTTP status, unexpected content-type, parse failures, etc.).
+    /// Displayed in a scrollable log pane so advanced users can diagnose issues.
+    Diagnostic(ApiDiagnostic),
+}
+
+/// Complete record of a failed API exchange — no truncation.
+#[derive(Debug, Clone)]
+pub struct ApiDiagnostic {
+    /// Which operation was attempted (e.g. "searchLibrary", "getTrackMetadata").
+    pub operation: String,
+    /// HTTP method + URL that was sent.
+    pub request_line: String,
+    /// Request headers that were sent, excluding the Cookie value (replaced
+    /// with a length hint so the user knows it was present).
+    pub request_headers: Vec<(String, String)>,
+    /// HTTP status code returned.
+    pub status: u16,
+    /// All response headers received.
+    pub response_headers: Vec<(String, String)>,
+    /// Full response body — never truncated.
+    pub body: String,
+    /// Any additional context (e.g. which JSON path was missing).
+    pub context: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +121,7 @@ impl AmazonClient {
         let mut offset = 0usize;
 
         loop {
-            match self.fetch_page(offset).await {
+            match self.fetch_page(offset, &inbox).await {
                 Ok((page, total)) => {
                     let got = page.len();
                     all.extend(page);
@@ -117,11 +141,71 @@ impl AmazonClient {
         push(&inbox, AmazonMsg::Tracks(all));
     }
 
-    async fn fetch_page(&self, offset: usize) -> anyhow::Result<(Vec<AmazonTrack>, usize)> {
-        // Filter to PURCHASED tracks only — these are the DRM-free MP3s
-        // visible at music.amazon.com/recently/purchased.
-        // sortColumn=purchaseDate DESC gives newest purchases first.
-        let body = format!(
+    /// Issue a POST to the cirrus endpoint, returning the raw response text and
+    /// a pre-built `ApiDiagnostic` skeleton (headers filled in, body empty) so
+    /// callers can attach the body and push `Diagnostic` on failure.
+    async fn cirrus_post(
+        &self,
+        operation: &str,
+        form_body: String,
+    ) -> anyhow::Result<(u16, Vec<(String, String)>, String)> {
+        let resp = self
+            .http
+            .post(CIRRUS_URL)
+            .header("Cookie", &self.cookie)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Referer", "https://music.amazon.com/")
+            .header("Origin", "https://music.amazon.com")
+            .body(form_body)
+            .send()
+            .await
+            .with_context(|| format!("POST cirrus/{operation}"))?;
+
+        let status = resp.status().as_u16();
+        let response_headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("<binary>").to_owned()))
+            .collect();
+        let body = resp.text().await.context("reading response body")?;
+
+        Ok((status, response_headers, body))
+    }
+
+    fn make_diagnostic(
+        &self,
+        operation: &str,
+        status: u16,
+        response_headers: Vec<(String, String)>,
+        body: String,
+        context: Option<String>,
+    ) -> ApiDiagnostic {
+        let cookie_hint = format!("<cookie: {} bytes>", self.cookie.len());
+        let request_headers = vec![
+            ("Content-Type".into(), "application/x-www-form-urlencoded".into()),
+            ("X-Requested-With".into(), "XMLHttpRequest".into()),
+            ("Referer".into(), "https://music.amazon.com/".into()),
+            ("Origin".into(), "https://music.amazon.com".into()),
+            ("Cookie".into(), cookie_hint),
+        ];
+        ApiDiagnostic {
+            operation: operation.to_owned(),
+            request_line: format!("POST {CIRRUS_URL}"),
+            request_headers,
+            status,
+            response_headers,
+            body,
+            context,
+        }
+    }
+
+    async fn fetch_page(
+        &self,
+        offset: usize,
+        inbox: &Arc<Mutex<Vec<AmazonMsg>>>,
+    ) -> anyhow::Result<(Vec<AmazonTrack>, usize)> {
+        let form_body = format!(
             "Operation=searchLibrary\
              &ContentType=JSON\
              &customerInfo.marketplaceId=ATVPDKIKX0DER\
@@ -141,33 +225,68 @@ impl AmazonClient {
              &nextResultsToken={offset}"
         );
 
-        let resp = self
-            .http
-            .post(CIRRUS_URL)
-            .header("Cookie", &self.cookie)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("X-Requested-With", "XMLHttpRequest")
-            .body(body)
-            .send()
-            .await
-            .context("POST cirrus/searchLibrary")?;
+        let (status, resp_headers, body) =
+            self.cirrus_post("searchLibrary", form_body).await?;
 
-        let status = resp.status();
-        let text = resp.text().await.context("reading response")?;
-
-        if !status.is_success() {
-            anyhow::bail!(
-                "Amazon API HTTP {status}: {}",
-                &text[..text.len().min(300)]
+        // Any non-2xx response: emit full diagnostic + short error for the
+        // status bar, then bail.
+        if !(200..300).contains(&(status as u32)) {
+            let content_type = resp_headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("unknown");
+            let short = format!(
+                "HTTP {status} ({content_type}) — see diagnostic log for full response"
             );
+            push(inbox, AmazonMsg::Diagnostic(self.make_diagnostic(
+                "searchLibrary",
+                status,
+                resp_headers,
+                body,
+                Some(format!("Expected HTTP 2xx, got {status}")),
+            )));
+            anyhow::bail!("{short}");
         }
 
-        let v: serde_json::Value = serde_json::from_str(&text).context("parse JSON")?;
+        // Successful status but wrong content-type (e.g. HTML login redirect
+        // that returns 200 with an HTML body) — also emit a diagnostic.
+        let content_type = resp_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+
+        let v: serde_json::Value = serde_json::from_str(&body).map_err(|parse_err| {
+            push(inbox, AmazonMsg::Diagnostic(self.make_diagnostic(
+                "searchLibrary",
+                status,
+                resp_headers.clone(),
+                body.clone(),
+                Some(format!(
+                    "JSON parse error: {parse_err}\n\
+                     Content-Type: {content_type}\n\
+                     (If the body looks like HTML, your cookie is likely expired or invalid.)"
+                )),
+            )));
+            anyhow::anyhow!("JSON parse failed ({parse_err}) — Content-Type: {content_type}")
+        })?;
 
         let result = &v["searchLibraryResponse"]["searchLibraryResult"];
-        let total = result["totalResultSetSize"]
-            .as_u64()
-            .unwrap_or(0) as usize;
+
+        // Sanity-check: if the expected key is missing, the API shape changed.
+        if result.is_null() {
+            push(inbox, AmazonMsg::Diagnostic(self.make_diagnostic(
+                "searchLibrary",
+                status,
+                resp_headers,
+                body,
+                Some("searchLibraryResponse.searchLibraryResult not found in JSON".into()),
+            )));
+            anyhow::bail!("unexpected API response shape — diagnostic emitted");
+        }
+
+        let total = result["totalResultSetSize"].as_u64().unwrap_or(0) as usize;
 
         let empty = vec![];
         let items = result["libraryTrackList"]["libraryTrack"]
@@ -186,8 +305,6 @@ impl AmazonClient {
                     .to_owned();
                 let album = t["albumName"].as_str().unwrap_or("").to_owned();
                 let duration_secs = t["duration"].as_u64().unwrap_or(0) as u32;
-                // purchaseDate arrives as epoch millis or an ISO string depending
-                // on the marketplace; take up to the first 10 chars for the date.
                 let purchase_date = t["purchaseDate"]
                     .as_str()
                     .map(|s| s.chars().take(10).collect());
@@ -215,7 +332,7 @@ impl AmazonClient {
         // 1. Resolve download URL.
         let url = match track.download_url.clone() {
             Some(u) => u,
-            None => match self.resolve_url(&track.asin).await {
+            None => match self.resolve_url(&track.asin, &inbox).await {
                 Ok(u) => u,
                 Err(e) => {
                     push(
@@ -298,8 +415,12 @@ impl AmazonClient {
         push(&inbox, AmazonMsg::Downloaded { asin: track.asin, path: dest });
     }
 
-    async fn resolve_url(&self, asin: &str) -> anyhow::Result<String> {
-        let body = format!(
+    async fn resolve_url(
+        &self,
+        asin: &str,
+        inbox: &Arc<Mutex<Vec<AmazonMsg>>>,
+    ) -> anyhow::Result<String> {
+        let form_body = format!(
             "Operation=getTrackMetadata\
              &ContentType=JSON\
              &asin={asin}\
@@ -307,22 +428,61 @@ impl AmazonClient {
              &trackMetadataResponse.trackResponseType=DOWNLOAD"
         );
 
-        let resp = self
-            .http
-            .post(CIRRUS_URL)
-            .header("Cookie", &self.cookie)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("X-Requested-With", "XMLHttpRequest")
-            .body(body)
-            .send()
-            .await?;
+        let (status, resp_headers, body) =
+            self.cirrus_post("getTrackMetadata", form_body).await?;
 
-        let text = resp.text().await?;
-        let v: serde_json::Value = serde_json::from_str(&text)?;
+        if !(200..300).contains(&(status as u32)) {
+            let content_type = resp_headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            push(inbox, AmazonMsg::Diagnostic(self.make_diagnostic(
+                "getTrackMetadata",
+                status,
+                resp_headers,
+                body,
+                Some(format!("asin={asin}  Expected HTTP 2xx, got {status} ({content_type})")),
+            )));
+            anyhow::bail!("HTTP {status} resolving download URL for {asin}");
+        }
+
+        let content_type = resp_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+
+        let v: serde_json::Value = serde_json::from_str(&body).map_err(|parse_err| {
+            push(inbox, AmazonMsg::Diagnostic(self.make_diagnostic(
+                "getTrackMetadata",
+                status,
+                resp_headers.clone(),
+                body.clone(),
+                Some(format!(
+                    "asin={asin}\nJSON parse error: {parse_err}\n\
+                     Content-Type: {content_type}"
+                )),
+            )));
+            anyhow::anyhow!("JSON parse failed for getTrackMetadata ({parse_err})")
+        })?;
 
         v["getTrackMetadataResponse"]["trackInfo"]["streamUrls"]["streamUrl"][0]["url"]
             .as_str()
-            .context("no download URL in metadata response")
+            .ok_or_else(|| {
+                push(inbox, AmazonMsg::Diagnostic(self.make_diagnostic(
+                    "getTrackMetadata",
+                    status,
+                    resp_headers,
+                    body,
+                    Some(format!(
+                        "asin={asin}\n\
+                         Path not found: getTrackMetadataResponse.trackInfo\
+                         .streamUrls.streamUrl[0].url"
+                    )),
+                )));
+                anyhow::anyhow!("no download URL in metadata response for {asin}")
+            })
             .map(str::to_owned)
     }
 }

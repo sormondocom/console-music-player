@@ -1,4 +1,4 @@
-//! Shared overlay renderers: edit, tag-edit, input, and search.
+//! Shared overlay renderers: edit, tag-edit, input, search, and gematria.
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, EditState, SearchState, EDIT_FIELD_LABELS};
+use crate::app::{App, EditState, GematriaState, SearchState, EDIT_FIELD_LABELS};
 use crate::media::MediaItem;
 
 // ---------------------------------------------------------------------------
@@ -186,6 +186,142 @@ pub(super) fn render_tag_edit_overlay(app: &App, frame: &mut Frame, parent: Rect
     ]);
 
     frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Gematria track-selection overlay
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_gematria_overlay(app: &App, state: &GematriaState, frame: &mut Frame, area: Rect) {
+    // Height: 2 border + 1 phrase input + 1 blank + 4 system rows + 1 blank
+    //       + 1 track preview + 1 meaning + 1 blank + 1 controls = 13 inner + 2 = 15
+    let width = (area.width as f32 * 0.72) as u16;
+    let height = 17u16;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let box_area = Rect { x, y, width, height };
+
+    let block = Block::default()
+        .title(" Gematria Track Selection ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title_style(Style::default().fg(Color::Magenta).bold());
+
+    let inner = block.inner(box_area);
+    frame.render_widget(Clear, box_area);
+    frame.render_widget(block, box_area);
+
+    // ── Phrase input line ──────────────────────────────────────────────────
+    let phrase_line = Line::from(vec![
+        Span::styled("Phrase: ", Style::default().fg(super::CLR_DIM)),
+        Span::styled(state.phrase.as_str(), Style::default().fg(Color::White).bold()),
+        Span::styled("▌", Style::default().fg(Color::Magenta)),
+    ]);
+
+    // ── System results table ───────────────────────────────────────────────
+    // Header
+    let col_w_sys   = 20usize;
+    let col_w_num   =  6usize;
+    let col_w_root  =  6usize;
+    let col_w_track =  8usize;
+
+    let header = Line::from(vec![
+        Span::styled(
+            format!("  {:<col_w_sys$}{:>col_w_num$}{:>col_w_root$}{:>col_w_track$}",
+                "System", "Total", "Root", "Track#"),
+            Style::default().fg(super::CLR_DIM),
+        ),
+    ]);
+
+    let system_rows: Vec<Line> = if state.results.is_empty() {
+        vec![Line::from(Span::styled(
+            "  (type a phrase to compute)",
+            Style::default().fg(super::CLR_DIM),
+        ))]
+    } else {
+        state.results.iter().enumerate().map(|(i, r)| {
+            let track_num = crate::gematria::select_index(r.total, app.library.tracks.len());
+            let selected = i == state.selected_system;
+            let prefix = if selected { "> " } else { "  " };
+            let style = if selected {
+                Style::default().fg(Color::Magenta).bold()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(
+                format!("{prefix}{:<col_w_sys$}{:>col_w_num$}{:>col_w_root$}{:>col_w_track$}",
+                    r.name, r.total, r.root, track_num + 1),
+                style,
+            ))
+        }).collect()
+    };
+
+    // ── Selected track preview ─────────────────────────────────────────────
+    let track_preview = if let Some(idx) = state.track_index {
+        if let Some(track) = app.library.tracks.get(idx) {
+            let label = format!(
+                "Track #{}: {} — {}",
+                idx + 1,
+                track.display_artist(),
+                track.display_title()
+            );
+            let max_w = inner.width.saturating_sub(2) as usize;
+            super::truncate(&label, max_w)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let preview_line = Line::from(Span::styled(
+        track_preview,
+        Style::default().fg(Color::Yellow).bold(),
+    ));
+
+    // ── Meaning line ───────────────────────────────────────────────────────
+    let meaning_text = if let Some(r) = state.results.get(state.selected_system) {
+        format!("Meaning: {}", crate::gematria::meaning_of(r.root))
+    } else {
+        String::new()
+    };
+    let meaning_line = Line::from(Span::styled(
+        meaning_text,
+        Style::default().fg(super::CLR_DIM),
+    ));
+
+    // ── Controls ──────────────────────────────────────────────────────────
+    let ctrl_line = Line::from(vec![
+        Span::styled("[Tab]", Style::default().fg(super::CLR_DIM).bold()),
+        Span::raw(" Cycle system  "),
+        Span::styled("[Enter]", Style::default().fg(Color::Magenta).bold()),
+        Span::raw(" Play  "),
+        Span::styled("[Esc]", Style::default().fg(super::CLR_DIM).bold()),
+        Span::raw(" Cancel"),
+    ]);
+
+    // ── Layout ────────────────────────────────────────────────────────────
+    // rows: phrase, blank, header, up to 4 system rows, blank, preview, meaning, blank, controls
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(phrase_line);
+    lines.push(Line::default());
+    lines.push(header);
+    lines.extend(system_rows);
+    // pad to 4 rows so layout stays stable
+    while lines.len() < 3 + 4 {
+        lines.push(Line::default());
+    }
+    lines.push(Line::default());
+    lines.push(preview_line);
+    lines.push(meaning_line);
+    lines.push(Line::default());
+    lines.push(ctrl_line);
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 // ---------------------------------------------------------------------------
