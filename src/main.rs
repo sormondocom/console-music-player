@@ -212,6 +212,20 @@ async fn main() -> anyhow::Result<()> {
     );
     refresh_devices(&mut app);
 
+    // Install a panic hook that writes to a temp file instead of stderr.
+    // The default hook prints to stderr, which corrupts the alternate-screen TUI
+    // on Windows (and on other platforms when the terminal mixes the two buffers).
+    // Panics caught by SampleCapture are handled gracefully; any uncaught panic
+    // will still crash the process and restore the terminal, but the message goes
+    // to <tmp>/cmp-panic.log rather than the screen.
+    {
+        let log_path = std::env::temp_dir().join("cmp-panic.log");
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = format!("{info}\n");
+            let _ = std::fs::write(&log_path, &msg);
+        }));
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -304,6 +318,15 @@ async fn run_event_loop(
 const PAGE_SIZE: usize = 10;
 
 fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
+    // Decoder error overlay intercepts all keys when open.
+    if app.decoder_error_track.is_some() {
+        match key {
+            KeyCode::Delete => app.remove_decoder_error_track(),
+            KeyCode::Esc    => app.dismiss_decoder_error(),
+            _ => {}
+        }
+        return;
+    }
     // Gematria overlay intercepts all keys when open.
     if app.gematria_state.is_some() {
         handle_gematria_key(app, key);
@@ -767,7 +790,10 @@ fn handle_amazon_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
     }
 
     match key {
-        KeyCode::Esc => unreachable!(), // handled above
+        KeyCode::Esc => {
+            app.amazon_state = None;
+            app.screen = Screen::Library;
+        }
         KeyCode::Char('q') => {
             app.amazon_state = None;
             app.screen = Screen::Library;

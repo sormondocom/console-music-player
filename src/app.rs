@@ -479,6 +479,11 @@ pub struct App {
     pub gematria_state: Option<GematriaState>,
     /// The phrase from the last gematria session — pre-filled on next open.
     pub last_gematria_phrase: String,
+
+    // --- decoder error ---
+    /// Set when the audio decoder panics mid-stream. Shows an overlay offering
+    /// to remove the offending track from the library.
+    pub decoder_error_track: Option<crate::library::Track>,
 }
 
 impl App {
@@ -526,6 +531,7 @@ impl App {
             amazon_download_dir,
             gematria_state: None,
             last_gematria_phrase: String::new(),
+            decoder_error_track: None,
         };
         app.rescan();
         app.rebuild_playlist_membership();
@@ -795,8 +801,16 @@ impl App {
 
     pub fn play_focused(&mut self) {
         if let Some(track) = self.library.tracks.get(self.library.selected_index).cloned() {
-            if let Err(e) = self.player.play(&track) {
-                self.status_message = Some(format!("Playback error: {e}"));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.player.play(&track)
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => self.status_message = Some(format!("Playback error: {e}")),
+                Err(_) => self.status_message = Some(format!(
+                    "Playback error: decoder panic for '{}' — file may be corrupt or unsupported.",
+                    track.display_title()
+                )),
             }
         }
     }
@@ -1409,6 +1423,28 @@ impl App {
         self.gematria_state = None;
     }
 
+    // --- decoder error recovery ---
+
+    /// Remove the errored track from the library and delete the file from disk.
+    pub fn remove_decoder_error_track(&mut self) {
+        let Some(track) = self.decoder_error_track.take() else { return };
+        let path = track.path.clone();
+        let _ = std::fs::remove_file(&path);
+        self.library.all_tracks.retain(|t| t.path != path);
+        self.library.tracks.retain(|t| t.path != path);
+        self.library.selected_index =
+            self.library.selected_index.min(self.library.tracks.len().saturating_sub(1));
+        self.status_message = Some(format!(
+            "Removed '{}' from library and disk.",
+            track.display_title()
+        ));
+    }
+
+    /// Dismiss the decoder error overlay without removing the track.
+    pub fn dismiss_decoder_error(&mut self) {
+        self.decoder_error_track = None;
+    }
+
     // --- Amazon easter egg ---
 
     /// Called when the A→C→E sequence completes.
@@ -1518,6 +1554,9 @@ impl App {
 
     pub fn tick(&mut self) {
         self.player.tick();
+        if let Some(track) = self.player.take_decoder_panic() {
+            self.decoder_error_track = Some(track);
+        }
         self.tick_transfer();
         self.drain_amazon_inbox();
         self.marquee_tick = self.marquee_tick.wrapping_add(1);

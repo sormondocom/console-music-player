@@ -13,7 +13,7 @@ use tracing::warn;
 use crate::library::Track;
 use crate::media::MediaItem;
 use crate::tracker;
-use crate::visualizer::{self, SampleCapture, WaveBuffer};
+use crate::visualizer::{self, DecoderPanicFlag, SampleCapture, WaveBuffer};
 
 // ---------------------------------------------------------------------------
 // External player (mpv subprocess via IPC socket)
@@ -200,6 +200,10 @@ pub struct Player {
     /// Shared sample ring-buffer fed by the audio thread, read by the UI.
     pub wave_buffer: WaveBuffer,
 
+    /// Set by `SampleCapture` when the decoder panics mid-stream.
+    /// Polled each tick; cleared when the player stops or a new track starts.
+    pub decoder_panic_flag: DecoderPanicFlag,
+
     /// Wall-clock moment the current play/resume started (rodio path).
     started_at: Option<Instant>,
     /// Accumulated playback time before the last pause (rodio path).
@@ -227,6 +231,7 @@ impl Player {
             repeat: RepeatMode::Off,
             volume: 0.8,
             wave_buffer: visualizer::new_wave_buffer(),
+            decoder_panic_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             started_at: None,
             elapsed_before_pause: Duration::ZERO,
             #[cfg(unix)]
@@ -244,6 +249,7 @@ impl Player {
     /// format, missing tracker feature, etc.).  On error the player is left
     /// in the `Stopped` state.
     pub fn play(&mut self, track: &Track) -> Result<(), String> {
+        self.decoder_panic_flag.store(false, std::sync::atomic::Ordering::Relaxed);
         self.stop_internal();
 
         // ── rodio path ────────────────────────────────────────────────────
@@ -300,7 +306,11 @@ impl Player {
             .map_err(|e| format!("Cannot decode '{}': {e}", track.path.display()))?
             .convert_samples::<f32>();
         sink.set_volume(self.volume);
-        sink.append(SampleCapture::new(source, self.wave_buffer.clone()));
+        sink.append(SampleCapture::new(
+            source,
+            self.wave_buffer.clone(),
+            self.decoder_panic_flag.clone(),
+        ));
         Ok(())
     }
 
@@ -316,6 +326,7 @@ impl Player {
                     sink.append(SampleCapture::new(
                         source.convert_samples::<f32>(),
                         self.wave_buffer.clone(),
+                        self.decoder_panic_flag.clone(),
                     ));
                     Ok(())
                 }
@@ -437,6 +448,18 @@ impl Player {
             self.started_at = None;
             #[cfg(unix)]
             { self.ext = None; }
+        }
+    }
+
+    /// Returns `Some(track)` if the decoder panicked since the last call, then
+    /// clears the flag.  Returns `None` if no panic has occurred.
+    pub fn take_decoder_panic(&mut self) -> Option<Track> {
+        if self.decoder_panic_flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.state = PlaybackState::Stopped;
+            self.started_at = None;
+            self.current_track.take()
+        } else {
+            None
         }
     }
 

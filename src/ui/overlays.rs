@@ -428,3 +428,4 @@ pub(super) fn render_search_overlay(state: &SearchState, frame: &mut Frame, area
         &mut list_state,
     );
 }
+

@@ -15,11 +15,13 @@ mod transfer;
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
+    text::{Line, Span},
     widgets::{ListState, Paragraph},
     Frame,
 };
 
 use crate::app::{App, Screen};
+use crate::library::Track;
 
 // ---------------------------------------------------------------------------
 // Palette — accessible to all submodules via `super::`
@@ -38,14 +40,32 @@ const CLR_SUCCESS:  Color = Color::Green;
 pub fn render(app: &App, frame: &mut Frame) {
     let area = frame.area();
 
-    let [header_area, body_area, footer_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .areas(area);
+    let has_error = app.decoder_error_track.is_some();
+    let constraints = if has_error {
+        vec![
+            Constraint::Length(1), // header
+            Constraint::Min(0),    // body
+            Constraint::Length(1), // error bar
+            Constraint::Length(1), // footer
+        ]
+    } else {
+        vec![
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ]
+    };
+
+    let areas = Layout::vertical(constraints).split(area);
+    let header_area = areas[0];
+    let body_area   = areas[1];
+    let error_area  = if has_error { Some(areas[2]) } else { None };
+    let footer_area = areas[if has_error { 3 } else { 2 }];
 
     render_header(app, frame, header_area);
+    if let (Some(ea), Some(track)) = (error_area, &app.decoder_error_track) {
+        render_error_bar(track, frame, ea);
+    }
     render_footer(app, frame, footer_area);
 
     match app.screen {
@@ -128,6 +148,24 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 // ---------------------------------------------------------------------------
 // Footer
 // ---------------------------------------------------------------------------
+
+fn render_error_bar(track: &Track, frame: &mut Frame, area: Rect) {
+    use crate::media::MediaItem;
+    let label = truncate(
+        &format!("  {} — {}", track.display_artist(), track.display_title()),
+        area.width.saturating_sub(48) as usize,
+    );
+    let line = Line::from(vec![
+        Span::styled("  ⚠ Decoder error: ", Style::default().fg(Color::White).bold()),
+        Span::styled(label, Style::default().fg(Color::White)),
+        Span::styled("   [Del] Remove & delete file", Style::default().fg(CLR_ERROR).bold()),
+        Span::styled("   [Esc] Dismiss", Style::default().fg(CLR_DIM).bold()),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(CLR_ERROR)),
+        area,
+    );
+}
 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let library_hint;

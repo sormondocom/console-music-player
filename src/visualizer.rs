@@ -8,10 +8,15 @@
 //! resolution.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rodio::Source;
+
+/// Shared flag: set by `SampleCapture` when the inner decoder panics.
+/// The player polls this each tick so it can surface the error to the UI.
+pub type DecoderPanicFlag = Arc<AtomicBool>;
 
 // ---------------------------------------------------------------------------
 // Shared sample buffer
@@ -35,14 +40,21 @@ pub fn new_wave_buffer() -> WaveBuffer {
 /// Wraps any `rodio::Source<Item = f32>`, recording every sample into a
 /// shared [`WaveBuffer`] without any allocations on the audio thread's hot
 /// path.
+///
+/// Also catches any panics from the inner decoder (e.g. symphonia internal
+/// `unreachable!()` on corrupt or edge-case files): sets `panic_flag` and
+/// returns `None` (end of stream) so the audio thread keeps running.
 pub struct SampleCapture<S: Source<Item = f32>> {
-    inner:  S,
-    buffer: WaveBuffer,
+    inner:      S,
+    buffer:     WaveBuffer,
+    panic_flag: DecoderPanicFlag,
+    /// Set locally once we've signalled — avoids repeated atomic writes.
+    panicked:   bool,
 }
 
 impl<S: Source<Item = f32>> SampleCapture<S> {
-    pub fn new(inner: S, buffer: WaveBuffer) -> Self {
-        Self { inner, buffer }
+    pub fn new(inner: S, buffer: WaveBuffer, panic_flag: DecoderPanicFlag) -> Self {
+        Self { inner, buffer, panic_flag, panicked: false }
     }
 }
 
@@ -51,15 +63,33 @@ impl<S: Source<Item = f32>> Iterator for SampleCapture<S> {
 
     #[inline]
     fn next(&mut self) -> Option<f32> {
-        let s = self.inner.next()?;
-        // `try_lock` — never blocks the audio thread if the UI is mid-read.
-        if let Ok(mut buf) = self.buffer.try_lock() {
-            if buf.len() >= BUFFER_SIZE {
-                buf.pop_front();
-            }
-            buf.push_back(s);
+        if self.panicked {
+            return None;
         }
-        Some(s)
+        // Wrap the inner decoder call so a symphonia `unreachable!()`/panic
+        // is caught here rather than unwinding rodio's audio thread.
+        let result = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| self.inner.next())
+        );
+        match result {
+            Ok(sample) => {
+                let s = sample?;
+                // `try_lock` — never blocks the audio thread if the UI is mid-read.
+                if let Ok(mut buf) = self.buffer.try_lock() {
+                    if buf.len() >= BUFFER_SIZE {
+                        buf.pop_front();
+                    }
+                    buf.push_back(s);
+                }
+                Some(s)
+            }
+            Err(_) => {
+                // Decoder panicked — signal the main thread and stop.
+                self.panicked = true;
+                self.panic_flag.store(true, Ordering::Relaxed);
+                None
+            }
+        }
     }
 }
 
