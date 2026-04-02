@@ -6,6 +6,7 @@
 mod amazon;
 mod dedup;
 mod library;
+mod organize;
 mod overlays;
 mod playlists;
 mod repair;
@@ -107,6 +108,8 @@ pub fn render(app: &App, frame: &mut Frame) {
         Screen::Dedup => dedup::render_dedup(app, frame, body_area),
 
         Screen::Amazon => amazon::render_amazon(app, frame, body_area),
+
+        Screen::Organize => organize::render_organize(app, frame, body_area),
     }
 
     // Tag edit overlay — floats above whatever screen is active.
@@ -183,7 +186,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
                 };
                 library_hint = format!(
                     " [↑↓/jk] Nav  [PgUp/Dn] Page  [Enter] Play  [P] Pause  [O] Repeat  \
-                     [Z] Sort  []/[ Vol  [Space] Sel  [G] Tag  [/] Search  [\\] Gematria  [Tab] Pane  {r_hint}"
+                     [Z] Sort  []/[ Vol  [Space] Sel  [G] Tag  [/] Search  [\\] Gematria  [M] Organize  [Tab] Pane  {r_hint}"
                 );
                 library_hint.as_str()
             }
@@ -198,6 +201,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             Screen::EditTrack  => " [Tab/↑↓] Next field  [Enter] Save  [Esc] Cancel",
             Screen::Dedup      => " [Tab] Panel  [↑↓] Navigate  [Space] Cycle action  [A] Auto  [Enter] Apply  [Esc] Cancel",
             Screen::Amazon     => " [Tab] Pane  [↑↓] Navigate  [D] Download  [R] Refresh  [?] Diagnostic log  [Esc] Back",
+            Screen::Organize   => " [↑↓/jk] Navigate groups  [Enter] Select destination  [Esc] Back",
         }
     };
 

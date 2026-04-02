@@ -5,6 +5,7 @@ mod amazon;
 mod app;
 mod config;
 mod gematria;
+mod organize;
 mod util;
 mod device;
 mod error;
@@ -283,6 +284,14 @@ async fn run_event_loop(
                     if !clean.is_empty() {
                         if app.gematria_state.is_some() {
                             for c in clean.chars() { app.gematria_push(c); }
+                        } else if matches!(app.screen, Screen::Organize)
+                            && app.organizer_state.as_ref()
+                                .map(|s| s.phase == crate::app::OrganizerPhase::DestInput)
+                                .unwrap_or(false)
+                        {
+                            if let Some(s) = &mut app.organizer_state {
+                                s.dest_input.push_str(&clean);
+                            }
                         } else if app.search_state.is_some() {
                             for c in clean.chars() { app.search_push(c); }
                         } else if let Some(state) = &mut app.tag_edit_state {
@@ -364,6 +373,7 @@ fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
         Screen::RepairIpod      => handle_repair_key(app, key),
         Screen::DeviceTracks    => handle_device_tracks_key(app, key),
         Screen::Amazon          => handle_amazon_key(app, key, cfg),
+        Screen::Organize        => handle_organize_key(app, key),
     }
 }
 
@@ -516,6 +526,7 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
 
         KeyCode::Char('/') => app.begin_search(),
         KeyCode::Char('\\') => app.begin_gematria(),
+        KeyCode::Char('m') | KeyCode::Char('M') => app.begin_organize(),
 
         _ => {}
     }
@@ -739,6 +750,84 @@ fn handle_tag_edit_key(app: &mut App, key: KeyCode) {
             }
         }
         _ => {}
+    }
+}
+
+fn handle_organize_key(app: &mut App, key: KeyCode) {
+    use crate::app::OrganizerPhase;
+
+    let phase = app.organizer_state.as_ref().map(|s| s.phase.clone());
+    match phase {
+        None => {
+            app.screen = Screen::Library;
+        }
+
+        // ── Phase: PickGroup ──────────────────────────────────────────────
+        Some(OrganizerPhase::PickGroup) => match key {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.organizer_state = None;
+                app.screen = Screen::Library;
+            }
+            KeyCode::Up   | KeyCode::Char('k') => {
+                if let Some(s) = &mut app.organizer_state { s.move_group_up(); }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(s) = &mut app.organizer_state { s.move_group_down(); }
+            }
+            KeyCode::PageUp => {
+                if let Some(s) = &mut app.organizer_state {
+                    for _ in 0..PAGE_SIZE { s.move_group_up(); }
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(s) = &mut app.organizer_state {
+                    for _ in 0..PAGE_SIZE { s.move_group_down(); }
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(s) = &mut app.organizer_state {
+                    s.phase = OrganizerPhase::DestInput;
+                }
+            }
+            _ => {}
+        },
+
+        // ── Phase: DestInput ─────────────────────────────────────────────
+        Some(OrganizerPhase::DestInput) => match key {
+            KeyCode::Esc => {
+                if let Some(s) = &mut app.organizer_state {
+                    s.phase = OrganizerPhase::PickGroup;
+                }
+            }
+            KeyCode::Enter => app.confirm_organize_dest(),
+            KeyCode::Backspace => {
+                if let Some(s) = &mut app.organizer_state { s.dest_input.pop(); }
+            }
+            KeyCode::Char(c) => {
+                if let Some(s) = &mut app.organizer_state { s.dest_input.push(c); }
+            }
+            _ => {}
+        },
+
+        // ── Phase: Running ────────────────────────────────────────────────
+        Some(OrganizerPhase::Running) => {
+            // Block all input while running except Ctrl+C (handled by OS).
+        }
+
+        // ── Phase: Done ───────────────────────────────────────────────────
+        Some(OrganizerPhase::Done) => match key {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                app.organizer_state = None;
+                app.screen = Screen::Library;
+            }
+            KeyCode::Up   | KeyCode::Char('k') => {
+                if let Some(s) = &mut app.organizer_state { s.scroll_log_up(); }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(s) = &mut app.organizer_state { s.scroll_log_down(); }
+            }
+            _ => {}
+        },
     }
 }
 

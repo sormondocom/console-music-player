@@ -19,6 +19,7 @@ use crate::playlist::{ConflictCtx, Playlist};
 use crate::amazon::{AmazonMsg, AmazonTrack};
 use crate::tags::TagStore;
 use crate::transfer::{TransferEngine, TransferEvent};
+use crate::organize::{OrganizerEngine, OrganizerEvent};
 
 // ---------------------------------------------------------------------------
 // Screens / focus
@@ -46,6 +47,8 @@ pub enum Screen {
     Dedup,
     /// Amazon Music easter egg — download owned DRM-free MP3s.
     Amazon,
+    /// File organizer — copy/verify/delete tracks into new folders.
+    Organize,
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +226,79 @@ pub struct TagEditState {
 // ---------------------------------------------------------------------------
 // Gematria shuffle state
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Organizer state
+// ---------------------------------------------------------------------------
+
+/// A single group of tracks that can be moved together.
+#[derive(Debug, Clone)]
+pub struct OrganizerGroup {
+    /// Display label (e.g. "Rock", "2024", "MP3").
+    pub label: String,
+    pub tracks: Vec<crate::library::Track>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrganizerPhase {
+    /// User is browsing groups / selection and choosing what to move.
+    PickGroup,
+    /// User is typing the destination directory path.
+    DestInput,
+    /// Copy/verify/delete in progress.
+    Running,
+    /// All done — showing final log.
+    Done,
+}
+
+pub struct OrganizerState {
+    pub phase: OrganizerPhase,
+    pub groups: Vec<OrganizerGroup>,
+    pub group_index: usize,
+    /// Pre-filled / in-progress destination path string.
+    pub dest_input: String,
+    pub log: Vec<String>,
+    pub log_scroll: usize,
+    pub results: Option<(usize, usize)>, // (succeeded, failed)
+}
+
+impl OrganizerState {
+    pub fn new(groups: Vec<OrganizerGroup>) -> Self {
+        Self {
+            phase: OrganizerPhase::PickGroup,
+            groups,
+            group_index: 0,
+            dest_input: String::new(),
+            log: Vec::new(),
+            log_scroll: 0,
+            results: None,
+        }
+    }
+
+    pub fn selected_group(&self) -> Option<&OrganizerGroup> {
+        self.groups.get(self.group_index)
+    }
+
+    pub fn move_group_up(&mut self) {
+        self.group_index = self.group_index.saturating_sub(1);
+    }
+
+    pub fn move_group_down(&mut self) {
+        if !self.groups.is_empty() {
+            self.group_index = (self.group_index + 1).min(self.groups.len() - 1);
+        }
+    }
+
+    pub fn scroll_log_up(&mut self) {
+        self.log_scroll = self.log_scroll.saturating_sub(1);
+    }
+
+    pub fn scroll_log_down(&mut self) {
+        if !self.log.is_empty() {
+            self.log_scroll = (self.log_scroll + 1).min(self.log.len() - 1);
+        }
+    }
+}
 
 /// State for the gematria track-selection overlay.
 pub struct GematriaState {
@@ -474,6 +550,10 @@ pub struct App {
     /// Directory where downloaded MP3s are saved, persisted from Config.
     pub amazon_download_dir: Option<PathBuf>,
 
+    // --- file organizer ---
+    pub organize: OrganizerEngine,
+    pub organizer_state: Option<OrganizerState>,
+
     // --- gematria shuffle ---
     /// Active gematria selection overlay; `Some` while the input box is open.
     pub gematria_state: Option<GematriaState>,
@@ -529,6 +609,8 @@ impl App {
             amazon_inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             amazon_cookie,
             amazon_download_dir,
+            organize: OrganizerEngine::new(),
+            organizer_state: None,
             gematria_state: None,
             last_gematria_phrase: String::new(),
             decoder_error_track: None,
@@ -1558,6 +1640,7 @@ impl App {
             self.decoder_error_track = Some(track);
         }
         self.tick_transfer();
+        self.tick_organize();
         self.drain_amazon_inbox();
         self.marquee_tick = self.marquee_tick.wrapping_add(1);
     }
@@ -1587,5 +1670,158 @@ impl App {
             };
             self.transfer_log.push(line);
         }
+    }
+
+    pub fn tick_organize(&mut self) {
+        while let Some(ev) = self.organize.poll_event() {
+            let Some(state) = &mut self.organizer_state else { continue };
+            match ev {
+                OrganizerEvent::Started { title, index, total } => {
+                    state.log.push(format!("[{}/{}] Moving: {}", index + 1, total, title));
+                }
+                OrganizerEvent::FileDone { title, dest } => {
+                    state.log.push(format!("  ✓ {} → {}", title, dest));
+                }
+                OrganizerEvent::FileFailed { title, reason } => {
+                    if title.is_empty() {
+                        state.log.push(format!("  {reason}"));
+                    } else {
+                        state.log.push(format!("  ✗ {} — {}", title, reason));
+                    }
+                }
+                OrganizerEvent::BatchComplete { succeeded, failed, dest_dir } => {
+                    state.log.push(format!(
+                        "Done. {succeeded} moved, {failed} failed."
+                    ));
+                    state.results = Some((succeeded, failed));
+                    state.phase = OrganizerPhase::Done;
+                    // Auto-scroll to bottom
+                    state.log_scroll = state.log.len().saturating_sub(1);
+
+                    // Add the destination directory as a new source and rescan.
+                    if !self.source_dirs.contains(&dest_dir) {
+                        self.source_dirs.push(dest_dir);
+                        // Persist the updated source list.
+                        crate::config::Config {
+                            source_dirs: self.source_dirs.clone(),
+                            amazon_cookie: self.amazon_cookie.clone(),
+                            amazon_download_dir: self.amazon_download_dir.clone(),
+                        }.save();
+                    }
+                    self.rescan();
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Organizer methods
+    // ---------------------------------------------------------------------------
+
+    /// Open the organizer screen.  Builds groups from:
+    /// 1. "Current selection" if any tracks are selected (always first)
+    /// 2. Groups derived from the current library sort order (if GroupBy*)
+    /// 3. Always: groups by Artist, Album, Year as fallback options
+    pub fn begin_organize(&mut self) {
+        let mut groups: Vec<OrganizerGroup> = Vec::new();
+
+        // ── 1. Current selection ──────────────────────────────────────────
+        if !self.selected_tracks.is_empty() {
+            let tracks: Vec<_> = self.selected_tracks
+                .iter()
+                .filter_map(|&i| self.library.tracks.get(i).cloned())
+                .collect();
+            if !tracks.is_empty() {
+                groups.push(OrganizerGroup {
+                    label: format!("Current selection ({} tracks)", tracks.len()),
+                    tracks,
+                });
+            }
+        }
+
+        // ── 2. Current sort-order groups (if GroupBy*) ────────────────────
+        if self.library.sort_order.has_sections() {
+            let mut seen: Vec<String> = Vec::new();
+            for track in &self.library.tracks {
+                let key = self.library.section_key(track)
+                    .unwrap_or_else(|| "Other".into());
+                if !seen.contains(&key) {
+                    seen.push(key.clone());
+                }
+            }
+            for key in seen {
+                let k = key.clone();
+                let tracks: Vec<_> = self.library.tracks
+                    .iter()
+                    .filter(|t| {
+                        self.library.section_key(t).as_deref() == Some(k.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                if !tracks.is_empty() {
+                    let label = format!("{} — {} ({} tracks)",
+                        self.library.sort_order.label(), key, tracks.len());
+                    groups.push(OrganizerGroup { label, tracks });
+                }
+            }
+        }
+
+        // ── 3. Always offer Artist / Year / Extension groups ─────────────
+        use crate::library::SortOrder;
+        for order in &[SortOrder::GroupByArtist, SortOrder::GroupByYear, SortOrder::GroupByExtension] {
+            let mut seen: Vec<String> = Vec::new();
+            for track in &self.library.tracks {
+                let key = order.section_key(track).unwrap_or_else(|| "Other".into());
+                if !seen.contains(&key) {
+                    seen.push(key.clone());
+                }
+            }
+            for key in seen {
+                // Skip duplicates that already appeared from the current sort-order pass
+                let label = format!("{} — {} ({} tracks)",
+                    order.label(), key,
+                    self.library.tracks.iter().filter(|t| {
+                        order.section_key(t).as_deref() == Some(key.as_str())
+                    }).count());
+                if !groups.iter().any(|g| g.label == label) {
+                    let tracks: Vec<_> = self.library.tracks
+                        .iter()
+                        .filter(|t| order.section_key(t).as_deref() == Some(key.as_str()))
+                        .cloned()
+                        .collect();
+                    if !tracks.is_empty() {
+                        groups.push(OrganizerGroup { label, tracks });
+                    }
+                }
+            }
+        }
+
+        if groups.is_empty() {
+            self.status_message = Some("No tracks or groups to organize.".into());
+            return;
+        }
+
+        self.organizer_state = Some(OrganizerState::new(groups));
+        self.screen = Screen::Organize;
+    }
+
+    /// Called when the user confirms the destination path and starts the move.
+    pub fn confirm_organize_dest(&mut self) {
+        let Some(state) = &mut self.organizer_state else { return };
+        let dest_raw = state.dest_input.trim().to_string();
+        if dest_raw.is_empty() {
+            return;
+        }
+        let dest_dir = crate::util::expand_tilde(&dest_raw);
+        let tracks = state.selected_group()
+            .map(|g| g.tracks.clone())
+            .unwrap_or_default();
+        if tracks.is_empty() {
+            return;
+        }
+        state.phase = OrganizerPhase::Running;
+        state.log.clear();
+        state.log_scroll = 0;
+        self.organize.start_batch(tracks, dest_dir);
     }
 }
