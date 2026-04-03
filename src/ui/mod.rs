@@ -200,7 +200,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             Screen::DeviceTracks => " [↑↓] Navigate  [Esc/Q] Back",
             Screen::EditTrack  => " [Tab/↑↓] Next field  [Enter] Save  [Esc] Cancel",
             Screen::Dedup      => " [Tab] Panel  [↑↓] Navigate  [Space] Cycle action  [A] Auto  [Enter] Apply  [Esc] Cancel",
-            Screen::Amazon     => " [Tab] Pane  [↑↓] Navigate  [D] Download  [R] Refresh  [?] Diagnostic log  [Esc] Back",
+            Screen::Amazon     => " [S] Add as source  [L] Launch app  [Esc] Back",
             Screen::Organize   => " [↑↓/jk] Navigate groups  [Enter] Select destination  [Esc] Back",
         }
     };

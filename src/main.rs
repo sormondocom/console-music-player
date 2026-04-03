@@ -1,11 +1,11 @@
 //! console-music-player — entry point.
 #![allow(dead_code)]
 
-mod amazon;
 mod app;
 mod config;
 mod gematria;
 mod organize;
+mod platform;
 mod util;
 mod device;
 mod error;
@@ -208,8 +208,6 @@ async fn main() -> anyhow::Result<()> {
     let mut app = App::new(
         cfg.source_dirs.clone(),
         audio_handle,
-        cfg.amazon_cookie.clone(),
-        cfg.amazon_download_dir.clone(),
     );
     refresh_devices(&mut app);
 
@@ -255,19 +253,6 @@ async fn run_event_loop(
     while app.running {
         terminal.draw(|frame| ui::render(app, frame))?;
         app.tick();
-
-        // Spawn an Amazon catalog fetch when amazon_state.needs_fetch is set.
-        // We clear the flag immediately so we only spawn once per request.
-        if let Some(state) = &mut app.amazon_state {
-            if state.needs_fetch && state.overlay.is_none() {
-                state.needs_fetch = false;
-                if let Some(cookie) = &app.amazon_cookie {
-                    let client = amazon::AmazonClient::new(cookie.clone());
-                    let inbox = app.amazon_inbox.clone();
-                    tokio::spawn(async move { client.fetch_catalog(inbox).await });
-                }
-            }
-        }
 
         if event::poll(TICK)? {
             if let Event::Key(key) = event::read()? {
@@ -832,138 +817,13 @@ fn handle_organize_key(app: &mut App, key: KeyCode) {
 }
 
 fn handle_amazon_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
-    use crate::app::{AmazonFocus, AmazonOverlay};
-
-    // If an overlay is active, handle text input for it.
-    let overlay = app.amazon_state.as_ref().and_then(|s| s.overlay.clone());
-    if let Some(ov) = overlay {
-        match key {
-            KeyCode::Esc => {
-                // Cancel → back to library (abandon amazon screen entirely).
-                app.amazon_state = None;
-                app.input_buffer.clear();
-                app.screen = Screen::Library;
-            }
-            KeyCode::Enter => match ov {
-                AmazonOverlay::CookieInput => app.confirm_amazon_cookie(cfg),
-                AmazonOverlay::DirInput    => app.confirm_amazon_dir(cfg),
-            },
-            KeyCode::Backspace => { app.input_buffer.pop(); }
-            KeyCode::Char(c)   => app.input_buffer.push(c),
-            _ => {}
-        }
-        return;
-    }
-
-    // [?] toggles the diagnostic log view regardless of focus.
-    if key == KeyCode::Char('?') {
-        if let Some(state) = &mut app.amazon_state {
-            if !state.diagnostic_log.is_empty() || state.show_diagnostic {
-                state.show_diagnostic = !state.show_diagnostic;
-            }
-        }
-        return;
-    }
-
-    // Esc closes the diagnostic view first before exiting the screen.
-    if key == KeyCode::Esc {
-        if let Some(state) = &mut app.amazon_state {
-            if state.show_diagnostic {
-                state.show_diagnostic = false;
-                return;
-            }
-        }
-        app.amazon_state = None;
-        app.screen = Screen::Library;
-        return;
-    }
-
     match key {
-        KeyCode::Esc => {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
             app.amazon_state = None;
             app.screen = Screen::Library;
         }
-        KeyCode::Char('q') => {
-            app.amazon_state = None;
-            app.screen = Screen::Library;
-        }
-
-        KeyCode::Tab => {
-            if let Some(state) = &mut app.amazon_state {
-                state.focus = match state.focus {
-                    AmazonFocus::Catalog => AmazonFocus::Local,
-                    AmazonFocus::Local   => AmazonFocus::Catalog,
-                };
-            }
-        }
-
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(state) = &mut app.amazon_state {
-                match state.focus {
-                    AmazonFocus::Catalog => state.move_catalog_up(),
-                    AmazonFocus::Local   => state.move_local_up(1),
-                }
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(state) = &mut app.amazon_state {
-                match state.focus {
-                    AmazonFocus::Catalog => state.move_catalog_down(),
-                    AmazonFocus::Local   => state.move_local_down(1),
-                }
-            }
-        }
-        KeyCode::PageUp => {
-            if let Some(state) = &mut app.amazon_state {
-                match state.focus {
-                    AmazonFocus::Catalog => {
-                        for _ in 0..PAGE_SIZE { state.move_catalog_up(); }
-                    }
-                    AmazonFocus::Local => state.move_local_up(PAGE_SIZE),
-                }
-            }
-        }
-        KeyCode::PageDown => {
-            if let Some(state) = &mut app.amazon_state {
-                match state.focus {
-                    AmazonFocus::Catalog => {
-                        for _ in 0..PAGE_SIZE { state.move_catalog_down(); }
-                    }
-                    AmazonFocus::Local => state.move_local_down(PAGE_SIZE),
-                }
-            }
-        }
-
-        // [D] — download the focused Amazon track.
-        KeyCode::Char('d') | KeyCode::Char('D') => {
-            let (cookie, download_dir) = (app.amazon_cookie.clone(), app.amazon_download_dir.clone());
-            if let (Some(cookie), Some(dir), Some(state)) =
-                (cookie, download_dir, &mut app.amazon_state)
-            {
-                if let Some(track) = state.tracks.get(state.catalog_index).cloned() {
-                    if !state.downloading.contains(&track.asin)
-                        && !state.completed.contains(&track.asin)
-                    {
-                        state.downloading.insert(track.asin.clone());
-                        let inbox = app.amazon_inbox.clone();
-                        let client = amazon::AmazonClient::new(cookie);
-                        tokio::spawn(async move {
-                            client.download_track(track, dir, inbox).await;
-                        });
-                    }
-                }
-            }
-        }
-
-        // [R] — refresh / re-fetch catalog.
-        KeyCode::Char('r') | KeyCode::Char('R') => {
-            if let Some(state) = &mut app.amazon_state {
-                state.loading = true;
-                state.needs_fetch = true;
-                state.status = "Fetching catalog…".into();
-            }
-        }
-
+        KeyCode::Char('s') | KeyCode::Char('S') => app.add_amazon_local_source(cfg),
+        KeyCode::Char('l') | KeyCode::Char('L') => app.launch_amazon_app(),
         _ => {}
     }
 }
@@ -998,8 +858,6 @@ fn handle_text_input_key(app: &mut App, key: KeyCode, on_enter: impl Fn(&mut App
 fn persist_sources(app: &App) {
     Config {
         source_dirs: app.source_dirs.clone(),
-        amazon_cookie: app.amazon_cookie.clone(),
-        amazon_download_dir: app.amazon_download_dir.clone(),
     }
     .save();
 }

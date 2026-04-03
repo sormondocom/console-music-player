@@ -16,7 +16,6 @@ use crate::library::{Library, TrackEdit};
 use crate::media::MediaItem;
 use crate::player::Player;
 use crate::playlist::{ConflictCtx, Playlist};
-use crate::amazon::{AmazonMsg, AmazonTrack};
 use crate::tags::TagStore;
 use crate::transfer::{TransferEngine, TransferEvent};
 use crate::organize::{OrganizerEngine, OrganizerEvent};
@@ -350,112 +349,24 @@ impl GematriaState {
 // ---------------------------------------------------------------------------
 
 /// Which overlay (if any) is showing inside the Amazon screen.
+/// (Currently unused — kept for future use.)
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AmazonOverlay {
-    /// Prompting the user to paste their amazon.com cookie string.
-    CookieInput,
-    /// Prompting the user to enter a download directory path.
-    DirInput,
-}
-
-/// Which pane has focus in the Amazon side-by-side view.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AmazonFocus {
-    /// Amazon catalog pane (left).
-    Catalog,
-    /// Local library pane (right).
-    Local,
-}
+pub enum AmazonOverlay {}
 
 /// All mutable state for the Amazon easter egg screen.
 pub struct AmazonState {
-    /// Tracks fetched from the Amazon catalog.
-    pub tracks: Vec<AmazonTrack>,
-    /// Selected row in the Amazon catalog pane.
-    pub catalog_index: usize,
-    /// Selected row in the local library pane.
-    pub local_index: usize,
-    /// Which pane currently has keyboard focus.
-    pub focus: AmazonFocus,
-    /// ASINs currently being downloaded.
-    pub downloading: std::collections::HashSet<String>,
-    /// Download progress: ASIN → (bytes received, total bytes).
-    pub progress: std::collections::HashMap<String, (u64, Option<u64>)>,
-    /// ASINs already confirmed present on disk.
-    pub completed: std::collections::HashSet<String>,
-    /// Status / error message shown at the bottom of the pane.
+    /// Status message shown at the bottom of the pane.
     pub status: String,
-    /// True while the initial catalog fetch is running.
-    pub loading: bool,
-    /// Set to true to signal the event loop to spawn a catalog fetch task.
-    pub needs_fetch: bool,
-    /// Active text-input overlay, if any.
-    pub overlay: Option<AmazonOverlay>,
-    /// Full diagnostic records from failed API calls, newest last.
-    /// Rendered as a scrollable log when non-empty.
-    pub diagnostic_log: Vec<crate::amazon::ApiDiagnostic>,
-    /// When true, the full diagnostic log view is shown instead of the catalog.
-    pub show_diagnostic: bool,
+    /// Local Amazon Music installation info (detected once at screen open).
+    pub local: Option<crate::platform::AmazonMusicLocal>,
 }
 
 impl AmazonState {
-    pub fn new_loading() -> Self {
+    pub fn new() -> Self {
         Self {
-            tracks: Vec::new(),
-            catalog_index: 0,
-            local_index: 0,
-            focus: AmazonFocus::Catalog,
-            downloading: Default::default(),
-            progress: Default::default(),
-            completed: Default::default(),
-            status: "Fetching catalog…".into(),
-            loading: true,
-            needs_fetch: true,
-            overlay: None,
-            diagnostic_log: Vec::new(),
-            show_diagnostic: false,
-        }
-    }
-
-    pub fn new_with_overlay(overlay: AmazonOverlay) -> Self {
-        Self {
-            tracks: Vec::new(),
-            catalog_index: 0,
-            local_index: 0,
-            focus: AmazonFocus::Catalog,
-            downloading: Default::default(),
-            progress: Default::default(),
-            completed: Default::default(),
             status: String::new(),
-            loading: false,
-            needs_fetch: false,
-            overlay: Some(overlay),
-            diagnostic_log: Vec::new(),
-            show_diagnostic: false,
+            local: None,
         }
-    }
-
-    pub fn move_catalog_up(&mut self) {
-        if self.catalog_index > 0 {
-            self.catalog_index -= 1;
-        }
-    }
-
-    pub fn move_catalog_down(&mut self) {
-        if !self.tracks.is_empty() && self.catalog_index + 1 < self.tracks.len() {
-            self.catalog_index += 1;
-        }
-    }
-
-    pub fn move_local_up(&mut self, count: usize) {
-        if self.local_index > 0 {
-            self.local_index = self.local_index.saturating_sub(count.max(1));
-        }
-    }
-
-    pub fn move_local_down(&mut self, count: usize) {
-        // upper bound set by caller using actual track count
-        self.local_index = self.local_index.saturating_add(count.max(1));
     }
 }
 
@@ -542,13 +453,6 @@ pub struct App {
     pub amazon_key_seq_time: Option<std::time::Instant>,
     /// Active Amazon screen state (Some while Screen::Amazon is active).
     pub amazon_state: Option<AmazonState>,
-    /// Shared inbox: async download tasks push messages here; the event loop
-    /// drains it each tick and applies updates.
-    pub amazon_inbox: std::sync::Arc<std::sync::Mutex<Vec<AmazonMsg>>>,
-    /// Cookie string persisted from Config.
-    pub amazon_cookie: Option<String>,
-    /// Directory where downloaded MP3s are saved, persisted from Config.
-    pub amazon_download_dir: Option<PathBuf>,
 
     // --- file organizer ---
     pub organize: OrganizerEngine,
@@ -570,8 +474,6 @@ impl App {
     pub fn new(
         source_dirs: Vec<PathBuf>,
         audio_handle: Option<OutputStreamHandle>,
-        amazon_cookie: Option<String>,
-        amazon_download_dir: Option<PathBuf>,
     ) -> Self {
         let mut app = Self {
             running: true,
@@ -606,9 +508,6 @@ impl App {
             amazon_key_seq: Vec::new(),
             amazon_key_seq_time: None,
             amazon_state: None,
-            amazon_inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            amazon_cookie,
-            amazon_download_dir,
             organize: OrganizerEngine::new(),
             organizer_state: None,
             gematria_state: None,
@@ -1530,105 +1429,60 @@ impl App {
     // --- Amazon easter egg ---
 
     /// Called when the A→C→E sequence completes.
-    /// Shows the cookie input overlay if no cookie is set, the dir prompt if no
-    /// download dir is set, otherwise opens the catalog view and starts fetching.
     pub fn activate_amazon(&mut self) {
-        // Always prompt for a fresh cookie each session — cookies expire and
-        // the endpoint will 404 with a stale one.  Pre-fill with the saved
-        // value so the user can press Enter to reuse it or paste a new one.
-        self.input_buffer = self
-            .amazon_cookie
-            .clone()
-            .unwrap_or_default();
-        self.amazon_cookie = None; // cleared until the user re-confirms this session
-        self.amazon_state = Some(AmazonState::new_with_overlay(AmazonOverlay::CookieInput));
+        let local = crate::platform::detect_amazon_music();
+        let status = if local.download_dir_exists {
+            format!(
+                "Local downloads: {}  —  [S] add as source  [L] launch app",
+                local.download_dir.display()
+            )
+        } else if local.is_installed() {
+            "[L] Launch Amazon Music to download your purchases, then [S] to import".into()
+        } else {
+            "Amazon Music not found. Install from amazon.com/music/unlimited/download".into()
+        };
+        self.amazon_state = Some(AmazonState { status, local: Some(local) });
         self.screen = Screen::Amazon;
     }
 
-    /// Confirm the cookie string entered in the overlay.
-    pub fn confirm_amazon_cookie(&mut self, cfg: &mut crate::config::Config) {
-        let cookie = self.input_buffer.trim().to_string();
-        self.input_buffer.clear();
-        if cookie.is_empty() {
-            return;
-        }
-        self.amazon_cookie = Some(cookie.clone());
-        cfg.amazon_cookie = Some(cookie);
-        cfg.save();
-
-        if let Some(state) = &mut self.amazon_state {
-            if self.amazon_download_dir.is_none() {
-                state.overlay = Some(AmazonOverlay::DirInput);
-            } else {
-                state.overlay = None;
-                state.loading = true;
-                state.needs_fetch = true;
-                state.status = "Fetching catalog…".into();
+    /// Add the local Amazon Music download directory as a library source and rescan.
+    pub fn add_amazon_local_source(&mut self, cfg: &mut crate::config::Config) {
+        let dir = match self.amazon_state.as_ref().and_then(|s| s.local.as_ref()) {
+            Some(local) if local.download_dir_exists => local.download_dir.clone(),
+            _ => {
+                if let Some(state) = &mut self.amazon_state {
+                    state.status = "No local Amazon Music download directory found.".into();
+                }
+                return;
             }
-        }
-    }
-
-    /// Confirm the download directory entered in the overlay.
-    pub fn confirm_amazon_dir(&mut self, cfg: &mut crate::config::Config) {
-        let dir = crate::util::expand_tilde(self.input_buffer.trim());
-        self.input_buffer.clear();
-        if dir.as_os_str().is_empty() {
-            return;
-        }
-        self.amazon_download_dir = Some(dir.clone());
-        cfg.amazon_download_dir = Some(dir);
-        cfg.save();
-
-        if let Some(state) = &mut self.amazon_state {
-            state.overlay = None;
-            state.loading = true;
-            state.needs_fetch = true;
-            state.status = "Fetching catalog…".into();
-        }
-    }
-
-    /// Drain the amazon_inbox and apply any pending messages to amazon_state.
-    pub fn drain_amazon_inbox(&mut self) {
-        let msgs: Vec<AmazonMsg> = {
-            let mut q = match self.amazon_inbox.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            q.drain(..).collect()
         };
 
-        let Some(state) = &mut self.amazon_state else { return };
-
-        for msg in msgs {
-            match msg {
-                AmazonMsg::Tracks(tracks) => {
-                    state.loading = false;
-                    let n = tracks.len();
-                    state.tracks = tracks;
-                    state.status = format!("{n} tracks in your Amazon library.");
-                }
-                AmazonMsg::Progress { asin, bytes, total } => {
-                    state.progress.insert(asin, (bytes, total));
-                }
-                AmazonMsg::Downloaded { asin, path } => {
-                    state.downloading.remove(&asin);
-                    state.progress.remove(&asin);
-                    state.completed.insert(asin);
-                    state.status = format!("Downloaded: {}", path.file_name().unwrap_or_default().to_string_lossy());
-                }
-                AmazonMsg::Error(e) => {
-                    state.loading = false;
-                    state.status = format!("Error: {e}");
-                }
-                AmazonMsg::Diagnostic(diag) => {
-                    state.loading = false;
-                    state.status = format!(
-                        "API error: HTTP {} on {} — press [?] for diagnostic log",
-                        diag.status, diag.operation
-                    );
-                    state.diagnostic_log.push(diag);
-                }
+        if !self.source_dirs.contains(&dir) {
+            self.source_dirs.push(dir.clone());
+            cfg.source_dirs = self.source_dirs.clone();
+            cfg.save();
+            self.rescan();
+            if let Some(state) = &mut self.amazon_state {
+                state.status = format!("Added '{}' as a source — rescanning.", dir.display());
             }
+        } else if let Some(state) = &mut self.amazon_state {
+            state.status = format!("'{}' is already a source.", dir.display());
+        }
+    }
+
+    /// Launch the Amazon Music desktop application (Windows/Linux/macOS only).
+    pub fn launch_amazon_app(&mut self) {
+        let launched = self.amazon_state.as_ref()
+            .and_then(|s| s.local.as_ref())
+            .map(|local| crate::platform::launch_amazon_music(local))
+            .unwrap_or(false);
+
+        if let Some(state) = &mut self.amazon_state {
+            state.status = if launched {
+                "Amazon Music app launched.".into()
+            } else {
+                "Could not launch Amazon Music app — is it installed?".into()
+            };
         }
     }
 
@@ -1641,7 +1495,6 @@ impl App {
         }
         self.tick_transfer();
         self.tick_organize();
-        self.drain_amazon_inbox();
         self.marquee_tick = self.marquee_tick.wrapping_add(1);
     }
 
@@ -1704,8 +1557,6 @@ impl App {
                         // Persist the updated source list.
                         crate::config::Config {
                             source_dirs: self.source_dirs.clone(),
-                            amazon_cookie: self.amazon_cookie.clone(),
-                            amazon_download_dir: self.amazon_download_dir.clone(),
                         }.save();
                     }
                     self.rescan();

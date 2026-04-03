@@ -15,15 +15,6 @@ use tracing::{info, warn};
 pub struct Config {
     /// Directories scanned for music files.
     pub source_dirs: Vec<PathBuf>,
-
-    // --- Amazon Music easter egg ---
-    /// Browser cookie string for amazon.com / music.amazon.com.
-    /// Copy from DevTools → Application → Cookies → music.amazon.com.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amazon_cookie: Option<String>,
-    /// Directory where Amazon MP3 downloads are saved.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amazon_download_dir: Option<PathBuf>,
 }
 
 impl Config {
