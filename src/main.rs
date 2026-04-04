@@ -7,6 +7,8 @@ mod gematria;
 mod organize;
 mod platform;
 mod util;
+#[cfg(target_os = "windows")]
+mod amazon_cdp;
 mod device;
 mod error;
 mod library;
@@ -824,6 +826,19 @@ fn handle_amazon_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
         }
         KeyCode::Char('s') | KeyCode::Char('S') => app.add_amazon_local_source(cfg),
         KeyCode::Char('l') | KeyCode::Char('L') => app.launch_amazon_app(),
+        #[cfg(target_os = "windows")]
+        KeyCode::Char('d') | KeyCode::Char('D') => app.start_cdp_download(),
+        // Scroll the CDP log pane
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(state) = &mut app.amazon_state {
+                state.cdp_log_scroll = state.cdp_log_scroll.saturating_add(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(state) = &mut app.amazon_state {
+                state.cdp_log_scroll = state.cdp_log_scroll.saturating_sub(1);
+            }
+        }
         _ => {}
     }
 }

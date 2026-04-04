@@ -359,6 +359,15 @@ pub struct AmazonState {
     pub status: String,
     /// Local Amazon Music installation info (detected once at screen open).
     pub local: Option<crate::platform::AmazonMusicLocal>,
+    /// Lines emitted by the CDP automation engine.
+    pub cdp_log: Vec<String>,
+    /// True while the CDP task is running.
+    pub cdp_running: bool,
+    /// Scroll offset for the CDP log pane (lines from bottom).
+    pub cdp_log_scroll: usize,
+    /// Receive end of the CDP automation channel (Windows only).
+    #[cfg(target_os = "windows")]
+    pub cdp_rx: Option<tokio::sync::mpsc::Receiver<crate::amazon_cdp::CdpMsg>>,
 }
 
 impl AmazonState {
@@ -366,6 +375,11 @@ impl AmazonState {
         Self {
             status: String::new(),
             local: None,
+            cdp_log: Vec::new(),
+            cdp_running: false,
+            cdp_log_scroll: 0,
+            #[cfg(target_os = "windows")]
+            cdp_rx: None,
         }
     }
 }
@@ -1441,7 +1455,7 @@ impl App {
         } else {
             "Amazon Music not found. Install from amazon.com/music/unlimited/download".into()
         };
-        self.amazon_state = Some(AmazonState { status, local: Some(local) });
+        self.amazon_state = Some(AmazonState { status, local: Some(local), ..AmazonState::new() });
         self.screen = Screen::Amazon;
     }
 
@@ -1486,6 +1500,87 @@ impl App {
         }
     }
 
+    /// Start the CDP download automation (Win32 installs only).
+    /// Spawns a background task and stores the receive channel in `AmazonState`.
+    #[cfg(target_os = "windows")]
+    pub fn start_cdp_download(&mut self) {
+        let state = match &mut self.amazon_state {
+            Some(s) => s,
+            None => return,
+        };
+
+        // UWP installs can't accept CLI args — debug port won't open.
+        if let Some(local) = &state.local {
+            if local.is_uwp {
+                state.cdp_log.push(
+                    "CDP automation requires the Win32 installer, not the Store/UWP version."
+                        .into(),
+                );
+                state.cdp_log.push(
+                    "Download the classic installer from amazon.com/music/unlimited/download"
+                        .into(),
+                );
+                return;
+            }
+            if local.exe.is_none() {
+                state.cdp_log.push("Amazon Music Win32 exe not found.".into());
+                return;
+            }
+        }
+
+        if state.cdp_running {
+            state.cdp_log.push("Automation already running...".into());
+            return;
+        }
+
+        let exe = state
+            .local
+            .as_ref()
+            .and_then(|l| l.exe.clone())
+            .expect("checked above");
+
+        state.cdp_log.clear();
+        state.cdp_log_scroll = 0;
+        state.cdp_running = true;
+        state.cdp_rx = Some(crate::amazon_cdp::spawn_download_automation(exe));
+    }
+
+    /// Drain any pending CDP messages into the log. Called every tick.
+    pub fn tick_amazon_cdp(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::amazon_cdp::CdpMsg;
+            let state = match &mut self.amazon_state {
+                Some(s) => s,
+                None => return,
+            };
+            let rx = match &mut state.cdp_rx {
+                Some(r) => r,
+                None => return,
+            };
+            loop {
+                match rx.try_recv() {
+                    Ok(CdpMsg::Log(line)) => {
+                        state.cdp_log.push(line);
+                        state.cdp_log_scroll = 0; // stay at bottom
+                    }
+                    Ok(CdpMsg::Done) => {
+                        state.cdp_running = false;
+                        state.cdp_rx = None;
+                        break;
+                    }
+                    Ok(CdpMsg::Error(e)) => {
+                        state.cdp_log.push(format!("✗ {e}"));
+                        state.cdp_running = false;
+                        state.cdp_rx = None;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
     // --- tick ---
 
     pub fn tick(&mut self) {
@@ -1495,6 +1590,7 @@ impl App {
         }
         self.tick_transfer();
         self.tick_organize();
+        self.tick_amazon_cdp();
         self.marquee_tick = self.marquee_tick.wrapping_add(1);
     }
 

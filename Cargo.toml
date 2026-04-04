@@ -66,6 +66,11 @@ humansize = "2"
 # HTTP client for Amazon Music easter egg (pure-Rust TLS, no OpenSSL dep)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# CDP (Chrome DevTools Protocol) WebSocket client — Amazon Music automation
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # Clipboard read/write (Ctrl+V paste support in text fields).
 # arboard requires a display server — not available on Android/Termux.
