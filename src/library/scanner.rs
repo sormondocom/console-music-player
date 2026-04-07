@@ -5,9 +5,10 @@ use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::*;
 use lofty::probe::Probe;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
+use super::cache::{self, CacheEntry, ScanCache};
 use super::{Track, TrackEdit};
 use crate::error::{AppError, Result};
 use crate::tracker;
@@ -19,14 +20,21 @@ const LOFTY_EXTENSIONS: &[&str] = &[
 
 /// Scan multiple directories, merge results, and deduplicate by path.
 ///
+/// Loads the scan cache first; files whose mtime and size are unchanged are
+/// returned from cache without calling lofty.  Only new or modified files
+/// incur a full metadata parse.  The updated cache is saved when done.
+///
 /// Directories that fail to scan are logged as warnings and skipped —
 /// the remaining sources are still returned.
 pub fn scan_directories(roots: &[PathBuf]) -> Result<Vec<Track>> {
+    let mut scan_cache = ScanCache::load();
     let mut tracks: Vec<Track> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut hits = 0usize;
+    let mut misses = 0usize;
 
     for root in roots {
-        match scan_directory(root) {
+        match scan_directory_cached(root, &mut scan_cache, &mut hits, &mut misses) {
             Ok(found) => {
                 for track in found {
                     if seen.insert(track.path.clone()) {
@@ -38,6 +46,12 @@ pub fn scan_directories(roots: &[PathBuf]) -> Result<Vec<Track>> {
         }
     }
 
+    info!(
+        "Scan complete: {} cache hits, {} files parsed, {} total tracks.",
+        hits, misses, tracks.len()
+    );
+    scan_cache.save();
+
     tracks.sort_by(|a, b| {
         a.artist
             .cmp(&b.artist)
@@ -48,8 +62,13 @@ pub fn scan_directories(roots: &[PathBuf]) -> Result<Vec<Track>> {
     Ok(tracks)
 }
 
-/// Recursively scan a single directory and return all discovered audio tracks.
-pub fn scan_directory(root: &Path) -> Result<Vec<Track>> {
+/// Recursively scan a single directory, using `scan_cache` to skip unchanged files.
+fn scan_directory_cached(
+    root: &Path,
+    scan_cache: &mut ScanCache,
+    hits: &mut usize,
+    misses: &mut usize,
+) -> Result<Vec<Track>> {
     let mut tracks = Vec::new();
 
     for entry in WalkDir::new(root)
@@ -75,7 +94,39 @@ pub fn scan_directory(root: &Path) -> Result<Vec<Track>> {
             continue;
         }
 
-        // Verify the file's magic bytes match the declared extension.
+        // Stat the file to get mtime + size for the cache key.
+        let metadata = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Could not stat {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        let file_size  = metadata.len();
+        let mtime      = cache::mtime_secs(&metadata);
+        let abs_path   = path.to_path_buf();
+
+        // --- cache hit? ---
+        if let Some(cached) = scan_cache.get(&abs_path, mtime, file_size) {
+            let track = Track {
+                path:           abs_path,
+                title:          cached.title.clone(),
+                artist:         cached.artist.clone(),
+                album:          cached.album.clone(),
+                year:           cached.year,
+                duration_secs:  cached.duration_secs,
+                file_size:      cached.file_size,
+                bitrate_kbps:   cached.bitrate_kbps,
+                sample_rate_hz: cached.sample_rate_hz,
+                channels:       cached.channels,
+            };
+            tracks.push(track);
+            *hits += 1;
+            continue;
+        }
+
+        // --- cache miss: verify magic bytes, then parse ---
+
         match super::magic::verify(path, &ext) {
             super::magic::MagicVerdict::Ok => {}
             super::magic::MagicVerdict::Mismatch { detected } => {
@@ -94,25 +145,17 @@ pub fn scan_directory(root: &Path) -> Result<Vec<Track>> {
             }
         }
 
-        let file_size = match std::fs::metadata(path) {
-            Ok(m) => m.len(),
-            Err(e) => {
-                warn!("Could not stat {}: {}", path.display(), e);
-                continue;
-            }
-        };
-
-        debug!("Found track: {}", path.display());
+        debug!("Parsing track: {}", path.display());
 
         let track = if is_tracker {
             let tmeta = tracker::read_metadata(path);
             Track {
-                path: path.to_path_buf(),
-                title:          tmeta.title,
-                artist:         tmeta.artist,
+                path:           abs_path.clone(),
+                title:          tmeta.title.clone(),
+                artist:         tmeta.artist.clone(),
                 album:          String::new(),
                 year:           None,
-                duration_secs:  None, // populated by TrackerSource at play time
+                duration_secs:  None,
                 file_size,
                 bitrate_kbps:   None,
                 sample_rate_hz: Some(48_000),
@@ -121,10 +164,10 @@ pub fn scan_directory(root: &Path) -> Result<Vec<Track>> {
         } else {
             let meta = read_metadata(path);
             Track {
-                path: path.to_path_buf(),
-                title:          meta.title,
-                artist:         meta.artist,
-                album:          meta.album,
+                path:           abs_path.clone(),
+                title:          meta.title.clone(),
+                artist:         meta.artist.clone(),
+                album:          meta.album.clone(),
                 year:           meta.year,
                 duration_secs:  meta.duration_secs,
                 file_size,
@@ -133,6 +176,22 @@ pub fn scan_directory(root: &Path) -> Result<Vec<Track>> {
                 channels:       meta.channels,
             }
         };
+
+        // Store in cache for next run.
+        scan_cache.insert(abs_path, CacheEntry {
+            mtime_secs:    mtime,
+            file_size,
+            title:         track.title.clone(),
+            artist:        track.artist.clone(),
+            album:         track.album.clone(),
+            year:          track.year,
+            duration_secs: track.duration_secs,
+            bitrate_kbps:  track.bitrate_kbps,
+            sample_rate_hz: track.sample_rate_hz,
+            channels:      track.channels,
+        });
+        *misses += 1;
+
         tracks.push(track);
     }
 

@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod dedup;
 pub mod magic;
 pub mod scanner;
