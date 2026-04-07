@@ -482,6 +482,11 @@ pub struct App {
     /// Set when the audio decoder panics mid-stream. Shows an overlay offering
     /// to remove the offending track from the library.
     pub decoder_error_track: Option<crate::library::Track>,
+
+    // --- shuffle RNG ---
+    /// Internal xorshift64 state, seeded from wall-clock at startup.
+    /// Used only when shuffle is enabled to pick the next track.
+    shuffle_rng: u64,
 }
 
 impl App {
@@ -527,6 +532,14 @@ impl App {
             gematria_state: None,
             last_gematria_phrase: String::new(),
             decoder_error_track: None,
+            shuffle_rng: {
+                // Non-zero seed required by xorshift64.
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| (d.as_secs() << 20) ^ d.subsec_nanos() as u64)
+                    .unwrap_or(0x853c49e6748fea9b);
+                if t == 0 { 0x853c49e6748fea9b } else { t }
+            },
         };
         app.rescan();
         app.rebuild_playlist_membership();
@@ -1581,12 +1594,51 @@ impl App {
         }
     }
 
+    // --- auto-advance (shuffle / sequential) ---
+
+    /// Advance to the next track after one ends naturally.
+    /// Sequential mode: moves to the next index, wrapping at the end of the list.
+    /// Shuffle mode: picks a random index (different from current when possible).
+    fn advance_track(&mut self) {
+        let n = self.library.tracks.len();
+        if n == 0 {
+            return;
+        }
+        let next = if self.player.shuffle == crate::player::ShuffleMode::On {
+            let current = self.library.selected_index;
+            let idx = self.next_shuffle_index(n);
+            // If we happened to land on the same track and there's more than one,
+            // nudge forward one position.
+            if idx == current && n > 1 { (idx + 1) % n } else { idx }
+        } else {
+            // Sequential: wrap around to the start after the last track.
+            (self.library.selected_index + 1) % n
+        };
+        self.library.selected_index = next;
+        self.reset_marquee();
+        self.play_focused();
+    }
+
+    /// xorshift64 — returns a value in `0..n`.
+    fn next_shuffle_index(&mut self, n: usize) -> usize {
+        let mut x = self.shuffle_rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.shuffle_rng = x;
+        (x as usize) % n
+    }
+
     // --- tick ---
 
     pub fn tick(&mut self) {
         self.player.tick();
         if let Some(track) = self.player.take_decoder_panic() {
             self.decoder_error_track = Some(track);
+            // Suppress any pending advance so the error overlay can show cleanly.
+            self.player.needs_next = false;
+        } else if self.player.take_needs_next() {
+            self.advance_track();
         }
         self.tick_transfer();
         self.tick_organize();

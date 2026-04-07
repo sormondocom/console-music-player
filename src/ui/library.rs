@@ -295,9 +295,10 @@ pub(super) fn render_player_pane(app: &App, frame: &mut Frame, area: Rect) {
             let vol_pct = (p.volume * 100.0).round() as u8;
 
             let time_vol = Paragraph::new(format!(
-                "{elapsed_s}/{total_s}  Vol:{} {vol_pct}%  {}",
+                "{elapsed_s}/{total_s}  Vol:{} {vol_pct}%  {}{}",
                 p.volume_bar(),
-                p.repeat.icon()
+                p.repeat.icon(),
+                p.shuffle.icon(),
             ))
             .style(Style::default().fg(super::CLR_DIM))
             .alignment(Alignment::Center);
@@ -492,6 +493,7 @@ pub(super) fn render_functions_pane(_app: &App, frame: &mut Frame, area: Rect) {
         Line::from(vec![key("E"), label("Edit tags"), key("R"), label("Rescan")]),
         Line::from(vec![key("F"), label("Find dupes"), key("G"), label("Tag")]),
         Line::from(vec![key("Z"), label("Sort      "), key("O"), label("Repeat")]),
+        Line::from(vec![key("H"), label("Shuffle")]),
         Line::from(vec![key("V"), label("Waveform")]),
         Line::from(vec![key("Q"), label("Quit")]),
     ];

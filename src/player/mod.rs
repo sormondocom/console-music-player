@@ -183,6 +183,31 @@ impl RepeatMode {
     }
 }
 
+/// Continuous-playback shuffle mode.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ShuffleMode {
+    #[default]
+    Off,
+    /// Pick a random track from the current library view after each track ends.
+    On,
+}
+
+impl ShuffleMode {
+    pub fn toggle(&self) -> Self {
+        match self {
+            Self::Off => Self::On,
+            Self::On  => Self::Off,
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Off => "  ",
+            Self::On  => "🔀",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Player
 // ---------------------------------------------------------------------------
@@ -194,6 +219,10 @@ pub struct Player {
     pub current_track: Option<Track>,
     pub state: PlaybackState,
     pub repeat: RepeatMode,
+    pub shuffle: ShuffleMode,
+    /// Set by `tick()` when a track ends naturally (no repeat).
+    /// Cleared by `take_needs_next()`. The app reads this to advance to the next track.
+    pub needs_next: bool,
     /// Volume 0.0..=1.0
     pub volume: f32,
 
@@ -229,6 +258,8 @@ impl Player {
             current_track: None,
             state: PlaybackState::Stopped,
             repeat: RepeatMode::Off,
+            shuffle: ShuffleMode::Off,
+            needs_next: false,
             volume: 0.8,
             wave_buffer: visualizer::new_wave_buffer(),
             decoder_panic_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -444,11 +475,20 @@ impl Player {
                     return;
                 }
             }
+            // Signal the app to advance to the next (or random) track.
+            self.needs_next = true;
             self.state = PlaybackState::Stopped;
             self.started_at = None;
             #[cfg(unix)]
             { self.ext = None; }
         }
+    }
+
+    /// Returns `true` if a track just ended naturally, then clears the flag.
+    pub fn take_needs_next(&mut self) -> bool {
+        let v = self.needs_next;
+        self.needs_next = false;
+        v
     }
 
     /// Returns `Some(track)` if the decoder panicked since the last call, then
@@ -502,6 +542,7 @@ impl Player {
             ext.stop();
         }
         self.state = PlaybackState::Stopped;
+        self.needs_next = false;
         self.started_at = None;
         self.elapsed_before_pause = Duration::ZERO;
     }

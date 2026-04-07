@@ -185,7 +185,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
                     "[R] Rescan"
                 };
                 library_hint = format!(
-                    " [↑↓/jk] Nav  [PgUp/Dn] Page  [Enter] Play  [P] Pause  [O] Repeat  \
+                    " [↑↓/jk] Nav  [PgUp/Dn] Page  [Enter] Play  [P] Pause  [O] Repeat  [H] Shuffle  \
                      [Z] Sort  []/[ Vol  [Space] Sel  [G] Tag  [/] Search  [\\] Gematria  [M] Organize  [Tab] Pane  {r_hint}"
                 );
                 library_hint.as_str()

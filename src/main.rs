@@ -503,6 +503,15 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
             };
             app.status_message = Some(label.into());
         }
+        KeyCode::Char('h') | KeyCode::Char('H') => {
+            app.player.shuffle = app.player.shuffle.toggle();
+            let label = match app.player.shuffle {
+                crate::player::ShuffleMode::Off => "Shuffle off.",
+                crate::player::ShuffleMode::On  =>
+                    "Shuffle on — plays continuously in random order.",
+            };
+            app.status_message = Some(label.into());
+        }
         KeyCode::Char('z') | KeyCode::Char('Z') => {
             app.library.cycle_sort();
             app.status_message = Some(format!(
