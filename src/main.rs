@@ -533,10 +533,12 @@ fn handle_search_key(app: &mut App, key: KeyCode) {
         KeyCode::Esc => app.cancel_search(),
         KeyCode::Enter => app.confirm_search(),
 
-        KeyCode::Up   | KeyCode::Char('k') => {
+        // Arrow keys navigate results; j/k are NOT aliased here so they can
+        // be typed as part of the search query.
+        KeyCode::Up => {
             if let Some(s) = &mut app.search_state { s.move_up(); }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             if let Some(s) = &mut app.search_state { s.move_down(); }
         }
         KeyCode::PageUp => {

@@ -175,7 +175,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let help = if app.gematria_state.is_some() {
         " Type a phrase  [Tab] Cycle system  [Enter] Play selected track  [Esc] Cancel"
     } else if app.search_state.is_some() {
-        " [↑↓/jk] Navigate  [PgUp/Dn] Page  [Enter] Jump to track  [Esc] Close  — type to filter"
+        " [↑↓] Navigate results  [PgUp/Dn] Page  [Enter] Jump to track  [Esc] Close  — type to filter"
     } else {
         match app.screen {
             Screen::Library => {
