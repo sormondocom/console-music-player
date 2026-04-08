@@ -329,10 +329,9 @@ pub(super) fn render_gematria_overlay(app: &App, state: &GematriaState, frame: &
 // ---------------------------------------------------------------------------
 
 pub(super) fn render_search_overlay(state: &SearchState, frame: &mut Frame, area: Rect) {
-    let max_results = 16usize;
-    let result_rows = state.results.len().min(max_results) as u16;
+    // Use as much vertical space as available — results scroll within it.
     let width = (area.width as f32 * 0.80) as u16;
-    let height = (result_rows + 5).max(7).min(area.height.saturating_sub(4));
+    let height = area.height.saturating_sub(4).max(7);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let box_area = Rect { x, y, width, height };
@@ -385,7 +384,6 @@ pub(super) fn render_search_overlay(state: &SearchState, frame: &mut Frame, area
     let items: Vec<ListItem> = state
         .results
         .iter()
-        .take(max_results)
         .enumerate()
         .map(|(i, result)| {
             let selected = i == state.selected;
@@ -419,9 +417,9 @@ pub(super) fn render_search_overlay(state: &SearchState, frame: &mut Frame, area
         })
         .collect();
 
-    let display_count = state.results.len().min(max_results);
-    let sel = state.selected.min(display_count.saturating_sub(1));
-    let mut list_state = super::centered_list_state(sel, display_count, results_area.height);
+    let total = state.results.len();
+    let sel = state.selected.min(total.saturating_sub(1));
+    let mut list_state = super::centered_list_state(sel, total, results_area.height);
     frame.render_stateful_widget(
         List::new(items).highlight_style(Style::default().bg(Color::DarkGray)),
         results_area,
