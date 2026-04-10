@@ -99,8 +99,14 @@ pub fn build_swarm(keypair: Keypair) -> anyhow::Result<Swarm<MusicBehaviour>> {
                     .with_agent_version(format!("cmp/{}", env!("CARGO_PKG_VERSION"))),
             );
 
+            // Probe every 30 s instead of the 5-minute default so LAN peers
+            // are found within half a minute of both nodes being up.
+            let mdns_cfg = mdns::Config {
+                query_interval: Duration::from_secs(30),
+                ..mdns::Config::default()
+            };
             let mdns = mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
+                mdns_cfg,
                 key.public().to_peer_id(),
             )
             .map_err(|e| anyhow::anyhow!("mdns init: {e}"))?;

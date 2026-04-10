@@ -446,6 +446,13 @@ impl MusicNode {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!(%peer_id, "connection established");
                 network::add_gossipsub_peer(&mut self.swarm, peer_id);
+                // Re-announce our PGP key so the new peer learns our identity.
+                // The startup announcement fires before any peers are connected
+                // (gossipsub has no subscribers yet), so this is the only
+                // reliable path for mutual key exchange on LAN discovery.
+                if let Err(e) = self.publish_announce_key().await {
+                    debug!(%peer_id, "key re-announce after connect: {e}");
+                }
             }
 
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
