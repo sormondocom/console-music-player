@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::app::{App, EditState, GematriaState, SearchState, EDIT_FIELD_LABELS};
+use crate::p2p::ToastLevel;
 use crate::media::MediaItem;
 
 // ---------------------------------------------------------------------------
@@ -322,6 +323,63 @@ pub(super) fn render_gematria_overlay(app: &App, state: &GematriaState, frame: &
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Toast notifications (bottom-right corner, non-modal, auto-dismiss)
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_toasts(app: &App, frame: &mut Frame, area: Rect) {
+    // Show at most 3 toasts, newest first, each 1 row tall + 2 border = 3 rows each.
+    // Stack them upward from the bottom-right.
+    const MAX_VISIBLE: usize = 3;
+    const TOAST_WIDTH: u16 = 52;
+    const TOAST_HEIGHT: u16 = 3;
+
+    let visible: Vec<_> = app.p2p_toasts.iter().take(MAX_VISIBLE).collect();
+    if visible.is_empty() {
+        return;
+    }
+
+    let right_edge = area.x + area.width;
+    let bottom_edge = area.y + area.height;
+    let x = right_edge.saturating_sub(TOAST_WIDTH + 1);
+
+    for (i, toast) in visible.iter().enumerate() {
+        let y = bottom_edge.saturating_sub((i as u16 + 1) * TOAST_HEIGHT + i as u16);
+        if y < area.y {
+            break;
+        }
+        let toast_area = Rect {
+            x,
+            y,
+            width: TOAST_WIDTH.min(area.width.saturating_sub(1)),
+            height: TOAST_HEIGHT,
+        };
+
+        let (border_color, icon) = match toast.level {
+            ToastLevel::Info    => (super::CLR_ACCENT, "ℹ"),
+            ToastLevel::Warning => (Color::Yellow,     "⚠"),
+            ToastLevel::Error   => (super::CLR_ERROR,  "✗"),
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color));
+
+        let inner = block.inner(toast_area);
+        frame.render_widget(Clear, toast_area);
+        frame.render_widget(block, toast_area);
+
+        let max_msg = inner.width.saturating_sub(3) as usize;
+        let msg = super::truncate(&toast.message, max_msg);
+        let line = Line::from(vec![
+            Span::styled(format!("{icon} "), Style::default().fg(border_color).bold()),
+            Span::styled(msg, Style::default().fg(Color::White)),
+        ]);
+        frame.render_widget(Paragraph::new(line), inner);
+    }
 }
 
 // ---------------------------------------------------------------------------

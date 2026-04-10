@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod gematria;
 mod organize;
+mod p2p;
 mod platform;
 mod util;
 #[cfg(target_os = "windows")]
@@ -361,7 +362,63 @@ fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
         Screen::DeviceTracks    => handle_device_tracks_key(app, key),
         Screen::Amazon          => handle_amazon_key(app, key, cfg),
         Screen::Organize        => handle_organize_key(app, key),
+        Screen::P2pPeers        => handle_p2p_peers_key(app, key),
+        Screen::RemoteLibrary   => handle_remote_library_key(app, key),
+        Screen::PartyLine       => handle_party_line_key(app, key),
     }
+}
+
+/// Advance the `p`→`2`→`p` P2P activation chord.
+///
+/// Design notes:
+/// - The first `p` is **not** consumed so that `toggle_pause` still fires.
+/// - The `2` is consumed (it has no other binding in the library screen).
+/// - The final `p` is consumed and triggers [`App::activate_p2p`].
+/// - Returns `true` if the key was consumed (i.e. should not be processed further).
+fn advance_p2p_chord(app: &mut App, c: char) -> bool {
+    const SEQ: [char; 3] = ['p', '2', 'p'];
+    const TIMEOUT_SECS: u64 = 2;
+    let lc = c.to_ascii_lowercase();
+    let seq_len = app.p2p_key_seq.len();
+
+    // Expire a stale partial sequence.
+    if seq_len > 0 {
+        let expired = app
+            .p2p_key_seq_time
+            .map(|t| t.elapsed().as_secs() >= TIMEOUT_SECS)
+            .unwrap_or(true);
+        if expired {
+            app.p2p_key_seq.clear();
+            app.p2p_key_seq_time = None;
+        }
+    }
+
+    let seq_len = app.p2p_key_seq.len();
+
+    if seq_len < SEQ.len() && lc == SEQ[seq_len] {
+        if seq_len == 0 {
+            // Record the start time and push, but do NOT consume the key —
+            // `p` still toggles pause as normal.
+            app.p2p_key_seq_time = Some(std::time::Instant::now());
+            app.p2p_key_seq.push(lc);
+            return false;
+        }
+        // Consume '2' and the completing 'p'.
+        app.p2p_key_seq.push(lc);
+        if app.p2p_key_seq.len() == SEQ.len() {
+            app.p2p_key_seq.clear();
+            app.p2p_key_seq_time = None;
+            app.activate_p2p();
+        }
+        return true;
+    }
+
+    // Wrong key — reset any in-progress sequence (but don't consume).
+    if seq_len > 0 {
+        app.p2p_key_seq.clear();
+        app.p2p_key_seq_time = None;
+    }
+    false
 }
 
 /// Advance the A→C→E easter-egg key sequence.
@@ -420,6 +477,14 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
     // the sequence (i.e. 'A' and 'C' were already pressed within 2 seconds).
     if let KeyCode::Char(c) = key {
         if advance_amazon_seq(app, c) {
+            return;
+        }
+    }
+
+    // P2P activation chord: p→2→p within 2 seconds.
+    // The first 'p' is not consumed (pause still works); '2' and final 'p' are.
+    if let KeyCode::Char(c) = key {
+        if advance_p2p_chord(app, c) {
             return;
         }
     }
@@ -877,15 +942,175 @@ fn handle_text_input_key(app: &mut App, key: KeyCode, on_enter: impl Fn(&mut App
     }
 }
 
+fn handle_p2p_peers_key(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+            app.screen = Screen::Library;
+        }
+        KeyCode::Up   | KeyCode::Char('k') => {
+            app.p2p_peers_selected = app.p2p_peers_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !app.p2p_peer_list.is_empty() {
+                app.p2p_peers_selected =
+                    (app.p2p_peers_selected + 1).min(app.p2p_peer_list.len() - 1);
+            }
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            // Approve the focused peer.
+            if let Some(info) = app.p2p_peer_list.get(app.p2p_peers_selected) {
+                let fp = info.fingerprint.clone();
+                if let Some(node) = &app.p2p_node {
+                    node.send(crate::p2p::P2pCommand::ApproveKey(fp));
+                }
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+            // Deny / revoke the focused peer.
+            if let Some(info) = app.p2p_peer_list.get(app.p2p_peers_selected) {
+                let fp = info.fingerprint.clone();
+                if let Some(node) = &app.p2p_node {
+                    node.send(crate::p2p::P2pCommand::DenyKey(fp));
+                }
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Char('X') => {
+            // Disconnect from P2P.
+            app.deactivate_p2p();
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            // Refresh peer list.
+            if let Some(node) = &app.p2p_node {
+                node.send(crate::p2p::P2pCommand::GetPeerList);
+            }
+        }
+        KeyCode::Char('l') | KeyCode::Char('L') => {
+            app.screen = Screen::RemoteLibrary;
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            app.screen = Screen::PartyLine;
+        }
+        _ => {}
+    }
+}
+
+fn handle_remote_library_key(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+            app.screen = Screen::Library;
+        }
+        KeyCode::Up   | KeyCode::Char('k') => {
+            app.remote_library_selected = app.remote_library_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !app.remote_tracks.is_empty() {
+                app.remote_library_selected =
+                    (app.remote_library_selected + 1).min(app.remote_tracks.len() - 1);
+            }
+        }
+        KeyCode::PageUp => {
+            app.remote_library_selected =
+                app.remote_library_selected.saturating_sub(PAGE_SIZE);
+        }
+        KeyCode::PageDown => {
+            if !app.remote_tracks.is_empty() {
+                app.remote_library_selected =
+                    (app.remote_library_selected + PAGE_SIZE)
+                        .min(app.remote_tracks.len() - 1);
+            }
+        }
+        KeyCode::Enter => {
+            // Request the focused track from its owner.
+            if let Some(track) = app.remote_tracks.get(app.remote_library_selected) {
+                let track_id = track.id;
+                let peer_fp  = track.owner_fp.clone();
+                let peer_nick = track.owner_nick.clone();
+                app.p2p_buffer_state = crate::p2p::P2pBufferState::Requesting {
+                    track_id,
+                    peer_nick,
+                };
+                if let Some(node) = &app.p2p_node {
+                    node.send(crate::p2p::P2pCommand::RequestTrack { track_id, peer_fp });
+                }
+                app.screen = Screen::Library; // return to library to watch buffering gauge
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            // Nominate the focused track for the party line.
+            if let Some(track) = app.remote_tracks.get(app.remote_library_selected).cloned() {
+                let party = app.party_line.get_or_insert_with(
+                    crate::p2p::party::PartyLineState::new
+                );
+                let _ = party; // will be populated by the event
+                if let Some(node) = &app.p2p_node {
+                    node.send(crate::p2p::P2pCommand::NominateTrack(track));
+                }
+                app.screen = Screen::PartyLine;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_party_line_key(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+            app.screen = Screen::Library;
+        }
+        KeyCode::Up   | KeyCode::Char('k') => {
+            if let Some(party) = &mut app.party_line {
+                party.move_up();
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(party) = &mut app.party_line {
+                party.move_down();
+            }
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            // Vote Yes on the focused nomination.
+            if let Some(nom_id) = app
+                .party_line
+                .as_ref()
+                .and_then(|p| p.focused_nomination())
+                .map(|n| n.id)
+            {
+                if let Some(node) = &app.p2p_node {
+                    node.send(crate::p2p::P2pCommand::CastVote {
+                        nomination_id: nom_id,
+                        vote: crate::p2p::wire::PartyVote::Yes,
+                    });
+                }
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            // Vote No on the focused nomination.
+            if let Some(nom_id) = app
+                .party_line
+                .as_ref()
+                .and_then(|p| p.focused_nomination())
+                .map(|n| n.id)
+            {
+                if let Some(node) = &app.p2p_node {
+                    node.send(crate::p2p::P2pCommand::CastVote {
+                        nomination_id: nom_id,
+                        vote: crate::p2p::wire::PartyVote::No,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn persist_sources(app: &App) {
-    Config {
-        source_dirs: app.source_dirs.clone(),
-    }
-    .save();
+    let mut cfg = Config::load();
+    cfg.source_dirs = app.source_dirs.clone();
+    cfg.save();
 }
 
 fn refresh_devices(app: &mut App) {

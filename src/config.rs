@@ -15,6 +15,36 @@ use tracing::{info, warn};
 pub struct Config {
     /// Directories scanned for music files.
     pub source_dirs: Vec<PathBuf>,
+
+    // ── P2P identity (all optional — absent means P2P never activated) ──────
+    /// ASCII-armoured secret key (protected by `p2p_identity_passphrase`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_identity_armored: Option<String>,
+
+    /// Auto-generated passphrase protecting the secret key.
+    /// Beta simplification — TODO: move to OS keychain before stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_identity_passphrase: Option<String>,
+
+    /// Display name for this node on the P2P network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_nickname: Option<String>,
+
+    /// Peers explicitly trusted across sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub p2p_trusted_peers: Vec<TrustedPeerRecord>,
+
+    /// Bootstrap multiaddrs (user-configurable).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub p2p_bootstrap_peers: Vec<String>,
+}
+
+/// A trusted peer persisted across sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedPeerRecord {
+    pub fingerprint:        String,
+    pub nickname:           String,
+    pub public_key_armored: String,
 }
 
 impl Config {

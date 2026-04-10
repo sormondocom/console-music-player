@@ -19,6 +19,13 @@ use crate::playlist::{ConflictCtx, Playlist};
 use crate::tags::TagStore;
 use crate::transfer::{TransferEngine, TransferEvent};
 use crate::organize::{OrganizerEngine, OrganizerEvent};
+use crate::config::Config;
+use crate::p2p::{P2pBufferState, P2pHandle, Toast, ToastLevel};
+use crate::p2p::identity::PgpIdentity;
+use crate::p2p::node::MusicNode;
+use crate::p2p::party::PartyLineState;
+use crate::p2p::trust::NodeInfo;
+use crate::p2p::wire::RemoteTrack;
 
 // ---------------------------------------------------------------------------
 // Screens / focus
@@ -48,6 +55,12 @@ pub enum Screen {
     Amazon,
     /// File organizer — copy/verify/delete tracks into new folders.
     Organize,
+    /// P2P peer management — approve/reject/view connected peers.  (Beta)
+    P2pPeers,
+    /// Browse remote music libraries from trusted peers.  (Beta)
+    RemoteLibrary,
+    /// Party Line — nominate and vote on tracks for group playback.  (Beta)
+    PartyLine,
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +500,28 @@ pub struct App {
     /// Internal xorshift64 state, seeded from wall-clock at startup.
     /// Used only when shuffle is enabled to pick the next track.
     shuffle_rng: u64,
+
+    // --- P2P music sharing (beta) ---
+    /// Active P2P handle; `None` when P2P is inactive.
+    pub p2p_node: Option<P2pHandle>,
+    /// Buffering/playing state for the player pane P2P display.
+    pub p2p_buffer_state: P2pBufferState,
+    /// Non-modal toast queue rendered in the bottom-right corner.
+    pub p2p_toasts: std::collections::VecDeque<Toast>,
+    /// Merged catalog of tracks from all trusted peers.
+    pub remote_tracks: Vec<RemoteTrack>,
+    /// Party Line state — `Some` when the P2P screen has been opened at least once.
+    pub party_line: Option<PartyLineState>,
+    /// Snapshot of all known peers for the P2pPeers screen.
+    pub p2p_peer_list: Vec<NodeInfo>,
+    /// Scroll offset for the RemoteLibrary screen.
+    pub remote_library_selected: usize,
+    /// Scroll offset for the P2pPeers screen.
+    pub p2p_peers_selected: usize,
+    /// Key sequence buffer for the `p`→`2`→`p` activation chord.
+    pub p2p_key_seq: Vec<char>,
+    /// Timestamp of the first key in the current P2P chord sequence.
+    pub p2p_key_seq_time: Option<std::time::Instant>,
 }
 
 impl App {
@@ -540,6 +575,16 @@ impl App {
                     .unwrap_or(0x853c49e6748fea9b);
                 if t == 0 { 0x853c49e6748fea9b } else { t }
             },
+            p2p_node: None,
+            p2p_buffer_state: P2pBufferState::Idle,
+            p2p_toasts: std::collections::VecDeque::new(),
+            remote_tracks: Vec::new(),
+            party_line: None,
+            p2p_peer_list: Vec::new(),
+            remote_library_selected: 0,
+            p2p_peers_selected: 0,
+            p2p_key_seq: Vec::new(),
+            p2p_key_seq_time: None,
         };
         app.rescan();
         app.rebuild_playlist_membership();
@@ -567,6 +612,13 @@ impl App {
                 ));
                 self.rebuild_playlist_membership();
                 self.sync_tag_sort_keys();
+                // Re-broadcast catalog to P2P peers after rescan
+                if let Some(node) = &self.p2p_node {
+                    let catalog = crate::p2p::catalog::build_catalog(&self.library);
+                    node.send(crate::p2p::P2pCommand::AnnounceLibrary(catalog));
+                    let paths = crate::p2p::catalog::build_path_map(&self.library);
+                    node.send(crate::p2p::P2pCommand::SetLocalPaths(paths));
+                }
             }
             Err(e) => self.status_message = Some(format!("Scan error: {e}")),
         }
@@ -1643,6 +1695,7 @@ impl App {
         self.tick_transfer();
         self.tick_organize();
         self.tick_amazon_cdp();
+        self.tick_p2p();
         self.marquee_tick = self.marquee_tick.wrapping_add(1);
     }
 
@@ -1703,12 +1756,366 @@ impl App {
                     if !self.source_dirs.contains(&dest_dir) {
                         self.source_dirs.push(dest_dir);
                         // Persist the updated source list.
-                        crate::config::Config {
-                            source_dirs: self.source_dirs.clone(),
-                        }.save();
+                        {
+                            let mut cfg = Config::load();
+                            cfg.source_dirs = self.source_dirs.clone();
+                            cfg.save();
+                        }
                     }
                     self.rescan();
                 }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // P2P methods
+    // ---------------------------------------------------------------------------
+
+    /// Activate P2P mode (called on `p`→`2`→`p` chord completion).
+    /// Loads or generates the PGP identity, spawns the libp2p node, and
+    /// stores a `P2pHandle` in `self.p2p_node`.
+    pub fn activate_p2p(&mut self) {
+        if self.p2p_node.is_some() {
+            // Already active — jump to peer management screen.
+            self.screen = Screen::P2pPeers;
+            return;
+        }
+
+        let mut cfg = Config::load();
+
+        let nickname = cfg.p2p_nickname.clone().unwrap_or_else(|| {
+            std::env::var("USERNAME")
+                .or_else(|_| std::env::var("USER"))
+                .unwrap_or_else(|_| "user".into())
+        });
+
+        match PgpIdentity::load_or_generate(
+            &nickname,
+            cfg.p2p_identity_armored.as_deref(),
+            cfg.p2p_identity_passphrase.as_deref(),
+        ) {
+            Ok((identity, new_keys)) => {
+                if let Some((armored, passphrase)) = new_keys {
+                    cfg.p2p_identity_armored    = Some(armored);
+                    cfg.p2p_identity_passphrase = Some(passphrase);
+                    cfg.p2p_nickname            = Some(nickname.clone());
+                    cfg.save();
+                    self.push_toast(Toast::info("P2P identity generated."));
+                }
+
+                let fp = identity.fingerprint();
+                let fp_short = &fp[..8.min(fp.len())];
+
+                // Build channel pair: UI-side handle + node-side channels
+                let (handle, channels) = P2pHandle::channel(nickname.clone(), fp.clone());
+
+                // Parse bootstrap peers from config multiaddrs.
+                // Each string is expected to be a full /ip4/.../tcp/.../p2p/<PeerId> multiaddr.
+                let bootstrap_peers: Vec<(libp2p::PeerId, libp2p::Multiaddr)> = cfg
+                    .p2p_bootstrap_peers
+                    .iter()
+                    .filter_map(|addr_str| {
+                        let ma: libp2p::Multiaddr = addr_str.parse().ok()?;
+                        // Extract the P2p protocol component (last segment)
+                        let peer_id = ma.iter().find_map(|p| {
+                            if let libp2p::multiaddr::Protocol::P2p(hash) = p {
+                                libp2p::PeerId::from_multihash(hash.into()).ok()
+                            } else {
+                                None
+                            }
+                        })?;
+                        Some((peer_id, ma))
+                    })
+                    .collect();
+
+                match MusicNode::spawn(identity, bootstrap_peers, channels.cmd_rx, channels.event_tx) {
+                    Ok(()) => {
+                        // Broadcast library catalog immediately after activation
+                        let catalog = crate::p2p::catalog::build_catalog(&self.library);
+                        handle.send(crate::p2p::P2pCommand::AnnounceLibrary(catalog));
+                        let paths = crate::p2p::catalog::build_path_map(&self.library);
+                        handle.send(crate::p2p::P2pCommand::SetLocalPaths(paths));
+                        self.p2p_node = Some(handle);
+                        self.screen = Screen::P2pPeers;
+                        self.status_message = Some(format!(
+                            "⬡ P2P active — {} [{fp_short}…]  Discovering peers…",
+                            nickname
+                        ));
+                    }
+                    Err(e) => {
+                        self.push_toast(Toast::error(format!("P2P node start failed: {e}")));
+                    }
+                }
+            }
+            Err(e) => {
+                self.push_toast(Toast::error(format!("P2P identity error: {e}")));
+            }
+        }
+    }
+
+    /// Deactivate P2P mode, disconnecting from the network.
+    pub fn deactivate_p2p(&mut self) {
+        if let Some(node) = &self.p2p_node {
+            node.send(crate::p2p::P2pCommand::Disconnect);
+        }
+        self.p2p_node = None;
+        self.p2p_buffer_state = P2pBufferState::Idle;
+        self.remote_tracks.clear();
+        self.p2p_peer_list.clear();
+        self.screen = Screen::Library;
+        self.status_message = Some("P2P disconnected.".into());
+    }
+
+    /// Push a toast notification onto the queue.
+    pub fn push_toast(&mut self, toast: Toast) {
+        // Keep at most 5 toasts — drop oldest if full.
+        if self.p2p_toasts.len() >= 5 {
+            self.p2p_toasts.pop_front();
+        }
+        self.p2p_toasts.push_back(toast);
+    }
+
+    /// Drain expired (non-error) toasts from the queue.  Called every tick.
+    pub fn prune_toasts(&mut self) {
+        self.p2p_toasts.retain(|t| !t.is_expired());
+    }
+
+    /// Dismiss the topmost error toast (called on `Esc` from any P2P screen).
+    pub fn dismiss_error_toast(&mut self) {
+        if let Some(pos) = self
+            .p2p_toasts
+            .iter()
+            .rposition(|t| t.level == ToastLevel::Error)
+        {
+            self.p2p_toasts.remove(pos);
+        }
+    }
+
+    /// Poll P2P events and update app state accordingly.  Called every tick.
+    pub fn tick_p2p(&mut self) {
+        // Prune expired toasts every tick.
+        self.prune_toasts();
+
+        // Prune expired party nominations.
+        if let Some(party) = &mut self.party_line {
+            party.prune_expired();
+        }
+
+        // Stall detection for in-progress buffer.
+        const STALL_SECS: u64 = 5;
+        const ABANDON_SECS: u64 = 30;
+        if let P2pBufferState::Buffering { stalled, stalled_since, last_chunk_at, transfer_id, peer_nick, .. } =
+            &mut self.p2p_buffer_state
+        {
+            let elapsed = last_chunk_at.elapsed().as_secs();
+            if elapsed >= STALL_SECS && !*stalled {
+                *stalled = true;
+                *stalled_since = Some(std::time::Instant::now());
+            }
+            if let Some(since) = stalled_since {
+                if since.elapsed().as_secs() >= ABANDON_SECS {
+                    let tid = *transfer_id;
+                    let nick = peer_nick.clone();
+                    self.p2p_buffer_state = P2pBufferState::Idle;
+                    self.push_toast(Toast::error(format!(
+                        "Transfer timed out — {nick} may be offline"
+                    )));
+                    if let Some(node) = &self.p2p_node {
+                        node.send(crate::p2p::P2pCommand::DeclineTrackRequest { transfer_id: tid });
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Party line: resume playback when start_at arrives.
+        let should_resume = self.party_line.as_ref().and_then(|p| p.active.as_ref()).map(|a| {
+            a.buffer_ready && !a.started && chrono::Utc::now() >= a.start_at
+        }).unwrap_or(false);
+        if should_resume {
+            self.player.toggle_pause(); // un-pause (was paused awaiting start_at)
+            if let Some(party) = &mut self.party_line {
+                if let Some(active) = &mut party.active {
+                    active.started = true;
+                }
+            }
+            self.push_toast(Toast::info("Party Line started!"));
+        }
+
+        // Drain P2P events from the background node.
+        let events = self.p2p_node.as_mut().map(|n| n.poll()).unwrap_or_default();
+        for event in events {
+            self.handle_p2p_event(event);
+        }
+    }
+
+    fn handle_p2p_event(&mut self, event: crate::p2p::P2pEvent) {
+        use crate::p2p::P2pEvent;
+        match event {
+            P2pEvent::PeerApprovalRequired { nickname, .. } => {
+                self.push_toast(Toast::info(format!("New peer: {nickname} — approve in P2P Peers")));
+            }
+            P2pEvent::PeerTrusted { nickname, .. } => {
+                self.push_toast(Toast::info(format!("{nickname} trusted")));
+            }
+            P2pEvent::PeerOffline { nickname, .. } => {
+                self.push_toast(Toast::warning(format!("{nickname} went offline")));
+            }
+            P2pEvent::PeerListSnapshot(peers) => {
+                self.p2p_peer_list = peers;
+            }
+            P2pEvent::RemoteCatalogReceived { peer_fp, peer_nick, mut tracks } => {
+                // Tag each track with its owner.
+                for t in &mut tracks {
+                    t.owner_fp   = peer_fp.clone();
+                    t.owner_nick = peer_nick.clone();
+                }
+                // Merge into remote_tracks, replacing any previous entries from this peer.
+                self.remote_tracks.retain(|t| t.owner_fp != peer_fp);
+                self.remote_tracks.extend(tracks);
+                self.push_toast(Toast::info(format!(
+                    "{peer_nick} shared {} tracks", self.remote_tracks.iter().filter(|t| t.owner_fp == peer_fp).count()
+                )));
+            }
+            P2pEvent::InboundTrackRequest { transfer_id, track, requester_fp: _ } => {
+                // Auto-accept for now; Phase 5 will add a confirmation prompt.
+                if let Some(node) = &self.p2p_node {
+                    node.send(crate::p2p::P2pCommand::AcceptTrackRequest { transfer_id });
+                }
+                let _ = track;
+            }
+            P2pEvent::TrackBufferProgress { transfer_id, received, total } => {
+                match &self.p2p_buffer_state {
+                    // TrackOffer arrived — transition Requesting → Buffering.
+                    P2pBufferState::Requesting { peer_nick, .. } => {
+                        let peer_nick = peer_nick.clone();
+                        self.p2p_buffer_state = P2pBufferState::Buffering {
+                            transfer_id,
+                            peer_nick,
+                            received,
+                            total,
+                            stalled: false,
+                            stalled_since: None,
+                            last_chunk_at: std::time::Instant::now(),
+                        };
+                    }
+                    // Subsequent chunk progress — update in place.
+                    P2pBufferState::Buffering { transfer_id: tid, .. }
+                        if *tid == transfer_id =>
+                    {
+                        if let P2pBufferState::Buffering {
+                            received: r, total: t, stalled, last_chunk_at, ..
+                        } = &mut self.p2p_buffer_state {
+                            *r = received;
+                            *t = total;
+                            *stalled = false;
+                            *last_chunk_at = std::time::Instant::now();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            P2pEvent::TrackBufferReady { bytes, track, transfer_id } => {
+                let nick = if let P2pBufferState::Buffering { ref peer_nick, .. } = self.p2p_buffer_state {
+                    peer_nick.clone()
+                } else {
+                    track.owner_nick.clone()
+                };
+
+                // Check if this is for an active party line — if so, defer playback to start_at.
+                let is_party = self.party_line
+                    .as_ref()
+                    .and_then(|p| p.active.as_ref())
+                    .map(|a| a.track.id == track.id && !a.started)
+                    .unwrap_or(false);
+
+                if is_party {
+                    // Mark buffer ready; tick_p2p will start playback at start_at.
+                    if let Some(party) = &mut self.party_line {
+                        if let Some(active) = &mut party.active {
+                            active.buffer_ready = true;
+                        }
+                    }
+                    // Hold bytes in a temporary field via a side-channel: store in player now,
+                    // but pause immediately until start_at arrives.
+                    match self.player.play_remote(bytes, track) {
+                        Ok(()) => {
+                            self.player.toggle_pause(); // pause immediately
+                            self.p2p_buffer_state = P2pBufferState::Playing { peer_nick: nick };
+                        }
+                        Err(e) => {
+                            self.p2p_buffer_state = P2pBufferState::Idle;
+                            self.push_toast(Toast::error(format!("Party playback error: {e}")));
+                        }
+                    }
+                    let _ = transfer_id;
+                } else {
+                    match self.player.play_remote(bytes, track) {
+                        Ok(()) => {
+                            self.p2p_buffer_state = P2pBufferState::Playing { peer_nick: nick };
+                        }
+                        Err(e) => {
+                            self.p2p_buffer_state = P2pBufferState::Idle;
+                            self.push_toast(Toast::error(format!("Playback error: {e}")));
+                        }
+                    }
+                }
+            }
+            P2pEvent::TrackTransferFailed { reason, .. } => {
+                self.p2p_buffer_state = P2pBufferState::Idle;
+                self.push_toast(Toast::error(format!("Transfer failed: {reason}")));
+            }
+            P2pEvent::TrackNominated { nomination_id, track, nominated_by } => {
+                let party = self.party_line.get_or_insert_with(PartyLineState::new);
+                party.upsert_nomination(crate::p2p::party::Nomination::new(
+                    nomination_id, track.clone(), nominated_by.clone(),
+                ));
+                self.push_toast(Toast::info(format!(
+                    "{nominated_by} nominated: {} — vote in Party Line", track.title
+                )));
+            }
+            P2pEvent::VoteReceived { nomination_id, voter_fp, vote } => {
+                if let Some(party) = &mut self.party_line {
+                    if let Some(nom) = party.nominations.iter_mut().find(|n| n.id == nomination_id) {
+                        nom.cast_vote(&voter_fp, &vote);
+                    }
+                }
+            }
+            P2pEvent::PartyLinePassed { nomination_id, track, start_at } => {
+                // If the track is from a remote peer, request it immediately so
+                // the buffer is ready before start_at.
+                if !track.owner_fp.is_empty() {
+                    if let Some(node) = &self.p2p_node {
+                        let peer_fp = track.owner_fp.clone();
+                        let peer_nick = track.owner_nick.clone();
+                        self.p2p_buffer_state = crate::p2p::P2pBufferState::Requesting {
+                            track_id: track.id,
+                            peer_nick,
+                        };
+                        node.send(crate::p2p::P2pCommand::RequestTrack {
+                            track_id: track.id,
+                            peer_fp,
+                        });
+                    }
+                }
+                let party = self.party_line.get_or_insert_with(PartyLineState::new);
+                party.active = Some(crate::p2p::party::ActiveParty {
+                    nomination_id,
+                    track: track.clone(),
+                    start_at,
+                    buffer_ready: false,
+                    started: false,
+                });
+                self.push_toast(Toast::info(format!(
+                    "Party Line: {} — starts in 5s", track.title
+                )));
+            }
+            P2pEvent::PartyLineFailed { .. } => {
+                self.push_toast(Toast::warning("Party Line vote expired."));
+            }
+            P2pEvent::Warning(msg) => {
+                self.push_toast(Toast::warning(msg));
             }
         }
     }

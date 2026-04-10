@@ -27,6 +27,7 @@ MOD tracker playback, and a numerology-based track selector, written in Rust.
 - iTunesDB & iTunesSD read/write — no iTunes required
 - iPod health scan and database repair
 - **Amazon Music** easter egg — catalog browser and MP3 downloader (session-cookie based)
+- **P2P music sharing** (beta) — share your library with trusted peers on the same network; stream tracks in-memory and vote on synchronized group playback via the Party Line
 - Playlists saved as JSON; single-track repeat
 - **Ctrl+V paste** in all text input fields (desktop platforms)
 - **mpv fallback** for audio playback on Termux (when the native backend is unavailable)
@@ -371,6 +372,106 @@ response headers, and the full response body.  This is especially useful for
 diagnosing expired-cookie 404 responses where Amazon returns an HTML error page
 instead of JSON.
 
+### P2P music sharing (beta)
+
+Activate by pressing `p` → `2` → `p` within two seconds from any screen.
+On first activation a PGP identity is generated and saved to `config.json`.
+Subsequent activations reuse the stored key.
+
+Once active, `cmp` announces itself to the local network via libp2p
+(Kademlia DHT over TCP + QUIC, Noise-encrypted transport) and broadcasts
+a presence beacon containing your track count.  Peers must explicitly approve
+each other before any library or track data is exchanged.
+
+#### Trust model
+
+Every peer has one of four states:
+
+| State | Meaning |
+|-------|---------|
+| **Pending** | Key announced; awaiting your approval |
+| **Trusted** | Library sharing and track streaming enabled |
+| **Rejected** | All messages from this peer are ignored |
+| **Deferred** | Not yet decided; no data exchanged |
+
+#### How it works
+
+1. **Activation** — chord opens the P2P Peers screen; your PGP fingerprint is shown in the status bar
+2. **Peer discovery** — libp2p Kademlia DHT finds peers on the LAN; each peer announces its public key
+3. **Trust** — you approve or reject each pending key in the P2P Peers screen
+4. **Library sharing** — trusted peers share their track catalog automatically (title, artist, album, duration — no file paths)
+5. **Track streaming** — select a remote track and press Enter; it is transferred in 64 KB chunks, verified with SHA-256, buffered entirely in RAM, and played immediately — nothing is written to disk
+6. **Party Line** — nominate any remote track; trusted peers vote; when a simple majority votes Yes, all peers start playing the track at the same UTC timestamp
+
+#### P2P Peers screen
+
+Opened automatically on activation.  Shows all known peers with their trust state.
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` or `k` / `j` | Navigate peer list |
+| `A` | Approve focused peer (Pending → Trusted) |
+| `D` | Deny / reject focused peer |
+| `R` | Refresh peer list |
+| `L` | Open Remote Library |
+| `P` | Open Party Line |
+| `X` | Disconnect from P2P network |
+| `Esc` / `Q` | Return to library |
+
+#### Remote Library screen
+
+Browse tracks shared by all trusted peers.  Each track shows format, duration, and the owning peer's nickname.
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` or `k` / `j` | Navigate tracks |
+| `Page Up` / `Page Down` | Jump 10 tracks |
+| `Enter` | Request and stream focused track |
+| `N` | Nominate focused track for Party Line vote |
+| `Esc` / `Q` | Return to library |
+
+While a track is buffering, the player pane shows a download progress gauge and
+a `[⬡ @peer]` badge in place of the normal playback position.  A stall warning
+appears if no data arrives for 5 seconds; the transfer is abandoned after 30
+seconds of silence.
+
+#### Party Line screen
+
+Shows active nominations and the current synchronized playback session.
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` or `k` / `j` | Navigate nominations |
+| `Y` | Vote Yes on focused nomination |
+| `N` | Vote No on focused nomination |
+| `Esc` / `Q` | Return to library |
+
+When a nomination reaches a simple majority of online trusted peers, the
+nominating peer broadcasts a `PartyStart` message with a UTC timestamp 5 seconds
+in the future.  All peers begin playback at that moment — peers who need to
+buffer the track first start downloading immediately and join as soon as their
+buffer is ready.  A nomination expires after 60 seconds if the threshold is not
+reached.
+
+#### Toast notifications
+
+Non-modal toasts appear in the bottom-right corner and stack up to three deep:
+
+| Colour | Meaning | Duration |
+|--------|---------|----------|
+| Cyan | Informational (peer connected, transfer complete) | 4 s |
+| Yellow | Warning (stall resolved, slow transfer) | 6 s |
+| Red | Error (integrity failure, peer offline) | Persists until `Esc` |
+
+#### Security notes
+
+- All gossipsub messages are signed with the sender's EdDSA PGP key; unsigned or tampered messages are rejected
+- Transport is encrypted end-to-end by the Noise XX protocol (QUIC/TCP)
+- Track bytes are never written to disk — they live in a `Zeroizing<Vec<u8>>` that wipes itself from memory when the decoded audio is done playing
+- The PGP identity (secret key) is stored in `config.json` protected by an auto-generated passphrase; this is a beta simplification — a future version will store it in the OS keychain
+
+---
+
 ### Text input fields
 
 All text input overlays (Add Source, Save Playlist, tag editors, search,
@@ -386,6 +487,138 @@ gematria) support:
 
 > Clipboard paste (`Ctrl+V`) is not available on Android/Termux — no system
 > clipboard service exists in a terminal process.
+
+---
+
+## P2P safety guide
+
+This section answers the questions a non-technical user should ask before
+activating the P2P feature.
+
+### What exactly gets shared — and with whom?
+
+When P2P is active, `cmp` broadcasts a small **presence beacon** to other `cmp`
+instances on the same local network.  The beacon contains only:
+
+- Your chosen **nickname**
+- Your **PGP public key** (used to verify your identity — this is safe to share)
+- How many tracks are in your library (a number, nothing else)
+
+**Nothing else is sent to anyone until you explicitly approve them.**
+
+Once you approve a peer as Trusted, they can see your **track metadata**:
+title, artist, album, year, duration, file size, and audio format.
+**File paths and file contents are never shared automatically.**
+
+A Trusted peer can *request* a specific track from you by its content ID.
+When that happens you will see an "Inbound track request" notification.
+The app accepts these automatically in the current beta — a future version will
+add a per-request confirmation prompt.  Tracks are sent as encrypted data
+chunks; the receiving peer gets the audio bytes in their RAM only — nothing is
+saved to their disk by the `cmp` protocol.
+
+### Who can discover me?
+
+Only other `cmp` instances on the **same local network** (your home Wi-Fi, a
+LAN party, a shared office network).  The peer discovery protocol (libp2p
+Kademlia DHT) does not route through the public internet by default.
+
+If you manually add bootstrap peer addresses in `config.json`
+(`p2p_bootstrap_peers`), you can connect to peers on other networks — but this
+is an advanced option that requires deliberate configuration; it does not happen
+automatically.
+
+### What is my "PGP identity" and what does it mean?
+
+The first time you activate P2P, `cmp` generates a **PGP keypair** — a pair of
+mathematically linked cryptographic keys:
+
+- The **public key** is shared freely.  It lets other peers verify that messages
+  really came from you.
+- The **secret key** is stored only on your machine, encrypted with an
+  auto-generated passphrase in `config.json`.
+
+Your identity is tied to this keypair.  If you approve a peer, you are approving
+their specific public key — not their nickname (nicknames can be anything).
+
+**What you are committing to when you approve a peer:**
+
+> "I recognise this public key and I am willing to share my track catalog with
+> whoever holds the matching secret key."
+
+You are not sharing personal information, account credentials, or location data.
+
+### How do I revoke a peer?
+
+From the **P2P Peers screen** (`p`→`2`→`p` to activate, then `L` / `P` are
+the library and party line screens; the peers screen opens automatically):
+
+1. Navigate to the peer with `↑` / `↓`
+2. Press `D` — this moves them to Rejected; their messages are ignored immediately
+
+**Revoking a peer does not notify them** — they will simply stop receiving
+catalog responses and track data from you.  Rejected peers are remembered across
+sessions (stored in `config.json`) so they cannot re-approve themselves.
+
+### How do I remove a peer from my trusted list permanently?
+
+Press `D` on the peer in the P2P Peers screen.  To make this permanent across
+future sessions, also open `config.json` and delete the entry for that
+fingerprint from the `p2p_trusted_peers` array.
+
+### How do I completely leave the P2P network?
+
+**For the current session:** press `X` in the P2P Peers screen, or let the app
+close normally.  The node shuts down and stops broadcasting.
+
+**Permanently — remove your identity:**  open `config.json` and delete these
+fields:
+
+```json
+"p2p_identity_armored": "...",
+"p2p_identity_passphrase": "...",
+"p2p_nickname": "...",
+"p2p_trusted_peers": [...],
+"p2p_bootstrap_peers": [...]
+```
+
+After deleting them, save the file and restart `cmp`.  The chord `p`→`2`→`p`
+will generate a brand-new identity the next time it is pressed — your old
+identity is gone and no peer can recognise you as the same node.
+
+> There is no central server to "deregister" from.  Peers hold your public key
+> in their own `config.json` under `p2p_trusted_peers`.  You cannot force them
+> to delete it, but once you stop broadcasting your old key, nothing identifies
+> you to them.
+
+### What do the "stall" and "transfer failed" errors mean?
+
+- **Stall warning** (yellow toast) — no data arrived for 5 seconds.  The peer
+  may be slow, their drive is busy, or there is network congestion.  The transfer
+  continues and may recover on its own.
+- **Transfer timed out** (red toast) — no data arrived for 30 seconds total.
+  The transfer is cancelled.  The peer may have gone offline mid-transfer.
+- **Integrity check failed** (red toast) — the audio bytes arrived but their
+  SHA-256 fingerprint does not match what the sender computed.  This could mean
+  data corruption in transit or (rarely) a malicious peer sending tampered data.
+  The corrupted buffer is discarded and no audio plays.
+
+### Known limitations in the beta
+
+- **Track requests are auto-accepted.**  In the current beta, any Trusted peer
+  can request any track from your library and it will be served automatically.
+  A per-request approval prompt is planned before the stable release.
+- **Chunks are broadcast to all peers on the topic.**  Audio data chunks are
+  sent over the shared gossipsub channel.  Although the transport is
+  Noise-encrypted (so third parties on the internet cannot read it), all peers
+  currently subscribed to the gossipsub topic receive each chunk — they just
+  cannot decrypt it without the requester's private key (this encryption layer
+  is planned but not yet implemented).  On a trusted home LAN this is acceptable
+  for a beta, but be aware of it on shared or untrusted networks.
+- **Identity is stored in `config.json` in plaintext** (passphrase-encrypted
+  secret key, auto-generated passphrase stored alongside it).  A future version
+  will use the OS keychain (Windows Credential Store, macOS Keychain,
+  libsecret on Linux).
 
 ---
 
@@ -481,10 +714,26 @@ console-music-player/
 │   │   ├── repair.rs       # iPod health / repair screens
 │   │   ├── dedup.rs        # Duplicate-finder two-pane screen
 │   │   └── amazon.rs       # Amazon catalog browser + diagnostic log view
-│   ├── player/mod.rs       # rodio backend + mpv subprocess fallback + waveform tap
+│   ├── player/mod.rs       # rodio backend + mpv subprocess fallback + waveform tap; play_remote() for P2P
 │   ├── visualizer.rs       # SampleCapture source wrapper + oscilloscope renderer
 │   ├── tracker/mod.rs      # libopenmpt wrapper + pure-Rust metadata parsers
 │   ├── amazon/mod.rs       # Amazon Music easter egg (AmazonClient, catalog, download)
+│   ├── p2p/
+│   │   ├── mod.rs          # P2pHandle, P2pCommand, P2pEvent, P2pBufferState, Toast
+│   │   ├── identity.rs     # PGP identity: load_or_generate(), EdDSA + ECDH Curve25519
+│   │   ├── crypto.rs       # Encrypt, decrypt, sign, verify, seal, open
+│   │   ├── trust.rs        # TrustState, NodeInfo, NodeStatus
+│   │   ├── keystore.rs     # PeerKeyStore — four-bucket in-memory peer key store
+│   │   ├── network.rs      # MusicBehaviour (Gossipsub + Kademlia + Identify), build_swarm()
+│   │   ├── node.rs         # MusicNode — async tokio coordinator; all protocol state machines
+│   │   ├── wire.rs         # MusicKind, MusicMessage, RemoteTrack, RemoteFormat, PartyVote
+│   │   ├── catalog.rs      # build_catalog() + build_path_map() from local Library
+│   │   ├── transfer.rs     # InboundTransfer: chunk accumulation, SHA-256, Zeroizing assembly
+│   │   └── party.rs        # PartyLineState, Nomination, ActiveParty (UI-side state)
+│   ├── ui/
+│   │   ├── p2p_peers.rs    # Peer list screen (approve / reject / disconnect)
+│   │   ├── remote_library.rs # Remote catalog browser
+│   │   └── party_line.rs   # Party Line vote screen
 │   ├── tags.rs             # User keyword tag store (tags.json)
 │   ├── library/
 │   │   ├── mod.rs          # Library state, 11 sort/group-by presets, Track struct
@@ -708,7 +957,7 @@ All three files live in the same platform-specific config directory:
 
 | File | Contents |
 |------|----------|
-| `config.json` | Source directories, Amazon cookie and download dir |
+| `config.json` | Source directories, Amazon cookie, P2P identity + trusted peers |
 | `tags.json` | User keyword tags per track path |
 | `playlists/{name}.json` | Track path list per named playlist (one file each) |
 
@@ -735,3 +984,126 @@ in a single DB pass, then checks each track against the set.
    - Add a `/DELAYLOAD` entry in `build.rs` for Windows
    - Add a `check_<lib>_dll()` probe in `main.rs`
    - Update `.cargo/config.toml` if the library needs special Android linkage
+
+### P2P module architecture
+
+The P2P feature lives entirely in `src/p2p/`.  It was built by copying and
+adapting security primitives from `console-pgp-chat` rather than taking a path
+dependency (the two crates pin different `crossterm` versions).
+
+#### Module map
+
+| Module | Role |
+|--------|------|
+| `mod.rs` | `P2pHandle`, `P2pCommand`, `P2pEvent`, `P2pBufferState`, `Toast` |
+| `identity.rs` | PGP identity — `load_or_generate()`; EdDSA primary + ECDH Curve25519 subkey |
+| `crypto.rs` | `encrypt_for_recipients`, `decrypt_message`, `sign_data`, `verify_data`, `seal`, `open` |
+| `trust.rs` | `TrustState` (Pending/Trusted/Rejected/Deferred), `NodeInfo`, `NodeStatus` |
+| `keystore.rs` | `PeerKeyStore` — four-bucket in-memory peer key store |
+| `network.rs` | `MusicBehaviour` (Gossipsub + Kademlia + Identify), `build_swarm()` |
+| `node.rs` | `MusicNode` — the async tokio coordinator; drives the swarm and all protocol state |
+| `wire.rs` | `MusicKind`, `MusicMessage`, `SignedMusicMessage`, `RemoteTrack`, `RemoteFormat`, `PartyVote` |
+| `catalog.rs` | `build_catalog()` — `Library → Vec<RemoteTrack>`; `build_path_map()` — `Library → HashMap<Uuid, PathBuf>` |
+| `transfer.rs` | `InboundTransfer` — chunk accumulation, SHA-256 assembly, `Zeroizing<Vec<u8>>` output |
+| `party.rs` | `PartyLineState`, `Nomination`, `ActiveParty` — UI-side party line state |
+
+#### Channel architecture
+
+`P2pHandle` wraps an `mpsc::unbounded_channel` pair.  The UI (main thread) holds
+`P2pHandle`; the background tokio task (`MusicNode::run`) holds the other ends.
+`P2pHandle::poll()` drains events non-blockingly each UI tick.  All `send()`
+calls on unbounded senders are synchronous — no `.await` needed.
+
+```
+App (main thread)
+  P2pHandle::send(P2pCommand)  ──→  MusicNode::handle_command()
+  P2pHandle::poll() → Vec<P2pEvent>  ←──  MusicNode::event_tx.send()
+```
+
+#### Protocol — gossipsub messages
+
+All messages use a single gossipsub topic (`cmp-p2p-v1`).  Each message is
+serialised as JSON, signed with the sender's EdDSA key, and re-serialised as a
+`SignedMusicMessage` envelope.  Receivers verify the signature and fingerprint
+before dispatching.
+
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `AnnounceKey` | broadcast | Peer introduces its PGP public key + nickname |
+| `StatusAnnounce` | broadcast (60 s) | Heartbeat; keeps the node map fresh |
+| `Revoke` | broadcast | Peer revokes its own identity |
+| `CatalogPresence` | broadcast | "I have N tracks" — triggers CatalogRequest from trusted peers |
+| `CatalogRequest` | broadcast | "Send me your catalog" |
+| `CatalogResponse` | broadcast | Full track catalog (metadata only, no paths) |
+| `TrackRequest` | broadcast | Requester asks for a specific track by UUIDv5 content ID |
+| `TrackOffer` | broadcast | Owner accepts and announces transfer parameters |
+| `TrackChunk` | broadcast | One 64 KiB chunk of audio data |
+| `TrackComplete` | broadcast | All chunks sent; SHA-256 for integrity check |
+| `TrackDecline` | broadcast | Owner declines a transfer request |
+| `PartyNominate` | broadcast | Peer nominates a track for group playback |
+| `PartyVote` | broadcast | Peer casts Yes/No vote |
+| `PartyStart` | broadcast (nominator only) | Vote passed; UTC start timestamp for all peers |
+
+#### Track transfer flow
+
+```
+Requester                           Owner
+─────────                           ─────
+send P2pCommand::RequestTrack
+  → publish TrackRequest ──────────→ receive TrackRequest
+                                      look up in local_catalog + local_paths
+                                      store in pending_outbound
+                                      emit InboundTrackRequest to UI
+                                    ← App auto-accepts → AcceptTrackRequest
+                                      read file via tokio::fs::read
+                                      compute SHA-256
+                                      publish TrackOffer ──────────→
+  receive TrackOffer                  publish TrackChunk × N ──────→
+  create InboundTransfer              publish TrackComplete ────────→
+  emit TrackBufferProgress(0, size)
+  ← chunks arrive, emit progress
+  receive TrackComplete
+  assemble + verify SHA-256
+  emit TrackBufferReady ──→ App::player.play_remote()
+```
+
+Chunks are sent over Noise-encrypted gossipsub transport.  Per-chunk PGP
+encryption to the requester's ECDH subkey is a planned improvement for the
+stable release (currently a `// TODO` in `transfer.rs`).
+
+#### Content-addressed track IDs
+
+Each `RemoteTrack` carries a stable `Uuid` computed as
+`UUIDv5(NAMESPACE_OID, "artist|album|title|file_size")`.  This lets peers
+detect duplicates and match transfer requests without ever sharing filesystem
+paths.
+
+#### Party Line — vote counting
+
+Vote counting happens inside `MusicNode` (not the UI) because the node knows
+the live online-peer count.  When the nominating node observes that
+`votes_yes × 2 > online_trusted_count` and `online_trusted_count ≥ 2`, it
+broadcasts a `PartyStart` message with `start_at = Utc::now() + 5s`.
+
+Receiving nodes see `PartyStart`, remove the nomination from their local state,
+and emit `P2pEvent::PartyLinePassed`.  The app requests the track immediately
+(if remote), pauses the player the instant the buffer is ready, then resumes
+at `start_at` via a check in `tick_p2p()`.
+
+#### Config fields added by P2P
+
+```json
+{
+  "p2p_identity_armored": "<ASCII-armoured secret key>",
+  "p2p_identity_passphrase": "<auto-generated 24-char passphrase>",
+  "p2p_nickname": "yourname",
+  "p2p_trusted_peers": [
+    { "fingerprint": "abc123…", "nickname": "alice", "public_key_armored": "…" }
+  ],
+  "p2p_bootstrap_peers": ["/ip4/192.168.1.5/tcp/0/p2p/12D3…"]
+}
+```
+
+All P2P fields are optional — the P2P feature is completely dormant if none are
+present (the activation chord is the only entry point).  Existing configs are
+never rewritten to drop unknown fields; the load-then-update pattern (`Config::load()` → mutate → `save()`) is used everywhere source directories are persisted.

@@ -8,7 +8,10 @@ mod dedup;
 mod library;
 mod organize;
 mod overlays;
+mod p2p_peers;
+mod party_line;
 mod playlists;
+mod remote_library;
 mod repair;
 mod sources;
 mod transfer;
@@ -110,6 +113,10 @@ pub fn render(app: &App, frame: &mut Frame) {
         Screen::Amazon => amazon::render_amazon(app, frame, body_area),
 
         Screen::Organize => organize::render_organize(app, frame, body_area),
+
+        Screen::P2pPeers      => p2p_peers::render_p2p_peers(app, frame, body_area),
+        Screen::RemoteLibrary => remote_library::render_remote_library(app, frame, body_area),
+        Screen::PartyLine     => party_line::render_party_line(app, frame, body_area),
     }
 
     // Tag edit overlay — floats above whatever screen is active.
@@ -125,6 +132,11 @@ pub fn render(app: &App, frame: &mut Frame) {
     // Gematria overlay — above everything.
     if let Some(state) = &app.gematria_state {
         overlays::render_gematria_overlay(app, state, frame, body_area);
+    }
+
+    // Toast notifications — always topmost, bottom-right corner.
+    if !app.p2p_toasts.is_empty() {
+        overlays::render_toasts(app, frame, area);
     }
 }
 
@@ -202,6 +214,9 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             Screen::Dedup      => " [Tab] Panel  [↑↓] Navigate  [Space] Cycle action  [A] Auto  [Enter] Apply  [Esc] Cancel",
             Screen::Amazon     => " [S] Add as source  [L] Launch app  [D] Auto-download (Win32)  [↑↓] Scroll log  [Esc] Back",
             Screen::Organize   => " [↑↓/jk] Navigate groups  [Enter] Select destination  [Esc] Back",
+            Screen::P2pPeers      => " [↑↓] Navigate  [A] Approve  [D] Deny  [L] Remote Library  [P] Party Line  [X] Disconnect  [Esc] Back",
+            Screen::RemoteLibrary => " [↑↓/PgUp/Dn] Navigate  [Enter] Stream  [N] Nominate for Party Line  [Esc] Back",
+            Screen::PartyLine     => " [↑↓] Navigate  [Y] Vote Yes  [N] Vote No  [Esc] Back",
         }
     };
 

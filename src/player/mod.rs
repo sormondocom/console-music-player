@@ -12,6 +12,7 @@ use tracing::warn;
 
 use crate::library::Track;
 use crate::media::MediaItem;
+use crate::p2p::wire::RemoteTrack;
 use crate::tracker;
 use crate::visualizer::{self, DecoderPanicFlag, SampleCapture, WaveBuffer};
 
@@ -217,6 +218,9 @@ pub struct Player {
     sink: Option<Sink>,
 
     pub current_track: Option<Track>,
+    /// Set when playing a remote (P2P-buffered) track; cleared when a local
+    /// track starts or when the player stops.
+    pub current_remote: Option<RemoteTrack>,
     pub state: PlaybackState,
     pub repeat: RepeatMode,
     pub shuffle: ShuffleMode,
@@ -256,6 +260,7 @@ impl Player {
             handle,
             sink: None,
             current_track: None,
+            current_remote: None,
             state: PlaybackState::Stopped,
             repeat: RepeatMode::Off,
             shuffle: ShuffleMode::Off,
@@ -302,7 +307,8 @@ impl Player {
             }
 
             self.sink = Some(sink);
-            self.current_track = Some(track.clone());
+            self.current_track  = Some(track.clone());
+            self.current_remote = None;
             self.state = PlaybackState::Playing;
             self.started_at = Some(Instant::now());
             self.elapsed_before_pause = Duration::ZERO;
@@ -327,6 +333,51 @@ impl Player {
 
         Err("No audio output device and no external player found.\n\
              On Termux, run:  pkg install mpv".into())
+    }
+
+    /// Play a remote track from an in-memory buffer.
+    ///
+    /// The bytes are wrapped in `std::io::Cursor` which implements both `Read`
+    /// and `Seek`, satisfying symphonia's `MediaSource` requirement for all
+    /// formats (including FLAC).  The buffer is never written to disk.
+    ///
+    /// On success, `current_remote` is set and `current_track` is cleared.
+    pub fn play_remote(
+        &mut self,
+        bytes: zeroize::Zeroizing<Vec<u8>>,
+        track: RemoteTrack,
+    ) -> Result<(), String> {
+        self.decoder_panic_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.stop_internal();
+
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| "No audio output device available for remote playback.".to_string())?;
+
+        let sink = Sink::try_new(handle)
+            .map_err(|e| format!("Cannot create audio sink: {e}"))?;
+
+        // Cursor<Vec<u8>> implements Read + Seek — symphonia is happy with it.
+        let cursor = std::io::Cursor::new(bytes.to_vec());
+        let source = rodio::Decoder::new(cursor)
+            .map_err(|e| format!("Cannot decode remote track '{}': {e}", track.title))?
+            .convert_samples::<f32>();
+
+        sink.set_volume(self.volume);
+        sink.append(SampleCapture::new(
+            source,
+            self.wave_buffer.clone(),
+            self.decoder_panic_flag.clone(),
+        ));
+
+        self.sink = Some(sink);
+        self.current_track  = None;  // clear local track
+        self.current_remote = Some(track);
+        self.state = PlaybackState::Playing;
+        self.started_at = Some(Instant::now());
+        self.elapsed_before_pause = Duration::ZERO;
+        Ok(())
     }
 
     /// Decode and append a standard audio file (MP3, FLAC, etc.) via rodio/symphonia.
@@ -386,7 +437,8 @@ impl Player {
 
     pub fn stop(&mut self) {
         self.stop_internal();
-        self.current_track = None;
+        self.current_track  = None;
+        self.current_remote = None;
     }
 
     // --- volume ---

@@ -1,0 +1,111 @@
+//! P2P Peers screen — manage trusted/pending/rejected peers.
+
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
+    Frame,
+};
+
+use crate::app::App;
+use crate::p2p::trust::{NodeStatus, TrustState};
+
+pub(super) fn render_p2p_peers(app: &App, frame: &mut Frame, area: Rect) {
+    let p2p_active = app.p2p_node.is_some();
+
+    let title = if p2p_active {
+        let nick = app
+            .p2p_node
+            .as_ref()
+            .map(|n| n.nickname.as_str())
+            .unwrap_or("?");
+        format!(" ⬡ P2P Peers — {} ", nick)
+    } else {
+        " ⬡ P2P Peers (inactive) ".to_string()
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(super::CLR_ACCENT));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if !p2p_active {
+        let msg = Paragraph::new(
+            "P2P is not active.\n\
+             Press  p → 2 → p  (within 2 s) in the library to activate.",
+        )
+        .style(Style::default().fg(super::CLR_DIM))
+        .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    if app.p2p_peer_list.is_empty() {
+        let msg = Paragraph::new("No peers discovered yet.\nDiscovery may take a few seconds.")
+            .style(Style::default().fg(super::CLR_DIM))
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    let avail = inner.width as usize;
+
+    let items: Vec<ListItem> = app
+        .p2p_peer_list
+        .iter()
+        .enumerate()
+        .map(|(i, info)| {
+            let focused = i == app.p2p_peers_selected;
+
+            let (trust_badge, trust_color) = match info.trust {
+                TrustState::Trusted  => ("[trusted]",  Color::Green),
+                TrustState::Pending  => ("[pending]",  Color::Yellow),
+                TrustState::Deferred => ("[deferred]", Color::Cyan),
+                TrustState::Rejected => ("[rejected]", Color::Red),
+            };
+
+            let status_icon = match info.status {
+                NodeStatus::Online    => "● ",
+                NodeStatus::Deferring => "◐ ",
+                NodeStatus::Offline   => "○ ",
+            };
+            let status_color = match info.status {
+                NodeStatus::Online    => Color::Green,
+                NodeStatus::Deferring => Color::Yellow,
+                NodeStatus::Offline   => super::CLR_DIM,
+            };
+
+            let nick = super::truncate(&info.nickname, avail.saturating_sub(24));
+            let fp   = &info.fingerprint[..8.min(info.fingerprint.len())];
+
+            let main_style = if focused {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(status_icon, Style::default().fg(status_color)),
+                Span::styled(nick,        main_style),
+                Span::styled(format!("  {fp}…"), Style::default().fg(super::CLR_DIM)),
+                Span::raw(" "),
+                Span::styled(trust_badge, Style::default().fg(trust_color).bold()),
+            ]))
+        })
+        .collect();
+
+    let total = items.len();
+    let sel   = app.p2p_peers_selected.min(total.saturating_sub(1));
+    let mut list_state = super::centered_list_state(sel, total, inner.height);
+
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+
+    frame.render_stateful_widget(list, inner, &mut list_state);
+}
