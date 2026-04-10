@@ -67,7 +67,7 @@ humansize = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # ── P2P music sharing (beta) ──────────────────────────────────────────────────
-libp2p   = { version = "0.54", features = ["tokio", "tcp", "quic", "noise", "yamux", "gossipsub", "kad", "identify", "macros"] }
+libp2p   = { version = "0.54", features = ["tokio", "tcp", "quic", "noise", "yamux", "gossipsub", "kad", "identify", "mdns", "macros"] }
 pgp      = { version = "0.13", default-features = false }
 smallvec = { version = "1", features = ["serde"] }
 rand     = "0.8"
@@ -77,6 +77,8 @@ chrono   = { version = "0.4", features = ["serde"] }
 zeroize  = { version = "1", features = ["derive"] }
 futures  = "0.3"
 sha2     = "0.10"
+# UPnP — automatic router port mapping so internet peers can reach us
+igd      = "0.12"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # CDP (Chrome DevTools Protocol) WebSocket client — Amazon Music automation

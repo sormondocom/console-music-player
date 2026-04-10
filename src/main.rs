@@ -363,6 +363,16 @@ fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
         Screen::Amazon          => handle_amazon_key(app, key, cfg),
         Screen::Organize        => handle_organize_key(app, key),
         Screen::P2pPeers        => handle_p2p_peers_key(app, key),
+        Screen::P2pConnect      => handle_text_input_key(app, key, |app| {
+            let addr = app.input_buffer.trim().to_string();
+            app.input_buffer.clear();
+            app.screen = Screen::P2pPeers;
+            if !addr.is_empty() {
+                if let Some(node) = &app.p2p_node {
+                    node.send(crate::p2p::P2pCommand::ConnectPeer { addr });
+                }
+            }
+        }),
         Screen::RemoteLibrary   => handle_remote_library_key(app, key),
         Screen::PartyLine       => handle_party_line_key(app, key),
     }
@@ -983,6 +993,10 @@ fn handle_p2p_peers_key(app: &mut App, key: KeyCode) {
             if let Some(node) = &app.p2p_node {
                 node.send(crate::p2p::P2pCommand::GetPeerList);
             }
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            // Connect to a peer by address (for internet peers).
+            app.screen = Screen::P2pConnect;
         }
         KeyCode::Char('l') | KeyCode::Char('L') => {
             app.screen = Screen::RemoteLibrary;

@@ -1,7 +1,7 @@
 //! P2P Peers screen — manage trusted/pending/rejected peers.
 
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
@@ -44,6 +44,42 @@ pub(super) fn render_p2p_peers(app: &App, frame: &mut Frame, area: Rect) {
         frame.render_widget(msg, inner);
         return;
     }
+
+    // Reserve a small strip at the top for own listen addresses
+    let addr_strip_height = if app.p2p_listen_addrs.is_empty() { 0 } else {
+        (app.p2p_listen_addrs.len() as u16 + 2).min(inner.height / 3)
+    };
+
+    let (addr_area, peer_area) = if addr_strip_height > 0 {
+        let [a, b] = Layout::vertical([
+            Constraint::Length(addr_strip_height),
+            Constraint::Min(0),
+        ])
+        .areas(inner);
+        (Some(a), b)
+    } else {
+        (None, inner)
+    };
+
+    if let Some(aa) = addr_area {
+        let addr_block = Block::default()
+            .title(" Your address (share with internet peers) ")
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(super::CLR_DIM));
+        let addr_inner = addr_block.inner(aa);
+        frame.render_widget(addr_block, aa);
+
+        let lines: Vec<Line> = app.p2p_listen_addrs.iter().map(|a| {
+            Line::from(Span::styled(
+                super::truncate(a, addr_inner.width.saturating_sub(2) as usize),
+                Style::default().fg(super::CLR_ACCENT),
+            ))
+        }).collect();
+        frame.render_widget(Paragraph::new(lines), addr_inner);
+    }
+
+    let inner = peer_area;
 
     if app.p2p_peer_list.is_empty() {
         let msg = Paragraph::new("No peers discovered yet.\nDiscovery may take a few seconds.")

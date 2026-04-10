@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use libp2p::{
-    gossipsub, identify, kad, noise, tcp, yamux,
+    gossipsub, identify, kad, mdns, noise, tcp, yamux,
     identity::Keypair,
     swarm::{NetworkBehaviour, Swarm},
     PeerId, SwarmBuilder,
@@ -30,16 +30,18 @@ const IDENTIFY_PROTOCOL:         &str     = "/cmp-p2p/1.0.0";
 
 /// The combined libp2p `NetworkBehaviour` for a music P2P node.
 ///
-/// | Field       | Protocol  | Purpose                                   |
-/// |-------------|-----------|-------------------------------------------|
-/// | `gossipsub` | GossipSub | Broadcast announce / nominate / vote msgs |
-/// | `kademlia`  | Kademlia  | Distributed peer discovery (DHT)          |
-/// | `identify`  | Identify  | Multiaddr exchange; feeds Kademlia        |
+/// | Field       | Protocol  | Purpose                                      |
+/// |-------------|-----------|----------------------------------------------|
+/// | `gossipsub` | GossipSub | Broadcast announce / nominate / vote msgs    |
+/// | `kademlia`  | Kademlia  | Distributed peer discovery (DHT)             |
+/// | `identify`  | Identify  | Multiaddr exchange; feeds Kademlia            |
+/// | `mdns`      | mDNS      | Zero-config LAN peer discovery (no bootstrap)|
 #[derive(NetworkBehaviour)]
 pub struct MusicBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub kademlia:  kad::Behaviour<kad::store::MemoryStore>,
     pub identify:  identify::Behaviour,
+    pub mdns:      mdns::tokio::Behaviour,
 }
 
 // The macro generates `pub enum MusicBehaviourEvent` with variants:
@@ -97,7 +99,13 @@ pub fn build_swarm(keypair: Keypair) -> anyhow::Result<Swarm<MusicBehaviour>> {
                     .with_agent_version(format!("cmp/{}", env!("CARGO_PKG_VERSION"))),
             );
 
-            Ok(MusicBehaviour { gossipsub, kademlia, identify })
+            let mdns = mdns::tokio::Behaviour::new(
+                mdns::Config::default(),
+                key.public().to_peer_id(),
+            )
+            .map_err(|e| anyhow::anyhow!("mdns init: {e}"))?;
+
+            Ok(MusicBehaviour { gossipsub, kademlia, identify, mdns })
         })
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))

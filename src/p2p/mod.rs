@@ -57,6 +57,9 @@ pub enum P2pCommand {
     SetLocalPaths(std::collections::HashMap<uuid::Uuid, std::path::PathBuf>),
     /// Request the full catalog from a specific trusted peer.
     RequestCatalog { peer_fp: String },
+    /// Explicitly dial a peer by multiaddr string (for internet peers).
+    /// The peer still must be approved before any data is exchanged.
+    ConnectPeer { addr: String },
 
     // ── Track streaming ───────────────────────────────────────────────────
     /// Request a specific track from a peer.
@@ -147,8 +150,13 @@ pub enum P2pEvent {
     PartyLineFailed { nomination_id: Uuid },
 
     // ── Misc ──────────────────────────────────────────────────────────────
-    /// Non-fatal warning (logged as a toast).
+    /// Informational message (cyan toast).
+    Info(String),
+    /// Non-fatal warning (logged as a yellow toast).
     Warning(String),
+    /// Our own listen addresses changed (new port bound, etc.).
+    /// The strings are human-readable multiaddrs suitable for sharing.
+    ListenAddrsUpdated(Vec<String>),
 }
 
 // ---------------------------------------------------------------------------

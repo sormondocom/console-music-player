@@ -57,6 +57,8 @@ pub enum Screen {
     Organize,
     /// P2P peer management — approve/reject/view connected peers.  (Beta)
     P2pPeers,
+    /// Text-input screen to connect to a peer by multiaddr.  (Beta)
+    P2pConnect,
     /// Browse remote music libraries from trusted peers.  (Beta)
     RemoteLibrary,
     /// Party Line — nominate and vote on tracks for group playback.  (Beta)
@@ -518,6 +520,8 @@ pub struct App {
     pub remote_library_selected: usize,
     /// Scroll offset for the P2pPeers screen.
     pub p2p_peers_selected: usize,
+    /// Our own confirmed P2P listen addresses (full multiaddrs including PeerId).
+    pub p2p_listen_addrs: Vec<String>,
     /// Key sequence buffer for the `p`→`2`→`p` activation chord.
     pub p2p_key_seq: Vec<char>,
     /// Timestamp of the first key in the current P2P chord sequence.
@@ -583,6 +587,7 @@ impl App {
             p2p_peer_list: Vec::new(),
             remote_library_selected: 0,
             p2p_peers_selected: 0,
+            p2p_listen_addrs: Vec::new(),
             p2p_key_seq: Vec::new(),
             p2p_key_seq_time: None,
         };
@@ -1829,7 +1834,7 @@ impl App {
                     })
                     .collect();
 
-                match MusicNode::spawn(identity, bootstrap_peers, channels.cmd_rx, channels.event_tx) {
+                match MusicNode::spawn(identity, bootstrap_peers, cfg.p2p_listen_port, channels.cmd_rx, channels.event_tx) {
                     Ok(()) => {
                         // Broadcast library catalog immediately after activation
                         let catalog = crate::p2p::catalog::build_catalog(&self.library);
@@ -1863,6 +1868,7 @@ impl App {
         self.p2p_buffer_state = P2pBufferState::Idle;
         self.remote_tracks.clear();
         self.p2p_peer_list.clear();
+        self.p2p_listen_addrs.clear();
         self.screen = Screen::Library;
         self.status_message = Some("P2P disconnected.".into());
     }
@@ -2114,8 +2120,14 @@ impl App {
             P2pEvent::PartyLineFailed { .. } => {
                 self.push_toast(Toast::warning("Party Line vote expired."));
             }
+            P2pEvent::Info(msg) => {
+                self.push_toast(Toast::info(msg));
+            }
             P2pEvent::Warning(msg) => {
                 self.push_toast(Toast::warning(msg));
+            }
+            P2pEvent::ListenAddrsUpdated(addrs) => {
+                self.p2p_listen_addrs = addrs;
             }
         }
     }

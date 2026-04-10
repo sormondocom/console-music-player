@@ -485,3 +485,80 @@ pub(super) fn render_search_overlay(state: &SearchState, frame: &mut Frame, area
     );
 }
 
+// ---------------------------------------------------------------------------
+// P2P Connect by address — full-screen, not a floating overlay
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_p2p_connect_screen(app: &App, frame: &mut Frame, area: Rect) {
+    use ratatui::layout::{Alignment, Constraint, Layout};
+
+    let block = Block::default()
+        .title(" ⬡ Connect to Internet Peer ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(super::CLR_ACCENT));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Split: top section for own addresses, bottom section for input
+    let addrs_height = (app.p2p_listen_addrs.len() as u16 + 4).min(inner.height.saturating_sub(5));
+    let [addrs_area, _gap, input_area] = Layout::vertical([
+        Constraint::Length(addrs_height),
+        Constraint::Length(1),
+        Constraint::Min(3),
+    ])
+    .areas(inner);
+
+    // ── Own listen addresses ──────────────────────────────────────────────
+    let own_block = Block::default()
+        .title(" Your addresses (share these with the remote peer) ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(super::CLR_DIM));
+
+    let own_inner = own_block.inner(addrs_area);
+    frame.render_widget(own_block, addrs_area);
+
+    if app.p2p_listen_addrs.is_empty() {
+        let msg = Paragraph::new("Waiting for node to report listen addresses…")
+            .style(Style::default().fg(super::CLR_DIM));
+        frame.render_widget(msg, own_inner);
+    } else {
+        let addr_items: Vec<Line> = app
+            .p2p_listen_addrs
+            .iter()
+            .map(|a| {
+                Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        super::truncate(a, own_inner.width.saturating_sub(4) as usize),
+                        Style::default().fg(super::CLR_ACCENT),
+                    ),
+                ])
+            })
+            .collect();
+
+        let addr_para = Paragraph::new(Text::from(addr_items));
+        frame.render_widget(addr_para, own_inner);
+    }
+
+    // ── Input box ────────────────────────────────────────────────────────
+    let input_block = Block::default()
+        .title(" Enter peer's full multiaddr (e.g. /ip4/1.2.3.4/tcp/7878/p2p/12D3…) ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(super::CLR_SELECTED));
+
+    let input_inner = input_block.inner(input_area);
+    frame.render_widget(input_block, input_area);
+
+    let display_buf = format!("{}_", app.input_buffer);
+    let input_para = Paragraph::new(
+        super::truncate(&display_buf, input_inner.width.saturating_sub(2) as usize),
+    )
+    .style(Style::default().fg(Color::White))
+    .alignment(Alignment::Left);
+    frame.render_widget(input_para, input_inner);
+}
+

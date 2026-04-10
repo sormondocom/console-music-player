@@ -27,7 +27,7 @@ MOD tracker playback, and a numerology-based track selector, written in Rust.
 - iTunesDB & iTunesSD read/write — no iTunes required
 - iPod health scan and database repair
 - **Amazon Music** easter egg — catalog browser and MP3 downloader (session-cookie based)
-- **P2P music sharing** (beta) — share your library with trusted peers on the same network; stream tracks in-memory and vote on synchronized group playback via the Party Line
+- **P2P music sharing** (beta) — share your library with trusted peers on the same network or over the internet; stream tracks in-memory and vote on synchronized group playback via the Party Line
 - Playlists saved as JSON; single-track repeat
 - **Ctrl+V paste** in all text input fields (desktop platforms)
 - **mpv fallback** for audio playback on Termux (when the native backend is unavailable)
@@ -378,10 +378,24 @@ Activate by pressing `p` → `2` → `p` within two seconds from any screen.
 On first activation a PGP identity is generated and saved to `config.json`.
 Subsequent activations reuse the stored key.
 
-Once active, `cmp` announces itself to the local network via libp2p
-(Kademlia DHT over TCP + QUIC, Noise-encrypted transport) and broadcasts
-a presence beacon containing your track count.  Peers must explicitly approve
-each other before any library or track data is exchanged.
+Once active, `cmp` announces itself to the local network via **mDNS**
+(multicast DNS) — no configuration required.  Peers on the same Wi-Fi or LAN
+are discovered automatically within a few seconds.
+
+For **internet peers** outside your local network, share your listen address
+(shown at the top of the P2P Peers screen) with the remote person out-of-band,
+and use the `C` key to enter their address.  The peer still enters the
+**Pending** state and must be explicitly approved before any data is exchanged.
+
+On activation, `cmp` automatically attempts to open a port on your router via
+**UPnP** (Universal Plug and Play).  If your router supports it, a cyan toast
+confirms exactly which port was opened and what external address internet peers
+can use.  If UPnP is unavailable, a yellow toast tells you which port to
+forward manually.
+
+Transport is encrypted end-to-end by the Noise XX protocol over TCP + QUIC.
+Peers must explicitly approve each other before any library or track data is
+exchanged.
 
 #### Trust model
 
@@ -394,29 +408,262 @@ Every peer has one of four states:
 | **Rejected** | All messages from this peer are ignored |
 | **Deferred** | Not yet decided; no data exchanged |
 
+#### Typical workflow — step by step
+
+The following walks through a complete P2P session between two people, Alice
+and Bob, from first launch to synchronized group playback.
+
+---
+
+**Step 1 — Alice activates P2P**
+
+Alice presses `p`, then `2`, then `p` (all within two seconds) from the library
+screen.
+
+Because this is her first time, `cmp` generates a PGP keypair and writes it to
+`config.json`.  The status bar shows:
+
+```
+⬡ P2P active — Alice [a3f7…]  Discovering peers…
+```
+
+The P2P Peers screen opens automatically.  It is empty — no peers have been
+seen yet.
+
+---
+
+**Step 2 — Bob activates P2P (same local network)**
+
+Bob does the same on his machine.  Both machines are on the same Wi-Fi network.
+
+Within a few seconds, mDNS multicast discovers both nodes automatically.
+Alice's Peers screen shows a new entry:
+
+```
+  Bob   [b82c…]   PENDING
+```
+
+Bob's screen simultaneously shows:
+
+```
+  Alice  [a3f7…]   PENDING
+```
+
+A cyan toast appears on each screen: `"New peer: Bob — approve in P2P Peers"`
+(and vice versa for Bob).
+
+At this point no library data or audio has been shared.  Both peers are in the
+**Pending** state and the only thing each knows about the other is their
+nickname and public key fingerprint.
+
+---
+
+**Step 2 (alternative) — Bob is on a different network (internet peer)**
+
+If Bob is not on the same local network, mDNS cannot reach him.  Instead:
+
+1. Alice looks at the top of her P2P Peers screen.  It shows her listen
+   addresses, for example:
+   ```
+   /ip4/203.0.113.10/tcp/7878/p2p/12D3KooWAbc…
+   ```
+2. Alice sends that string to Bob out-of-band (chat, email, etc.).
+3. Bob presses `C` in his P2P Peers screen, pastes Alice's address, and presses
+   `Enter`.
+4. Alice presses `C` in her P2P Peers screen, enters Bob's address, and presses
+   `Enter`.
+5. Bob appears as **Pending** in Alice's list (and vice versa) — identical to
+   the LAN case from here on.
+
+> **Port note:** On activation, `cmp` tries UPnP automatically — if your
+> router supports it, the port is opened for you and your external address
+> appears in the Peers screen.  If UPnP fails, a yellow toast tells you which
+> port to forward manually.  To use a fixed, predictable port, set
+> `"p2p_listen_port": 7878` in `config.json` (recommended for internet use).
+
+---
+
+**Step 3 — mutual approval**
+
+Alice looks at Bob's fingerprint in the Peers screen.  She confirms it with Bob
+out-of-band (for example, by voice or chat) and presses `A` to approve him.
+
+Bob does the same and approves Alice.
+
+Both Peers screens now show:
+
+```
+  Bob   [b82c…]   TRUSTED
+  Alice  [a3f7…]   TRUSTED
+```
+
+The moment both sides are Trusted, their catalogs are exchanged automatically:
+- Alice's `cmp` broadcasts a `CatalogPresence` message ("I have 1 247 tracks")
+- Bob's `cmp` sees it, sends a `CatalogRequest`
+- Alice's node responds with Alice's full catalog (metadata only — titles,
+  artists, albums, durations, formats, file sizes — no file paths)
+- The same exchange happens in the other direction
+
+A toast confirms: `"Bob shared 843 tracks"` on Alice's screen.
+
+---
+
+**Step 4 — browsing the Remote Library**
+
+Alice presses `L` to open the Remote Library screen.  She sees Bob's 843 tracks
+listed alongside a `[FLAC  04:12  @Bob]` badge on each row.
+
+She navigates with `↑` / `↓` and finds a FLAC album she wants to hear.
+
+---
+
+**Step 5 — streaming a track**
+
+Alice presses `Enter` on the track.
+
+Immediately, her player pane changes:
+
+```
+  Requesting from Bob…
+```
+
+Bob's `cmp` receives the request, finds the file on his disk, reads it, and
+starts sending it to Alice in 64 KB chunks over the encrypted gossipsub channel.
+
+Alice's player pane shows a download progress gauge:
+
+```
+  ████████████░░░░░░░░░░░░  48%   Buffering @Bob…
+```
+
+When the last chunk arrives, Alice's `cmp` verifies the SHA-256 fingerprint
+supplied by Bob.  If it matches, playback begins instantly from RAM:
+
+```
+  ▶ Comptine d'un autre été — Yann Tiersen          [⬡ @Bob]
+  ────────────────────────────────────────── 02:14 / 04:50
+```
+
+The `[⬡ @Bob]` badge in the player pane indicates this is a remote track
+playing from memory, not a local file.  Nothing was written to Alice's disk.
+
+If the integrity check had failed (data corruption or tampering), a red
+persistent toast would appear instead:
+```
+  ✗ Integrity check failed — corrupted transfer discarded
+```
+
+---
+
+**Step 6 — nominating a track for the Party Line**
+
+Alice navigates back to the Remote Library (`p`→`2`→`p` again to reach the
+Peers screen, then `L`), finds a track she wants to share with Bob, and presses
+`N`.
+
+Bob's screen shows a yellow toast: `"Alice nominated: Comptine d'un autre été — vote in Party Line"`
+
+---
+
+**Step 7 — voting**
+
+Both Alice and Bob press `P` to open the Party Line screen.  The nomination is
+listed with a 60-second countdown:
+
+```
+  Comptine d'un autre été — Yann Tiersen
+  ✓ 0  ✗ 0  ⏱ 54s — by Alice
+```
+
+Alice presses `Y` (she auto-votes Yes on her own nomination in spirit; the node
+counts her implicit yes).  Bob presses `Y` too.
+
+The moment Bob's vote arrives at Alice's node, Alice's node detects a majority
+(2 of 2 trusted peers have voted Yes) and broadcasts:
+
+```
+  PartyStart { start_at: 2026-04-09T18:42:05Z }
+```
+
+Both screens show: `"Party Line: Comptine d'un autre été — starts in 5s"`
+
+---
+
+**Step 8 — synchronized playback**
+
+Both `cmp` instances start playing at exactly `18:42:05 UTC`:
+
+- If the track was already in memory (Alice already streamed it), her player
+  resumes at the correct moment.
+- If Bob hadn't streamed it yet, his `cmp` requested it the moment he saw
+  `PartyStart`, buffered it in the 5-second window, and began playing on time.
+- If Bob's buffer was not ready in time, a yellow toast appears —
+  `"Late join"` — and playback starts as soon as the buffer is complete.
+
+Both players now show:
+
+```
+  ▶ Comptine d'un autre été — Yann Tiersen          [⬡ @Alice]
+  ────────────────────────── 00:03 / 04:50
+```
+
+---
+
+**Step 9 — disconnecting**
+
+When Alice is done, she navigates to the P2P Peers screen and presses `X`.  Her
+node shuts down, stops broadcasting, and all remote tracks disappear from her
+Remote Library.  Bob's Peers screen shows: `"Alice went offline"` as a yellow
+toast.
+
+Her PGP identity and the list of trusted peers are saved in `config.json` for
+next time.  The next session resumes with the same identity — Bob will
+recognise her immediately and trust will not need to be re-established.
+
+---
+
 #### How it works
 
-1. **Activation** — chord opens the P2P Peers screen; your PGP fingerprint is shown in the status bar
-2. **Peer discovery** — libp2p Kademlia DHT finds peers on the LAN; each peer announces its public key
-3. **Trust** — you approve or reject each pending key in the P2P Peers screen
-4. **Library sharing** — trusted peers share their track catalog automatically (title, artist, album, duration — no file paths)
-5. **Track streaming** — select a remote track and press Enter; it is transferred in 64 KB chunks, verified with SHA-256, buffered entirely in RAM, and played immediately — nothing is written to disk
-6. **Party Line** — nominate any remote track; trusted peers vote; when a simple majority votes Yes, all peers start playing the track at the same UTC timestamp
+1. **Activation** — chord opens the P2P Peers screen; your PGP fingerprint and listen addresses are shown
+2. **LAN discovery** — mDNS (multicast DNS) finds other `cmp` instances on the same network automatically; no configuration needed
+3. **Internet peers** — share your `/ip4/…/tcp/…/p2p/…` address out-of-band; the remote peer enters it with `C`; you do the same in reverse
+4. **Trust** — every new peer (LAN or internet) enters Pending state; you approve or reject each one in the P2P Peers screen; no data flows until both sides approve
+5. **Library sharing** — trusted peers exchange track catalogs automatically (title, artist, album, duration — no file paths, no raw audio)
+6. **Track streaming** — select a remote track and press Enter; it is transferred in 64 KB chunks, verified with SHA-256, buffered entirely in RAM, and played immediately — nothing is written to disk
+7. **Party Line** — nominate any remote track; trusted peers vote; when a simple majority votes Yes, all peers start playing the track at the same UTC timestamp
 
 #### P2P Peers screen
 
-Opened automatically on activation.  Shows all known peers with their trust state.
+Opened automatically on activation.  Shows all known peers with their trust
+state.  **Your own listen addresses appear at the top** — these are the strings
+to share with internet peers.
 
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` or `k` / `j` | Navigate peer list |
 | `A` | Approve focused peer (Pending → Trusted) |
 | `D` | Deny / reject focused peer |
+| `C` | Connect to an internet peer by address |
 | `R` | Refresh peer list |
 | `L` | Open Remote Library |
 | `P` | Open Party Line |
 | `X` | Disconnect from P2P network |
 | `Esc` / `Q` | Return to library |
+
+#### Connect to internet peer screen
+
+Opened with `C` from the P2P Peers screen.  Displays your own shareable listen
+addresses at the top and a text input at the bottom.
+
+Enter the remote peer's full multiaddr — for example:
+
+```
+/ip4/203.0.113.42/tcp/7878/p2p/12D3KooWAbc123…
+```
+
+Press `Enter` to dial.  The peer enters the **Pending** state immediately; no
+data is exchanged until you (and they) approve each other.  Press `Esc` to
+cancel.
 
 #### Remote Library screen
 
@@ -462,6 +709,30 @@ Non-modal toasts appear in the bottom-right corner and stack up to three deep:
 | Cyan | Informational (peer connected, transfer complete) | 4 s |
 | Yellow | Warning (stall resolved, slow transfer) | 6 s |
 | Red | Error (integrity failure, peer offline) | Persists until `Esc` |
+
+#### UPnP automatic port mapping
+
+When the node starts, `cmp` searches for a UPnP-capable router on the local
+network (3-second timeout).  If found, it requests the router to forward one
+TCP port to this machine.
+
+| Outcome | Toast colour | Message |
+|---------|-------------|---------|
+| Router responded and opened the port | Cyan (info) | `"UPnP: your router opened port N — internet peers can reach you at X.X.X.X:N"` |
+| Router did not respond | Yellow (warning) | `"UPnP: router did not respond (…). Internet peers cannot connect to you unless you forward TCP port N manually."` |
+| Could not determine local IP | Yellow (warning) | `"UPnP: could not determine local IP address — skipping router port mapping."` |
+
+The mapping is removed from the router automatically when `cmp` shuts down
+cleanly (or when the app is closed normally).  If the process is killed without
+a clean shutdown, most routers expire the mapping after a reboot.
+
+`cmp` only ever opens the **one TCP port it is already listening on** — no
+other ports are touched.  The mapping description visible in your router's
+admin UI is `"cmp-p2p port N"`.
+
+To use a consistent port across sessions (recommended for internet peers),
+set `"p2p_listen_port": 7878` in `config.json`.  Without this, the OS assigns
+a different port each session.
 
 #### Security notes
 
@@ -519,14 +790,29 @@ saved to their disk by the `cmp` protocol.
 
 ### Who can discover me?
 
-Only other `cmp` instances on the **same local network** (your home Wi-Fi, a
-LAN party, a shared office network).  The peer discovery protocol (libp2p
-Kademlia DHT) does not route through the public internet by default.
+**Automatic discovery (LAN):** Only other `cmp` instances on the **same local
+network** (your home Wi-Fi, a LAN party, a shared office network).  Discovery
+uses **mDNS** (multicast DNS), which works automatically with no configuration —
+as soon as two machines on the same network activate P2P, they find each other
+within a few seconds.  mDNS traffic stays on the local network segment and does
+not route through the internet.
 
-If you manually add bootstrap peer addresses in `config.json`
-(`p2p_bootstrap_peers`), you can connect to peers on other networks — but this
-is an advanced option that requires deliberate configuration; it does not happen
-automatically.
+**Internet peers:** Nobody on the internet can find you unless *you* share your
+listen address with them explicitly.  There is no central server, no directory,
+and no registration.  Your address is only visible in two places:
+
+1. The top of your own P2P Peers screen (shown only to you)
+2. Any message you choose to send to someone out-of-band (chat, email, etc.)
+
+If you choose to connect to an internet peer, you dial them directly.  They
+still enter the **Pending** state and you must approve their PGP key before any
+data is exchanged — the same requirement as on a local network.  You can reject
+or revoke them at any time.
+
+If you want to use a fixed port (for NAT/firewall forwarding), add
+`"p2p_listen_port": 7878` to `config.json`.  Without this, the OS assigns an
+ephemeral port that changes each session — making it harder to reconnect to
+internet peers reliably.
 
 ### What is my "PGP identity" and what does it mean?
 
@@ -579,7 +865,8 @@ fields:
 "p2p_identity_passphrase": "...",
 "p2p_nickname": "...",
 "p2p_trusted_peers": [...],
-"p2p_bootstrap_peers": [...]
+"p2p_bootstrap_peers": [...],
+"p2p_listen_port": 7878
 ```
 
 After deleting them, save the file and restart `cmp`.  The chord `p`→`2`→`p`
@@ -590,6 +877,35 @@ identity is gone and no peer can recognise you as the same node.
 > in their own `config.json` under `p2p_trusted_peers`.  You cannot force them
 > to delete it, but once you stop broadcasting your old key, nothing identifies
 > you to them.
+
+### What is UPnP and what does cmp do with it?
+
+**UPnP** (Universal Plug and Play) is a protocol that lets applications ask
+your home router to temporarily open a port for inbound connections.  It is
+built into most consumer routers and is used by many peer-to-peer applications
+(BitTorrent, online games, etc.).
+
+**What `cmp` does, exactly:**
+
+1. When P2P activates, `cmp` sends a UPnP request to the router asking it to
+   forward one specific TCP port to your machine.
+2. A toast confirms: `"UPnP: your router opened port N — internet peers can
+   reach you at X.X.X.X:N"`.  The port number and your external IP address are
+   stated explicitly.
+3. The router admin UI will show an entry named `"cmp-p2p port N"` for as long
+   as `cmp` is running.
+4. When `cmp` closes, it immediately removes the mapping.
+
+**`cmp` never opens more than one port** and it only opens the port it is
+already listening on — it cannot open ports it doesn't need.
+
+**If you don't want UPnP used at all:** set `"p2p_listen_port": null` or
+simply don't activate the P2P feature (the chord `p`→`2`→`p` is the only
+entry point — P2P is completely dormant otherwise).
+
+**If your router does not support UPnP** (common on corporate or university
+networks), `cmp` shows a yellow warning toast and continues.  You are not
+connected to anything new — you simply don't get the automatic port mapping.
 
 ### What do the "stall" and "transfer failed" errors mean?
 
@@ -1000,12 +1316,33 @@ dependency (the two crates pin different `crossterm` versions).
 | `crypto.rs` | `encrypt_for_recipients`, `decrypt_message`, `sign_data`, `verify_data`, `seal`, `open` |
 | `trust.rs` | `TrustState` (Pending/Trusted/Rejected/Deferred), `NodeInfo`, `NodeStatus` |
 | `keystore.rs` | `PeerKeyStore` — four-bucket in-memory peer key store |
-| `network.rs` | `MusicBehaviour` (Gossipsub + Kademlia + Identify), `build_swarm()` |
-| `node.rs` | `MusicNode` — the async tokio coordinator; drives the swarm and all protocol state |
+| `network.rs` | `MusicBehaviour` (Gossipsub + Kademlia + Identify + mDNS), `build_swarm()` |
+| `node.rs` | `MusicNode` — async coordinator; drives the swarm, UPnP port mapping, and all protocol state |
 | `wire.rs` | `MusicKind`, `MusicMessage`, `SignedMusicMessage`, `RemoteTrack`, `RemoteFormat`, `PartyVote` |
 | `catalog.rs` | `build_catalog()` — `Library → Vec<RemoteTrack>`; `build_path_map()` — `Library → HashMap<Uuid, PathBuf>` |
 | `transfer.rs` | `InboundTransfer` — chunk accumulation, SHA-256 assembly, `Zeroizing<Vec<u8>>` output |
 | `party.rs` | `PartyLineState`, `Nomination`, `ActiveParty` — UI-side party line state |
+
+#### Discovery
+
+Two complementary mechanisms run in parallel:
+
+| Mechanism | Scope | Config required |
+|-----------|-------|----------------|
+| **mDNS** | Same local network segment | None — zero-config |
+| **Explicit dial** | Any IP-reachable host | Remote address shared out-of-band |
+| **Kademlia DHT** | Bootstrapped peers | `p2p_bootstrap_peers` in config |
+
+mDNS fires `Discovered` events when a peer appears; the node dials them and
+adds them to the gossipsub mesh.  `Expired` events clean the mesh when a peer
+leaves.  For internet peers, `ConnectPeer { addr }` dials a full multiaddr
+(`/ip4/…/tcp/…/p2p/…`) directly.  In both cases the peer enters **Pending**
+state until approved.
+
+The node emits `P2pEvent::ListenAddrsUpdated(Vec<String>)` whenever new listen
+addresses are bound (startup, port changes).  The UI stores these in
+`app.p2p_listen_addrs` and shows them at the top of the P2P Peers screen and
+the Connect screen.
 
 #### Channel architecture
 
@@ -1100,8 +1437,36 @@ at `start_at` via a check in `tick_p2p()`.
   "p2p_trusted_peers": [
     { "fingerprint": "abc123…", "nickname": "alice", "public_key_armored": "…" }
   ],
-  "p2p_bootstrap_peers": ["/ip4/192.168.1.5/tcp/0/p2p/12D3…"]
+  "p2p_bootstrap_peers": ["/ip4/192.168.1.5/tcp/0/p2p/12D3…"],
+  "p2p_listen_port": 7878
 }
+```
+
+All P2P fields are optional.  `p2p_listen_port` is only needed when operating
+behind a NAT/firewall that requires a fixed, pre-forwarded port for inbound
+internet connections.  Without it, the OS assigns an ephemeral port each
+session.
+
+#### Notable P2pCommand variants
+
+| Command | Description |
+|---------|-------------|
+| `AnnounceLibrary(Vec<RemoteTrack>)` | Broadcast `CatalogPresence` and update the node's local catalog |
+| `SetLocalPaths(HashMap<Uuid, PathBuf>)` | Register file paths for serving (never transmitted) |
+| `ConnectPeer { addr: String }` | Dial a peer by full multiaddr — peer enters Pending |
+| `RequestTrack { track_id, peer_fp }` | Begin a 5-message transfer handshake |
+| `NominateTrack(RemoteTrack)` | Publish `PartyNominate` to all trusted peers |
+| `CastVote { nomination_id, vote }` | Publish `PartyVote`; node tallies and may auto-broadcast `PartyStart` |
+
+#### Notable P2pEvent variants
+
+| Event | Emitted when |
+|-------|-------------|
+| `ListenAddrsUpdated(Vec<String>)` | Node binds a new listen address (startup or port change) |
+| `PeerApprovalRequired { .. }` | A new peer announces its key |
+| `RemoteCatalogReceived { .. }` | A trusted peer responds to a catalog request |
+| `TrackBufferReady { bytes, track, .. }` | All chunks received and SHA-256 verified |
+| `PartyLinePassed { track, start_at, .. }` | Vote majority reached; UTC start timestamp broadcast
 ```
 
 All P2P fields are optional — the P2P feature is completely dormant if none are

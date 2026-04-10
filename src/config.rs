@@ -37,6 +37,11 @@ pub struct Config {
     /// Bootstrap multiaddrs (user-configurable).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub p2p_bootstrap_peers: Vec<String>,
+
+    /// Fixed TCP/UDP listen port for P2P (enables consistent port-forwarding).
+    /// If absent or 0, a random port is assigned each session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_listen_port: Option<u16>,
 }
 
 /// A trusted peer persisted across sessions.

@@ -9,6 +9,7 @@
 //!   - Track transfer and party line stubs (Phases 4-6 will fill these in)
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -27,6 +28,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::p2p::transfer::{sha256_hex, InboundTransfer, CHUNK_SIZE};
+
+use libp2p::mdns;
 
 use crate::p2p::{
     identity::PgpIdentity,
@@ -75,6 +78,18 @@ impl NodeNomination {
 }
 
 // ---------------------------------------------------------------------------
+// UpnpLease — tracks an active UPnP port mapping so we can remove it cleanly
+// ---------------------------------------------------------------------------
+
+/// Holds the minimal state needed to remove a UPnP port mapping from the
+/// router when the node shuts down.
+struct UpnpLease {
+    gateway:       igd::Gateway,
+    external_port: u16,
+    local_addr:    SocketAddrV4,
+}
+
+// ---------------------------------------------------------------------------
 // MusicNode — the async coordinator
 // ---------------------------------------------------------------------------
 
@@ -102,6 +117,13 @@ pub struct MusicNode {
     party_nominations: HashMap<Uuid, NodeNomination>,
     /// Nomination IDs originated by this node (so it can broadcast PartyStart on majority).
     my_nominations: HashSet<Uuid>,
+    /// Our own confirmed listen multiaddrs (emitted to UI as ListenAddrsUpdated).
+    listen_addrs: Vec<Multiaddr>,
+    /// Active UPnP port lease — `Some` after a successful router port mapping.
+    /// Removed from the router when the node shuts down.
+    upnp_lease: Option<UpnpLease>,
+    /// Ensures we only attempt UPnP once per session.
+    upnp_attempted: bool,
 }
 
 impl MusicNode {
@@ -113,13 +135,18 @@ impl MusicNode {
     pub fn spawn(
         identity: PgpIdentity,
         bootstrap_peers: Vec<(PeerId, Multiaddr)>,
+        listen_port: Option<u16>,
         cmd_rx:   UnboundedReceiver<P2pCommand>,
         event_tx: UnboundedSender<P2pEvent>,
     ) -> anyhow::Result<()> {
         let keypair = Keypair::generate_ed25519();
         let mut swarm = network::build_swarm(keypair)?;
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-        swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+
+        // Use a fixed port when configured (allows consistent port-forwarding for
+        // internet peers); fall back to 0 (random) if unset.
+        let port = listen_port.unwrap_or(0);
+        swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{port}").parse()?)?;
+        swarm.listen_on(format!("/ip4/0.0.0.0/udp/{port}/quic-v1").parse()?)?;
 
         let node = Self {
             swarm,
@@ -138,6 +165,9 @@ impl MusicNode {
             inbound_transfers: HashMap::new(),
             party_nominations: HashMap::new(),
             my_nominations: HashSet::new(),
+            listen_addrs: Vec::new(),
+            upnp_lease: None,
+            upnp_attempted: false,
         };
 
         tokio::spawn(async move {
@@ -192,6 +222,22 @@ impl MusicNode {
         }
 
         info!("music P2P node shutting down");
+
+        // Remove the UPnP port mapping we opened, so the router slot is freed
+        // immediately rather than waiting for the lease to expire.
+        if let Some(lease) = self.upnp_lease.take() {
+            info!("UPnP: removing port {} mapping from router", lease.external_port);
+            let _ = tokio::task::spawn_blocking(move || {
+                match lease.gateway.remove_port(
+                    igd::PortMappingProtocol::TCP,
+                    lease.external_port,
+                ) {
+                    Ok(()) => info!("UPnP: port {} removed from router", lease.external_port),
+                    Err(e) => warn!("UPnP: failed to remove port {}: {e}", lease.external_port),
+                }
+            })
+            .await;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -247,6 +293,28 @@ impl MusicNode {
                 let _ = peer_fp; // gossipsub broadcast; responder filters by trust
                 if let Err(e) = self.publish(MusicKind::CatalogRequest).await {
                     warn!("catalog request failed: {e}");
+                }
+            }
+
+            P2pCommand::ConnectPeer { addr } => {
+                match addr.parse::<Multiaddr>() {
+                    Ok(ma) => {
+                        info!(%ma, "dialling explicit peer");
+                        if let Err(e) = self.swarm.dial(ma) {
+                            warn!("explicit dial failed: {e}");
+                            let _ = self.event_tx.send(P2pEvent::Warning(
+                                format!("Could not connect: {e}")
+                            )).ok();
+                        }
+                        // The peer will announce their key via AnnounceKey once connected;
+                        // they will appear as Pending and require normal approval.
+                    }
+                    Err(e) => {
+                        warn!("invalid peer address '{addr}': {e}");
+                        let _ = self.event_tx.send(P2pEvent::Warning(
+                            format!("Invalid address: {e}")
+                        )).ok();
+                    }
                 }
             }
 
@@ -354,6 +422,25 @@ impl MusicNode {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(%address, "listening");
+                // Skip loopback and circuit-relay addresses — not useful for sharing.
+                let addr_str = address.to_string();
+                if !addr_str.contains("/127.0.0.1") && !addr_str.contains("/::1") {
+                    if !self.listen_addrs.contains(&address) {
+                        self.listen_addrs.push(address.clone());
+                    }
+                    // Emit full shareable multiaddrs: address + /p2p/<PeerId>
+                    let local_peer_id = *self.swarm.local_peer_id();
+                    let addrs: Vec<String> = self.listen_addrs.iter()
+                        .map(|a| format!("{}/p2p/{}", a, local_peer_id))
+                        .collect();
+                    let _ = self.event_tx.send(P2pEvent::ListenAddrsUpdated(addrs)).ok();
+
+                    // Attempt UPnP once, on the first TCP listen address.
+                    // UDP/QUIC is skipped — TCP is what internet peers dial.
+                    if !self.upnp_attempted && addr_str.contains("/tcp/") {
+                        self.try_upnp(&address).await;
+                    }
+                }
             }
 
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -406,7 +493,154 @@ impl MusicNode {
                 debug!(%peer, "kademlia routing updated");
             }
 
+            MusicBehaviourEvent::Mdns(mdns::Event::Discovered(peers)) => {
+                for (peer_id, addr) in peers {
+                    info!(%peer_id, %addr, "mDNS: discovered peer");
+                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                    network::add_gossipsub_peer(&mut self.swarm, peer_id);
+                    if let Err(e) = self.swarm.dial(addr) {
+                        debug!(%peer_id, "mDNS dial failed: {e}");
+                    }
+                }
+            }
+
+            MusicBehaviourEvent::Mdns(mdns::Event::Expired(peers)) => {
+                for (peer_id, _addr) in peers {
+                    debug!(%peer_id, "mDNS: peer expired");
+                    self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                }
+            }
+
             _ => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // UPnP — automatic router port mapping
+    // -----------------------------------------------------------------------
+
+    /// Attempt to open an inbound TCP port on the home router via UPnP/IGD.
+    ///
+    /// Called once, on the first non-loopback TCP `NewListenAddr` event.
+    /// Emits an `Info` toast on success (with the external IP:port that
+    /// internet peers can use) or a `Warning` toast on failure (explaining
+    /// what the user needs to do manually).  Always sets `upnp_attempted`
+    /// so this path is only taken once per session.
+    async fn try_upnp(&mut self, listen_addr: &Multiaddr) {
+        self.upnp_attempted = true;
+
+        // Extract the TCP port the OS actually bound (may differ from the
+        // configured port when 0 was requested).
+        let port = match Self::extract_tcp_port(listen_addr) {
+            Some(p) if p != 0 => p,
+            _ => {
+                debug!("UPnP: skipping — could not extract TCP port from {listen_addr}");
+                return;
+            }
+        };
+
+        // Determine which local IPv4 address sits on the default route.
+        // This is the address the router needs to forward traffic to.
+        let local_ip = match Self::local_ipv4() {
+            Some(ip) => ip,
+            None => {
+                let _ = self.event_tx.send(P2pEvent::Warning(
+                    "UPnP: could not determine local IP address — skipping router port mapping. \
+                     Internet peers will not be able to reach you unless you forward a port manually."
+                    .to_string(),
+                )).ok();
+                return;
+            }
+        };
+        let local_addr = SocketAddrV4::new(local_ip, port);
+        let description = format!("cmp-p2p port {port}");
+
+        info!("UPnP: attempting to open port {port} on router (local {local_addr})");
+
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(igd::Gateway, std::net::Ipv4Addr)> {
+            let gateway = igd::search_gateway(igd::SearchOptions {
+                timeout: Some(Duration::from_secs(3)),
+                ..Default::default()
+            })?;
+            let external_ip = gateway.get_external_ip()?;
+            // lease_duration = 0 → the router keeps the mapping until we
+            // explicitly call remove_port() on clean shutdown, or until it
+            // reboots.  We always clean up ourselves.
+            gateway.add_port(
+                igd::PortMappingProtocol::TCP,
+                port,
+                local_addr,
+                0,
+                &description,
+            )?;
+            Ok((gateway, external_ip))
+        })
+        .await;
+
+        match result {
+            Ok(Ok((gateway, external_ip))) => {
+                info!("UPnP: port {port} mapped → {external_ip}:{port}");
+
+                // Append the externally-reachable address to the shareable
+                // list so it appears in the P2P Peers screen and Connect screen.
+                let external_ma: Multiaddr = format!("/ip4/{external_ip}/tcp/{port}")
+                    .parse()
+                    .unwrap_or_else(|_| listen_addr.clone());
+                if !self.listen_addrs.contains(&external_ma) {
+                    self.listen_addrs.push(external_ma);
+                }
+                let local_peer_id = *self.swarm.local_peer_id();
+                let addrs: Vec<String> = self.listen_addrs.iter()
+                    .map(|a| format!("{}/p2p/{}", a, local_peer_id))
+                    .collect();
+                let _ = self.event_tx.send(P2pEvent::ListenAddrsUpdated(addrs)).ok();
+
+                // Crystal-clear success message: tell the user exactly what
+                // was opened and what it means.
+                let _ = self.event_tx.send(P2pEvent::Info(format!(
+                    "UPnP: your router opened port {port} — \
+                     internet peers can reach you at {external_ip}:{port}"
+                ))).ok();
+
+                self.upnp_lease = Some(UpnpLease { gateway, external_port: port, local_addr });
+            }
+
+            Ok(Err(e)) => {
+                info!("UPnP not available: {e}");
+                // Tell the user what failed and what they need to do if they
+                // want internet connectivity.
+                let _ = self.event_tx.send(P2pEvent::Warning(format!(
+                    "UPnP: router did not respond ({e}). \
+                     Internet peers cannot connect to you unless you forward \
+                     TCP port {port} manually on your router."
+                ))).ok();
+            }
+
+            Err(join_err) => {
+                warn!("UPnP task panicked: {join_err}");
+            }
+        }
+    }
+
+    /// Extract the TCP port number from a libp2p `Multiaddr`.
+    fn extract_tcp_port(addr: &Multiaddr) -> Option<u16> {
+        use libp2p::multiaddr::Protocol;
+        addr.iter().find_map(|p| {
+            if let Protocol::Tcp(port) = p { Some(port) } else { None }
+        })
+    }
+
+    /// Return the local IPv4 address that would be used to reach the internet.
+    ///
+    /// Uses a UDP connect-without-send trick: asking the OS which source
+    /// address it would use to reach 8.8.8.8 reveals the default-route
+    /// interface IP without actually sending any traffic.
+    fn local_ipv4() -> Option<std::net::Ipv4Addr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("8.8.8.8:80").ok()?;
+        match socket.local_addr().ok()?.ip() {
+            std::net::IpAddr::V4(ip) => Some(ip),
+            _ => None,
         }
     }
 
