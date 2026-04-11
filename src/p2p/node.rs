@@ -282,6 +282,26 @@ impl MusicNode {
                     info!(%fp, %nick, "peer approved");
                     self.node_map_set_trust(&fp, TrustState::Trusted);
                     let _ = self.publish_announce_key().await;
+
+                    // Trigger mutual catalog exchange with the newly trusted peer.
+                    //
+                    // The CatalogPresence broadcast at node startup was received
+                    // while this peer was still Pending, so the handler silently
+                    // dropped it.  Publish fresh messages now (each publish() gets
+                    // a new message UUID so the seen-message dedup won't suppress them):
+                    //
+                    //  1. CatalogPresence — tells them we have tracks; if they've
+                    //     already approved us they'll immediately send a CatalogRequest.
+                    //  2. CatalogRequest  — asks for their catalog; they'll respond if
+                    //     they've approved us (signature verifies against their key).
+                    let count = self.local_catalog.len() as u32;
+                    if let Err(e) = self.publish(MusicKind::CatalogPresence { track_count: count }).await {
+                        warn!("post-approve CatalogPresence failed: {e}");
+                    }
+                    if let Err(e) = self.publish(MusicKind::CatalogRequest).await {
+                        warn!("post-approve CatalogRequest failed: {e}");
+                    }
+
                     let _ = self.event_tx.send(P2pEvent::PeerTrusted {
                         fingerprint: fp,
                         nickname: nick,
