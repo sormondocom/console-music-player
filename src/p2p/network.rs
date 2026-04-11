@@ -24,6 +24,11 @@ const GOSSIPSUB_HEARTBEAT:       Duration = Duration::from_secs(10);
 const IDLE_CONNECTION_TIMEOUT:   Duration = Duration::from_secs(60);
 const IDENTIFY_PROTOCOL:         &str     = "/cmp-p2p/1.0.0";
 
+/// Gossipsub per-message size cap.  The default (65 536 B) is far too small
+/// for a catalog page of 300 tracks (~75 KB JSON + envelope).  4 MB gives
+/// comfortable headroom while staying well below typical MTU stacks.
+const MAX_TRANSMIT_SIZE: usize = 4 * 1024 * 1024; // 4 MB
+
 // ---------------------------------------------------------------------------
 // Behaviour
 // ---------------------------------------------------------------------------
@@ -63,6 +68,7 @@ pub fn build_swarm(keypair: Keypair) -> anyhow::Result<Swarm<MusicBehaviour>> {
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
         .validation_mode(gossipsub::ValidationMode::Strict)
+        .max_transmit_size(MAX_TRANSMIT_SIZE)
         .message_id_fn(|msg: &gossipsub::Message| {
             use std::hash::{Hash, Hasher};
             let mut s = std::collections::hash_map::DefaultHasher::new();

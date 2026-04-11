@@ -2026,9 +2026,8 @@ impl App {
                 // Merge into remote_tracks, replacing any previous entries from this peer.
                 self.remote_tracks.retain(|t| t.owner_fp != peer_fp);
                 self.remote_tracks.extend(tracks);
-                self.push_toast(Toast::info(format!(
-                    "{peer_nick} shared {} tracks", self.remote_tracks.iter().filter(|t| t.owner_fp == peer_fp).count()
-                )));
+                // The node already emits a "catalog complete" Info toast; no
+                // duplicate toast needed here.
             }
             P2pEvent::InboundTrackRequest { transfer_id, track, requester_fp: _ } => {
                 // Auto-accept for now; Phase 5 will add a confirmation prompt.

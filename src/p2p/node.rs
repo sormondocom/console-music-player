@@ -50,6 +50,9 @@ const EVENT_CHANNEL_CAP:        usize    = 128;
 const CMD_CHANNEL_CAP:          usize    = 64;
 const STATUS_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
 const NOMINATION_LIFETIME_SECS: u64     = 60;
+/// Tracks per CatalogResponse page.  At ~250 B JSON per track this keeps each
+/// gossipsub message well under the 4 MB cap even with envelope overhead.
+const CATALOG_PAGE_SIZE:        usize    = 300;
 
 /// Gossipsub topic name — all music P2P nodes share one topic per network.
 const TOPIC: &str = "cmp-p2p-v1";
@@ -129,6 +132,9 @@ pub struct MusicNode {
     port_tx: watch::Sender<Option<u16>>,
     /// Peers discovered by the LAN beacon task, ready to be dialled.
     beacon_rx: UnboundedReceiver<(PeerId, Multiaddr)>,
+    /// Accumulates paginated CatalogResponse pages keyed by sender fingerprint.
+    /// Flushed to RemoteCatalogReceived when the final page arrives.
+    partial_catalogs: HashMap<String, Vec<RemoteTrack>>,
 }
 
 impl MusicNode {
@@ -181,6 +187,7 @@ impl MusicNode {
             upnp_attempted: false,
             port_tx,
             beacon_rx,
+            partial_catalogs: HashMap::new(),
         };
 
         tokio::spawn(async move {
@@ -295,6 +302,9 @@ impl MusicNode {
                     //  2. CatalogRequest  — asks for their catalog; they'll respond if
                     //     they've approved us (signature verifies against their key).
                     let count = self.local_catalog.len() as u32;
+                    let _ = self.event_tx.send(P2pEvent::Info(format!(
+                        "{nick} approved — exchanging catalogs…"
+                    ))).ok();
                     if let Err(e) = self.publish(MusicKind::CatalogPresence { track_count: count }).await {
                         warn!("post-approve CatalogPresence failed: {e}");
                     }
@@ -765,37 +775,91 @@ impl MusicNode {
             }
 
             MusicKind::CatalogPresence { track_count } => {
-                debug!(%sender_fp, %track_count, "catalog presence");
+                info!(%sender_fp, %sender_nick, %track_count, "catalog presence received");
                 if self.keystore.get_by_fingerprint(&sender_fp).is_some() {
+                    let _ = self.event_tx.send(P2pEvent::Info(format!(
+                        "{sender_nick} has {track_count} tracks — requesting catalog…"
+                    ))).ok();
                     if let Err(e) = self.publish(MusicKind::CatalogRequest).await {
                         warn!("catalog request failed: {e}");
+                        let _ = self.event_tx.send(P2pEvent::Warning(format!(
+                            "Failed to request catalog from {sender_nick}: {e}"
+                        ))).ok();
                     }
+                } else {
+                    debug!(%sender_fp, "CatalogPresence from untrusted peer — ignored");
                 }
             }
 
             MusicKind::CatalogRequest if verified => {
                 if self.keystore.get_by_fingerprint(&sender_fp).is_some() {
-                    if let Err(e) = self.publish(MusicKind::CatalogResponse {
-                        tracks: self.local_catalog.clone(),
-                        page: None,
-                        total_pages: None,
-                    }).await {
-                        warn!("catalog response failed: {e}");
+                    let catalog = self.local_catalog.clone();
+                    let total = catalog.len();
+                    let pages: Vec<&[RemoteTrack]> = catalog.chunks(CATALOG_PAGE_SIZE).collect();
+                    let total_pages = pages.len() as u32;
+
+                    info!(%sender_nick, total, total_pages, "sending catalog");
+                    let _ = self.event_tx.send(P2pEvent::Info(format!(
+                        "Sending catalog to {sender_nick} ({total} tracks, {total_pages} page{})…",
+                        if total_pages == 1 { "" } else { "s" }
+                    ))).ok();
+
+                    for (i, page_tracks) in pages.iter().enumerate() {
+                        if let Err(e) = self.publish(MusicKind::CatalogResponse {
+                            tracks: page_tracks.to_vec(),
+                            page: Some(i as u32),
+                            total_pages: Some(total_pages),
+                        }).await {
+                            warn!(page = i, "catalog page send failed: {e}");
+                            let _ = self.event_tx.send(P2pEvent::Warning(format!(
+                                "Catalog page {} of {total_pages} failed to send: {e}", i + 1
+                            ))).ok();
+                            break;
+                        }
                     }
+                } else {
+                    debug!(%sender_fp, "CatalogRequest from untrusted peer — ignored");
                 }
             }
 
-            MusicKind::CatalogResponse { tracks, .. } if verified => {
-                let mut owned: Vec<RemoteTrack> = tracks;
-                for t in &mut owned {
-                    t.owner_fp   = sender_fp.clone();
-                    t.owner_nick = sender_nick.clone();
+            MusicKind::CatalogResponse { tracks, page, total_pages } if verified => {
+                let page_num  = page.unwrap_or(0);
+                let total_pgs = total_pages.unwrap_or(1);
+                let page_len  = tracks.len();
+
+                info!(%sender_nick, page_num, total_pgs, page_len, "catalog page received");
+
+                // Accumulate pages.
+                let acc = self.partial_catalogs
+                    .entry(sender_fp.clone())
+                    .or_default();
+                acc.extend(tracks);
+
+                if page_num + 1 < total_pgs {
+                    // More pages coming — report progress.
+                    let received = acc.len();
+                    let _ = self.event_tx.send(P2pEvent::Info(format!(
+                        "Receiving catalog from {sender_nick}: page {} of {total_pgs} ({received} tracks so far)…",
+                        page_num + 1,
+                    ))).ok();
+                } else {
+                    // Final page — flush the accumulator.
+                    let mut owned = self.partial_catalogs.remove(&sender_fp).unwrap_or_default();
+                    let total_received = owned.len();
+                    for t in &mut owned {
+                        t.owner_fp   = sender_fp.clone();
+                        t.owner_nick = sender_nick.clone();
+                    }
+                    info!(%sender_nick, total_received, "catalog complete");
+                    let _ = self.event_tx.send(P2pEvent::Info(format!(
+                        "Catalog from {sender_nick} complete — {total_received} tracks"
+                    ))).ok();
+                    let _ = self.event_tx.send(P2pEvent::RemoteCatalogReceived {
+                        peer_fp:   sender_fp,
+                        peer_nick: sender_nick,
+                        tracks:    owned,
+                    }).ok();
                 }
-                let _ = self.event_tx.send(P2pEvent::RemoteCatalogReceived {
-                    peer_fp:   sender_fp,
-                    peer_nick: sender_nick,
-                    tracks:    owned,
-                }).ok();
             }
 
             MusicKind::TrackRequest { track_id } if verified => {
