@@ -23,6 +23,7 @@ use libp2p::{
     Multiaddr, PeerId,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio::time;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -124,6 +125,10 @@ pub struct MusicNode {
     upnp_lease: Option<UpnpLease>,
     /// Ensures we only attempt UPnP once per session.
     upnp_attempted: bool,
+    /// Notifies the LAN beacon task of our TCP listen port once the swarm binds.
+    port_tx: watch::Sender<Option<u16>>,
+    /// Peers discovered by the LAN beacon task, ready to be dialled.
+    beacon_rx: UnboundedReceiver<(PeerId, Multiaddr)>,
 }
 
 impl MusicNode {
@@ -140,6 +145,7 @@ impl MusicNode {
         event_tx: UnboundedSender<P2pEvent>,
     ) -> anyhow::Result<()> {
         let keypair = Keypair::generate_ed25519();
+        let local_peer_id = keypair.public().to_peer_id();
         let mut swarm = network::build_swarm(keypair)?;
 
         // Use a fixed port when configured (allows consistent port-forwarding for
@@ -147,6 +153,11 @@ impl MusicNode {
         let port = listen_port.unwrap_or(0);
         swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{port}").parse()?)?;
         swarm.listen_on(format!("/ip4/0.0.0.0/udp/{port}/quic-v1").parse()?)?;
+
+        // LAN beacon: watch channel carries our TCP port to the beacon task once
+        // the swarm has bound.  Beacon discoveries come back via `beacon_rx`.
+        let (port_tx, port_rx) = watch::channel(None::<u16>);
+        let beacon_rx = crate::p2p::lan_beacon::spawn(local_peer_id, port_rx);
 
         let node = Self {
             swarm,
@@ -168,6 +179,8 @@ impl MusicNode {
             listen_addrs: Vec::new(),
             upnp_lease: None,
             upnp_attempted: false,
+            port_tx,
+            beacon_rx,
         };
 
         tokio::spawn(async move {
@@ -217,6 +230,17 @@ impl MusicNode {
                         warn!("status announce failed: {e}");
                     }
                     self.prune_expired_nominations().await;
+                }
+
+                discovered = self.beacon_rx.recv() => {
+                    if let Some((peer_id, addr)) = discovered {
+                        // Feed into Kademlia and dial.  The swarm deduplicates
+                        // connection attempts, so repeated beacons are harmless.
+                        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                        if let Err(e) = self.swarm.dial(addr.clone()) {
+                            debug!(%peer_id, %addr, "LAN beacon dial: {e}");
+                        }
+                    }
                 }
             }
         }
@@ -435,10 +459,18 @@ impl MusicNode {
                         .collect();
                     let _ = self.event_tx.send(P2pEvent::ListenAddrsUpdated(addrs)).ok();
 
-                    // Attempt UPnP once, on the first TCP listen address.
-                    // UDP/QUIC is skipped — TCP is what internet peers dial.
-                    if !self.upnp_attempted && addr_str.contains("/tcp/") {
-                        self.try_upnp(&address).await;
+                    // Notify the LAN beacon task of our TCP port so it can start
+                    // broadcasting.  We only need the first TCP address.
+                    if addr_str.contains("/tcp/") {
+                        if *self.port_tx.borrow() == None {
+                            if let Some(p) = Self::extract_tcp_port(&address) {
+                                let _ = self.port_tx.send(Some(p));
+                            }
+                        }
+                        // Attempt UPnP once on that same address.
+                        if !self.upnp_attempted {
+                            self.try_upnp(&address).await;
+                        }
                     }
                 }
             }

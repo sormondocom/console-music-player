@@ -79,6 +79,9 @@ futures  = "0.3"
 sha2     = "0.10"
 # UPnP — automatic router port mapping so internet peers can reach us
 igd      = "0.12"
+# LAN beacon: interface enumeration + raw socket options (both already transitive, zero new downloads)
+if-addrs = "0.15"
+socket2  = "0.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # CDP (Chrome DevTools Protocol) WebSocket client — Amazon Music automation

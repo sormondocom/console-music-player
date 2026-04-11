@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod crypto;
 pub mod identity;
 pub mod keystore;
+pub mod lan_beacon;
 pub mod network;
 pub mod node;
 pub mod party;
