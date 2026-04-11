@@ -375,12 +375,27 @@ instead of JSON.
 ### P2P music sharing (beta)
 
 Activate by pressing `p` → `2` → `p` within two seconds from any screen.
-On first activation a PGP identity is generated and saved to `config.json`.
+
+**First-time setup:** on the very first activation you will be asked to choose a
+**display name** — a short identifier for your node on the P2P network.  Rules:
+
+- 1 to 12 characters
+- Letters and digits only (`a-z`, `A-Z`, `0-9`) — no spaces or symbols
+- You can use the same name as another person; the app automatically appends a
+  4-character key suffix to distinguish you: `Alice#A1B2` vs `Alice#C3D4`
+
+Once confirmed the name is saved to `config.json` and never asked again.  To
+change it later, edit or delete the `"p2p_nickname"` field in `config.json` (see
+[Configuration file location](#configuration-file-location)) and restart.
+
+On first activation a PGP identity is also generated and saved to `config.json`.
 Subsequent activations reuse the stored key.
 
 Once active, `cmp` announces itself to the local network via **mDNS**
-(multicast DNS) — no configuration required.  Peers on the same Wi-Fi or LAN
-are discovered automatically within a few seconds.
+(multicast DNS) and a supplementary **UDP directed-broadcast beacon** sent to
+every network interface every 2 seconds — no configuration required.  Peers on
+the same Wi-Fi or LAN are discovered automatically within a few seconds even
+on multi-homed hosts (VPN + Ethernet, Docker bridges, etc.).
 
 For **internet peers** outside your local network, share your listen address
 (shown at the top of the P2P Peers screen) with the remote person out-of-band,
@@ -420,12 +435,19 @@ and Bob, from first launch to synchronized group playback.
 Alice presses `p`, then `2`, then `p` (all within two seconds) from the library
 screen.
 
-Because this is her first time, `cmp` generates a PGP keypair and writes it to
-`config.json`.  The status bar shows:
+Because this is her first time, she is taken to the **identity screen** and
+prompted to type a display name.  She types `Alice` and presses `Enter`.
+
+`cmp` saves the name, generates a PGP keypair, and writes both to `config.json`.
+The status bar shows:
 
 ```
-⬡ P2P active — Alice [a3f7…]  Discovering peers…
+⬡ P2P active — Alice#A3F7  Discovering peers…
 ```
+
+The `#A3F7` suffix is derived from the last four characters of her PGP
+fingerprint.  Two users both named `Alice` would appear as `Alice#A3F7` and
+`Alice#B82C` — always distinguishable.
 
 The P2P Peers screen opens automatically.  It is empty — no peers have been
 seen yet.
@@ -436,20 +458,20 @@ seen yet.
 
 Bob does the same on his machine.  Both machines are on the same Wi-Fi network.
 
-Within a few seconds, mDNS multicast discovers both nodes automatically.
+Within a few seconds, the UDP broadcast beacon discovers both nodes automatically.
 Alice's Peers screen shows a new entry:
 
 ```
-  Bob   [b82c…]   PENDING
+  ● Bob#B82C   [pending]
 ```
 
 Bob's screen simultaneously shows:
 
 ```
-  Alice  [a3f7…]   PENDING
+  ● Alice#A3F7   [pending]
 ```
 
-A cyan toast appears on each screen: `"New peer: Bob — approve in P2P Peers"`
+A cyan toast appears on each screen: `"New peer: Bob#B82C — press A to approve"`
 (and vice versa for Bob).
 
 At this point no library data or audio has been shared.  Both peers are in the
@@ -493,8 +515,8 @@ Bob does the same and approves Alice.
 Both Peers screens now show:
 
 ```
-  Bob   [b82c…]   TRUSTED
-  Alice  [a3f7…]   TRUSTED
+  ● Bob#B82C     [trusted]
+  ● Alice#A3F7   [trusted]
 ```
 
 The moment both sides are Trusted, their catalogs are exchanged automatically:
@@ -624,8 +646,8 @@ recognise her immediately and trust will not need to be re-established.
 
 #### How it works
 
-1. **Activation** — chord opens the P2P Peers screen; your PGP fingerprint and listen addresses are shown
-2. **LAN discovery** — mDNS (multicast DNS) finds other `cmp` instances on the same network automatically; no configuration needed
+1. **Activation** — first time asks for a display name (1–12 alphanumeric chars); chord then opens the P2P Peers screen showing your display name as `name#XXXX` (name + last 4 key chars)
+2. **LAN discovery** — mDNS multicast + UDP directed-broadcast beacon (every 2 s, all interfaces) finds other `cmp` instances on the same network automatically; no configuration needed
 3. **Internet peers** — share your `/ip4/…/tcp/…/p2p/…` address out-of-band; the remote peer enters it with `C`; you do the same in reverse
 4. **Trust** — every new peer (LAN or internet) enters Pending state; you approve or reject each one in the P2P Peers screen; no data flows until both sides approve
 5. **Library sharing** — trusted peers exchange track catalogs automatically (title, artist, album, duration — no file paths, no raw audio)
@@ -734,6 +756,33 @@ To use a consistent port across sessions (recommended for internet peers),
 set `"p2p_listen_port": 7878` in `config.json`.  Without this, the OS assigns
 a different port each session.
 
+#### Configuration file location
+
+All P2P settings — your display name, PGP identity, trusted peers, bootstrap
+peers, and listen port — are stored in a single JSON file:
+
+| Platform | Path |
+|----------|------|
+| **Windows** | `%APPDATA%\console-music-player\config.json` — typically `C:\Users\<you>\AppData\Roaming\console-music-player\config.json` |
+| **Linux / macOS** | `$HOME/.config/console-music-player/config.json` |
+
+To **change your display name**, open the file and edit the `"p2p_nickname"` field
+(must be 1–12 alphanumeric characters), then restart `cmp` — the `#XXXX` suffix
+is re-derived from your existing key automatically.
+
+To **reset your P2P identity entirely**, delete the following fields from the file
+and restart.  A fresh keypair and a new identity prompt will appear the next time
+you activate P2P:
+
+```json
+"p2p_identity_armored": "...",
+"p2p_identity_passphrase": "...",
+"p2p_nickname": "...",
+"p2p_trusted_peers": [...],
+"p2p_bootstrap_peers": [...],
+"p2p_listen_port": 7878
+```
+
 #### Security notes
 
 - All gossipsub messages are signed with the sender's EdDSA PGP key; unsigned or tampered messages are rejected
@@ -771,7 +820,7 @@ activating the P2P feature.
 When P2P is active, `cmp` broadcasts a small **presence beacon** to other `cmp`
 instances on the same local network.  The beacon contains only:
 
-- Your chosen **nickname**
+- Your chosen **display name** (the plain part — e.g. `Alice`, not `Alice#A3F7`)
 - Your **PGP public key** (used to verify your identity — this is safe to share)
 - How many tracks are in your library (a number, nothing else)
 
@@ -792,10 +841,10 @@ saved to their disk by the `cmp` protocol.
 
 **Automatic discovery (LAN):** Only other `cmp` instances on the **same local
 network** (your home Wi-Fi, a LAN party, a shared office network).  Discovery
-uses **mDNS** (multicast DNS), which works automatically with no configuration —
-as soon as two machines on the same network activate P2P, they find each other
-within a few seconds.  mDNS traffic stays on the local network segment and does
-not route through the internet.
+uses **mDNS** (multicast DNS) and a supplementary **UDP broadcast beacon** sent
+to every network interface every 2 seconds.  Both mechanisms stay on the local
+network segment and do not route through the internet.  As soon as two machines
+on the same network activate P2P, they find each other within a few seconds.
 
 **Internet peers:** Nobody on the internet can find you unless *you* share your
 listen address with them explicitly.  There is no central server, no directory,
@@ -857,7 +906,8 @@ fingerprint from the `p2p_trusted_peers` array.
 **For the current session:** press `X` in the P2P Peers screen, or let the app
 close normally.  The node shuts down and stops broadcasting.
 
-**Permanently — remove your identity:**  open `config.json` and delete these
+**Permanently — remove your identity:**  open `config.json` (see
+[Configuration file location](#configuration-file-location)) and delete these
 fields:
 
 ```json
@@ -870,8 +920,9 @@ fields:
 ```
 
 After deleting them, save the file and restart `cmp`.  The chord `p`→`2`→`p`
-will generate a brand-new identity the next time it is pressed — your old
-identity is gone and no peer can recognise you as the same node.
+will show the identity name prompt and generate a brand-new keypair the next
+time it is pressed — your old identity is gone and no peer can recognise you as
+the same node.
 
 > There is no central server to "deregister" from.  Peers hold your public key
 > in their own `config.json` under `p2p_trusted_peers`.  You cannot force them
