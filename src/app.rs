@@ -1958,15 +1958,32 @@ impl App {
 
     fn handle_p2p_event(&mut self, event: crate::p2p::P2pEvent) {
         use crate::p2p::P2pEvent;
+        use crate::p2p::trust::{NodeInfo, NodeStatus, TrustState};
         match event {
-            P2pEvent::PeerApprovalRequired { nickname, .. } => {
-                self.push_toast(Toast::info(format!("New peer: {nickname} — approve in P2P Peers")));
+            P2pEvent::PeerApprovalRequired { fingerprint, nickname } => {
+                self.push_toast(Toast::info(format!("New peer: {nickname} — press A to approve")));
+                // Add to the peer list immediately so the user can act on it.
+                if !self.p2p_peer_list.iter().any(|p| p.fingerprint == fingerprint) {
+                    self.p2p_peer_list.push(NodeInfo {
+                        fingerprint,
+                        nickname,
+                        trust: TrustState::Pending,
+                        status: NodeStatus::Online,
+                        last_seen: chrono::Utc::now(),
+                    });
+                }
             }
-            P2pEvent::PeerTrusted { nickname, .. } => {
+            P2pEvent::PeerTrusted { fingerprint, nickname } => {
                 self.push_toast(Toast::info(format!("{nickname} trusted")));
+                if let Some(p) = self.p2p_peer_list.iter_mut().find(|p| p.fingerprint == fingerprint) {
+                    p.trust = TrustState::Trusted;
+                }
             }
-            P2pEvent::PeerOffline { nickname, .. } => {
+            P2pEvent::PeerOffline { fingerprint, nickname } => {
                 self.push_toast(Toast::warning(format!("{nickname} went offline")));
+                if let Some(p) = self.p2p_peer_list.iter_mut().find(|p| p.fingerprint == fingerprint) {
+                    p.status = NodeStatus::Offline;
+                }
             }
             P2pEvent::PeerListSnapshot(peers) => {
                 self.p2p_peer_list = peers;
