@@ -57,6 +57,8 @@ pub enum Screen {
     Organize,
     /// P2P peer management — approve/reject/view connected peers.  (Beta)
     P2pPeers,
+    /// First-run identity entry — set an alphanumeric display name ≤12 chars.
+    P2pIdentity,
     /// Text-input screen to connect to a peer by multiaddr.  (Beta)
     P2pConnect,
     /// Browse remote music libraries from trusted peers.  (Beta)
@@ -1777,6 +1779,23 @@ impl App {
     // P2P methods
     // ---------------------------------------------------------------------------
 
+    /// Returns `true` if `s` is a valid P2P display name: 1–12 ASCII alphanumeric chars.
+    pub fn is_valid_p2p_name(s: &str) -> bool {
+        !s.is_empty() && s.len() <= 12 && s.chars().all(|c| c.is_ascii_alphanumeric())
+    }
+
+    /// Build the composite display name shown in the UI: `"nickname#ABCD"`.
+    ///
+    /// The four-character suffix is the last four hex digits of the PGP
+    /// fingerprint, uppercased.  Two nodes with the same nickname will thus
+    /// always show differently so the user can tell them apart.
+    pub fn p2p_display_name(nickname: &str, fingerprint: &str) -> String {
+        let tag = fingerprint
+            .get(fingerprint.len().saturating_sub(4)..)
+            .unwrap_or(fingerprint);
+        format!("{}#{}", nickname, tag.to_uppercase())
+    }
+
     /// Activate P2P mode (called on `p`→`2`→`p` chord completion).
     /// Loads or generates the PGP identity, spawns the libp2p node, and
     /// stores a `P2pHandle` in `self.p2p_node`.
@@ -1789,11 +1808,15 @@ impl App {
 
         let mut cfg = Config::load();
 
-        let nickname = cfg.p2p_nickname.clone().unwrap_or_else(|| {
-            std::env::var("USERNAME")
-                .or_else(|_| std::env::var("USER"))
-                .unwrap_or_else(|_| "user".into())
-        });
+        // If no valid nickname is stored, send the user to the identity screen
+        // first.  activate_p2p() will be called again after they confirm a name.
+        let nickname = match cfg.p2p_nickname.as_deref().filter(|n| Self::is_valid_p2p_name(n)) {
+            Some(n) => n.to_string(),
+            None => {
+                self.screen = Screen::P2pIdentity;
+                return;
+            }
+        };
 
         match PgpIdentity::load_or_generate(
             &nickname,
@@ -1810,7 +1833,6 @@ impl App {
                 }
 
                 let fp = identity.fingerprint();
-                let fp_short = &fp[..8.min(fp.len())];
 
                 // Build channel pair: UI-side handle + node-side channels
                 let (handle, channels) = P2pHandle::channel(nickname.clone(), fp.clone());
@@ -1843,9 +1865,9 @@ impl App {
                         handle.send(crate::p2p::P2pCommand::SetLocalPaths(paths));
                         self.p2p_node = Some(handle);
                         self.screen = Screen::P2pPeers;
+                        let display = Self::p2p_display_name(&nickname, &fp);
                         self.status_message = Some(format!(
-                            "⬡ P2P active — {} [{fp_short}…]  Discovering peers…",
-                            nickname
+                            "⬡ P2P active — {display}  Discovering peers…"
                         ));
                     }
                     Err(e) => {
@@ -1961,7 +1983,12 @@ impl App {
         use crate::p2p::trust::{NodeInfo, NodeStatus, TrustState};
         match event {
             P2pEvent::PeerApprovalRequired { fingerprint, nickname } => {
-                self.push_toast(Toast::info(format!("New peer: {nickname} — press A to approve")));
+                // Filter self-connections (belt-and-suspenders; node also filters).
+                if self.p2p_node.as_ref().map(|n| n.fingerprint == fingerprint).unwrap_or(false) {
+                    return;
+                }
+                let display = Self::p2p_display_name(&nickname, &fingerprint);
+                self.push_toast(Toast::info(format!("New peer: {display} — press A to approve")));
                 // Add to the peer list immediately so the user can act on it.
                 if !self.p2p_peer_list.iter().any(|p| p.fingerprint == fingerprint) {
                     self.p2p_peer_list.push(NodeInfo {
@@ -1974,13 +2001,15 @@ impl App {
                 }
             }
             P2pEvent::PeerTrusted { fingerprint, nickname } => {
-                self.push_toast(Toast::info(format!("{nickname} trusted")));
+                let display = Self::p2p_display_name(&nickname, &fingerprint);
+                self.push_toast(Toast::info(format!("{display} trusted")));
                 if let Some(p) = self.p2p_peer_list.iter_mut().find(|p| p.fingerprint == fingerprint) {
                     p.trust = TrustState::Trusted;
                 }
             }
             P2pEvent::PeerOffline { fingerprint, nickname } => {
-                self.push_toast(Toast::warning(format!("{nickname} went offline")));
+                let display = Self::p2p_display_name(&nickname, &fingerprint);
+                self.push_toast(Toast::warning(format!("{display} went offline")));
                 if let Some(p) = self.p2p_peer_list.iter_mut().find(|p| p.fingerprint == fingerprint) {
                     p.status = NodeStatus::Offline;
                 }

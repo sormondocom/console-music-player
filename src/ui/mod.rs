@@ -115,6 +115,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         Screen::Organize => organize::render_organize(app, frame, body_area),
 
         Screen::P2pPeers      => p2p_peers::render_p2p_peers(app, frame, body_area),
+        Screen::P2pIdentity   => overlays::render_p2p_identity_screen(app, frame, body_area),
         Screen::P2pConnect    => overlays::render_p2p_connect_screen(app, frame, body_area),
         Screen::RemoteLibrary => remote_library::render_remote_library(app, frame, body_area),
         Screen::PartyLine     => party_line::render_party_line(app, frame, body_area),
@@ -216,6 +217,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             Screen::Amazon     => " [S] Add as source  [L] Launch app  [D] Auto-download (Win32)  [↑↓] Scroll log  [Esc] Back",
             Screen::Organize   => " [↑↓/jk] Navigate groups  [Enter] Select destination  [Esc] Back",
             Screen::P2pPeers      => " [↑↓] Navigate  [A] Approve  [D] Deny  [C] Connect by address  [L] Remote Library  [P] Party Line  [X] Disconnect  [Esc] Back",
+            Screen::P2pIdentity   => " Type your display name (a-z, A-Z, 0-9, max 12 chars)  [Enter] Confirm  [Esc] Cancel",
             Screen::P2pConnect    => " Paste a peer address and press Enter to connect  [Esc] Cancel",
             Screen::RemoteLibrary => " [↑↓/PgUp/Dn] Navigate  [Enter] Stream  [N] Nominate for Party Line  [Esc] Back",
             Screen::PartyLine     => " [↑↓] Navigate  [Y] Vote Yes  [N] Vote No  [Esc] Back",

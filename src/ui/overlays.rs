@@ -562,3 +562,92 @@ pub(super) fn render_p2p_connect_screen(app: &App, frame: &mut Frame, area: Rect
     frame.render_widget(input_para, input_inner);
 }
 
+// ---------------------------------------------------------------------------
+// P2P identity entry screen
+// ---------------------------------------------------------------------------
+
+pub(super) fn render_p2p_identity_screen(app: &App, frame: &mut Frame, area: Rect) {
+    use ratatui::layout::Alignment;
+
+    let block = Block::default()
+        .title(" ⬡ P2P Identity — Choose a Display Name ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(super::CLR_ACCENT));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [_top, body, _bottom] = ratatui::layout::Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(10),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+
+    let [_left, center, _right] = ratatui::layout::Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(50.min(body.width)),
+        Constraint::Min(0),
+    ])
+    .areas(body);
+
+    frame.render_widget(Clear, center);
+
+    let card = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(super::CLR_SELECTED));
+
+    let card_inner = card.inner(center);
+    frame.render_widget(card, center);
+
+    let valid = crate::app::App::is_valid_p2p_name(&app.input_buffer);
+    let name_color = if app.input_buffer.is_empty() {
+        super::CLR_DIM
+    } else if valid {
+        Color::Green
+    } else {
+        Color::Red
+    };
+
+    let hint = if app.input_buffer.is_empty() {
+        "Up to 12 letters / digits, no spaces"
+    } else if valid {
+        "Looks good — press Enter to continue"
+    } else if app.input_buffer.len() > 12 {
+        "Too long — max 12 characters"
+    } else {
+        "Letters and digits only (a-z, A-Z, 0-9)"
+    };
+
+    let [desc_area, _gap, input_area, _gap2, hint_area] =
+        ratatui::layout::Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(card_inner);
+
+    let desc = Paragraph::new(
+        "Your name will appear as  name#XXXX\n\
+         where XXXX is derived from your key.",
+    )
+    .style(Style::default().fg(super::CLR_DIM))
+    .alignment(Alignment::Center);
+    frame.render_widget(desc, desc_area);
+
+    let display_buf = format!("{}_", app.input_buffer);
+    let input_para = Paragraph::new(display_buf)
+        .style(Style::default().fg(name_color).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    frame.render_widget(input_para, input_area);
+
+    let hint_para = Paragraph::new(hint)
+        .style(Style::default().fg(super::CLR_DIM))
+        .alignment(Alignment::Center);
+    frame.render_widget(hint_para, hint_area);
+}
+

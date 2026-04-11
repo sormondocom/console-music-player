@@ -946,6 +946,10 @@ impl MusicNode {
         use pgp::types::KeyTrait;
         use std::io::Cursor;
 
+        // Never process our own key announcement (happens when beacon echoes back).
+        if announced_fp == self.identity.fingerprint() {
+            return;
+        }
         if self.revoked_fps.contains(announced_fp) || self.keystore.is_rejected(announced_fp) {
             return;
         }

@@ -363,6 +363,7 @@ fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
         Screen::Amazon          => handle_amazon_key(app, key, cfg),
         Screen::Organize        => handle_organize_key(app, key),
         Screen::P2pPeers        => handle_p2p_peers_key(app, key),
+        Screen::P2pIdentity     => handle_p2p_identity_key(app, key),
         Screen::P2pConnect      => handle_text_input_key(app, key, |app| {
             let addr = app.input_buffer.trim().to_string();
             app.input_buffer.clear();
@@ -948,6 +949,47 @@ fn handle_text_input_key(app: &mut App, key: KeyCode, on_enter: impl Fn(&mut App
         KeyCode::Enter     => on_enter(app),
         KeyCode::Backspace => { app.input_buffer.pop(); }
         KeyCode::Char(c)   => app.input_buffer.push(c),
+        _ => {}
+    }
+}
+
+fn handle_p2p_identity_key(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc => {
+            app.input_buffer.clear();
+            app.screen = Screen::Library;
+        }
+        KeyCode::Enter => {
+            let name = app.input_buffer.trim().to_string();
+            if App::is_valid_p2p_name(&name) {
+                // Persist the chosen name, then proceed to spawn the node.
+                let mut cfg = Config::load();
+                cfg.p2p_nickname = Some(name);
+                cfg.save();
+                app.input_buffer.clear();
+                app.activate_p2p(); // now has a valid nickname, won't loop
+            } else {
+                // Leave the buffer intact so the user can fix it.
+                let msg = if app.input_buffer.is_empty() {
+                    "Please enter a name (1–12 letters or digits)".to_string()
+                } else if app.input_buffer.len() > 12 {
+                    format!("Too long ({} chars) — max 12", app.input_buffer.len())
+                } else {
+                    "Letters and digits only (a-z, A-Z, 0-9)".to_string()
+                };
+                app.status_message = Some(msg);
+            }
+        }
+        KeyCode::Backspace => {
+            app.input_buffer.pop();
+            app.status_message = None;
+        }
+        KeyCode::Char(c) if c.is_ascii_alphanumeric() => {
+            if app.input_buffer.len() < 12 {
+                app.input_buffer.push(c);
+                app.status_message = None;
+            }
+        }
         _ => {}
     }
 }

@@ -15,12 +15,10 @@ pub(super) fn render_p2p_peers(app: &App, frame: &mut Frame, area: Rect) {
     let p2p_active = app.p2p_node.is_some();
 
     let title = if p2p_active {
-        let nick = app
-            .p2p_node
-            .as_ref()
-            .map(|n| n.nickname.as_str())
-            .unwrap_or("?");
-        format!(" ⬡ P2P Peers — {} ", nick)
+        let display = app.p2p_node.as_ref().map(|n| {
+            App::p2p_display_name(&n.nickname, &n.fingerprint)
+        }).unwrap_or_else(|| "?".to_string());
+        format!(" ⬡ P2P Peers — {display} ")
     } else {
         " ⬡ P2P Peers (inactive) ".to_string()
     };
@@ -116,8 +114,8 @@ pub(super) fn render_p2p_peers(app: &App, frame: &mut Frame, area: Rect) {
                 NodeStatus::Offline   => super::CLR_DIM,
             };
 
-            let nick = super::truncate(&info.nickname, avail.saturating_sub(24));
-            let fp   = &info.fingerprint[..8.min(info.fingerprint.len())];
+            let display_name = App::p2p_display_name(&info.nickname, &info.fingerprint);
+            let nick = super::truncate(&display_name, avail.saturating_sub(16));
 
             let main_style = if focused {
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
@@ -128,8 +126,7 @@ pub(super) fn render_p2p_peers(app: &App, frame: &mut Frame, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::styled(status_icon, Style::default().fg(status_color)),
                 Span::styled(nick,        main_style),
-                Span::styled(format!("  {fp}…"), Style::default().fg(super::CLR_DIM)),
-                Span::raw(" "),
+                Span::raw("  "),
                 Span::styled(trust_badge, Style::default().fg(trust_color).bold()),
             ]))
         })
