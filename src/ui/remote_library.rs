@@ -23,8 +23,8 @@ pub(super) fn render_remote_library(app: &App, frame: &mut Frame, area: Rect) {
     .areas(area);
 
     render_track_list(app, frame, list_area);
-    // Re-use the same player pane renderer as the main library screen.
-    super::library::render_player_pane(app, frame, player_area);
+    // Re-use the player pane renderer with remote-context metadata panel.
+    super::library::render_player_pane_remote(app, frame, player_area);
 }
 
 fn render_track_list(app: &App, frame: &mut Frame, area: Rect) {

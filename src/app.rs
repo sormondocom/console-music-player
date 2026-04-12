@@ -1697,7 +1697,18 @@ impl App {
             // Suppress any pending advance so the error overlay can show cleanly.
             self.player.needs_next = false;
         } else if self.player.take_needs_next() {
-            self.advance_track();
+            // Only auto-advance into the local library when no remote track is
+            // active.  If a remote track just finished, clear the buffer state
+            // and stop — the user must choose the next remote track explicitly.
+            match &self.p2p_buffer_state {
+                P2pBufferState::Playing { .. } => {
+                    self.p2p_buffer_state = P2pBufferState::Idle;
+                    self.player.current_remote = None;
+                }
+                _ => {
+                    self.advance_track();
+                }
+            }
         }
         self.tick_transfer();
         self.tick_organize();
@@ -2036,14 +2047,18 @@ impl App {
                 }
                 let _ = track;
             }
-            P2pEvent::TrackBufferProgress { transfer_id, received, total } => {
+            P2pEvent::TrackBufferProgress { transfer_id, received, total, track } => {
                 match &self.p2p_buffer_state {
                     // TrackOffer arrived — transition Requesting → Buffering.
                     P2pBufferState::Requesting { peer_nick, .. } => {
-                        let peer_nick = peer_nick.clone();
+                        let peer_nick     = peer_nick.clone();
+                        let track_title   = track.as_ref().map(|t| t.title.clone()).unwrap_or_default();
+                        let track_artist  = track.as_ref().map(|t| t.artist.clone()).unwrap_or_default();
                         self.p2p_buffer_state = P2pBufferState::Buffering {
                             transfer_id,
                             peer_nick,
+                            track_title,
+                            track_artist,
                             received,
                             total,
                             stalled: false,

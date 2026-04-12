@@ -349,6 +349,9 @@ impl Player {
     ) -> Result<(), String> {
         self.decoder_panic_flag.store(false, std::sync::atomic::Ordering::Relaxed);
         self.stop_internal();
+        // Discard any pending "advance to next local track" signal so a local
+        // track finishing mid-download doesn't hijack playback after this call.
+        self.needs_next = false;
 
         let handle = self
             .handle

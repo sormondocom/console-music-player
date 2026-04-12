@@ -238,6 +238,16 @@ pub(super) fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
 // ---------------------------------------------------------------------------
 
 pub(super) fn render_player_pane(app: &App, frame: &mut Frame, area: Rect) {
+    render_player_pane_inner(app, frame, area, false);
+}
+
+/// `remote_context` — when true (remote library screen), the lower metadata
+/// panel shows the focused remote track instead of the local library selection.
+pub(super) fn render_player_pane_remote(app: &App, frame: &mut Frame, area: Rect) {
+    render_player_pane_inner(app, frame, area, true);
+}
+
+fn render_player_pane_inner(app: &App, frame: &mut Frame, area: Rect, remote_context: bool) {
     let p = &app.player;
     let icon = p.state.icon();
 
@@ -257,18 +267,85 @@ pub(super) fn render_player_pane(app: &App, frame: &mut Frame, area: Rect) {
     ])
     .areas(inner);
 
-    // ── P2P buffering states (override normal player display) ────────────
+    // ── Unified status bar ───────────────────────────────────────────────
+    // All states share the same 3-row layout:
+    //   Row 1 (3 lines) — title / artist / context line
+    //   Row 2 (1 line)  — gauge (download % or playback %)
+    //   Row 3 (1 line)  — status text (bytes/total OR elapsed/duration + vol)
+    let [names_area, gauge_area, status_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(playing_area);
+
     match &app.p2p_buffer_state {
         P2pBufferState::Requesting { peer_nick, .. } => {
-            render_p2p_requesting(peer_nick, inner.width, frame, playing_area);
+            let w = inner.width as usize;
+            frame.render_widget(Paragraph::new(vec![
+                Line::styled("Requesting…", Style::default().fg(Color::White).bold()),
+                Line::styled(format!("from @{peer_nick}"), Style::default().fg(super::CLR_DIM)),
+                Line::default(),
+            ]), names_area);
+            frame.render_widget(
+                Gauge::default()
+                    .gauge_style(Style::default().fg(super::CLR_ACCENT).bg(Color::DarkGray))
+                    .ratio(0.0),
+                gauge_area,
+            );
+            frame.render_widget(
+                Paragraph::new(super::truncate(&format!("Waiting for @{peer_nick}…"), w))
+                    .style(Style::default().fg(super::CLR_DIM))
+                    .alignment(Alignment::Center),
+                status_area,
+            );
         }
-        P2pBufferState::Buffering { peer_nick, received, total, stalled, .. } => {
-            render_p2p_buffering(peer_nick, *received, *total, *stalled, inner.width, frame, playing_area);
+
+        P2pBufferState::Buffering { peer_nick, track_title, track_artist, received, total, stalled, .. } => {
+            let w   = inner.width as usize;
+            let pct = if *total > 0 { *received as f64 / *total as f64 } else { 0.0 };
+
+            let title_line  = if track_title.is_empty() { "Buffering…".to_string() }
+                              else { super::truncate(track_title, w) };
+            let artist_line = if track_artist.is_empty() { format!("from @{peer_nick}") }
+                              else { super::truncate(&format!("{track_artist}  ·  @{peer_nick}"), w) };
+
+            frame.render_widget(Paragraph::new(vec![
+                Line::styled(
+                    title_line,
+                    Style::default()
+                        .fg(if *stalled { Color::Yellow } else { Color::White })
+                        .bold(),
+                ),
+                Line::styled(artist_line, Style::default().fg(super::CLR_DIM)),
+                Line::styled(
+                    if *stalled { "⚠ Stalled".to_string() }
+                    else { format!("{:.0}%  downloading…", pct * 100.0) },
+                    Style::default().fg(if *stalled { Color::Yellow } else { super::CLR_DIM }),
+                ),
+            ]), names_area);
+
+            let gauge_color = if *stalled { Color::Yellow } else { super::CLR_ACCENT };
+            frame.render_widget(
+                Gauge::default()
+                    .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
+                    .ratio(pct.clamp(0.0, 1.0)),
+                gauge_area,
+            );
+
+            let recv_mb  = *received as f64 / (1024.0 * 1024.0);
+            let total_mb = *total   as f64 / (1024.0 * 1024.0);
+            frame.render_widget(
+                Paragraph::new(format!("{:.2} MB / {:.2} MB", recv_mb, total_mb))
+                    .style(Style::default().fg(if *stalled { Color::Yellow } else { super::CLR_DIM }))
+                    .alignment(Alignment::Center),
+                status_area,
+            );
         }
+
+        // Idle or Playing — show normal playback view.
         _ => {
-            // Normal local playback OR remote track playing.
             if p.state != PlaybackState::Stopped {
-                // Prefer remote track metadata if available.
                 let (title, artist, album, duration_secs) =
                     if let Some(rt) = &p.current_remote {
                         (rt.title.as_str(), rt.artist.as_str(), rt.album.as_str(), rt.duration_secs)
@@ -278,63 +355,52 @@ pub(super) fn render_player_pane(app: &App, frame: &mut Frame, area: Rect) {
                         ("", "", "", None)
                     };
 
-                let [names_area, gauge_area, time_vol_area] = Layout::vertical([
-                    Constraint::Length(3),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                ])
-                .areas(playing_area);
+                let w = inner.width as usize;
+                frame.render_widget(Paragraph::new(vec![
+                    Line::styled(super::truncate(title,  w), Style::default().fg(Color::White).bold()),
+                    Line::styled(super::truncate(artist, w), Style::default().fg(super::CLR_DIM)),
+                    Line::styled(super::truncate(album,  w), Style::default().fg(super::CLR_DIM)),
+                ]), names_area);
 
-                let info_lines = vec![
-                    Line::styled(
-                        super::truncate(title, inner.width as usize),
-                        Style::default().fg(Color::White).bold(),
-                    ),
-                    Line::styled(
-                        super::truncate(artist, inner.width as usize),
-                        Style::default().fg(super::CLR_DIM),
-                    ),
-                    Line::styled(
-                        super::truncate(album, inner.width as usize),
-                        Style::default().fg(super::CLR_DIM),
-                    ),
-                ];
-                frame.render_widget(Paragraph::new(info_lines), names_area);
+                frame.render_widget(
+                    Gauge::default()
+                        .gauge_style(Style::default().fg(super::CLR_ACCENT).bg(Color::DarkGray))
+                        .ratio(p.progress()),
+                    gauge_area,
+                );
 
-                let gauge = Gauge::default()
-                    .gauge_style(Style::default().fg(super::CLR_ACCENT).bg(Color::DarkGray))
-                    .ratio(p.progress());
-                frame.render_widget(gauge, gauge_area);
-
-                let elapsed = p.elapsed();
+                let elapsed   = p.elapsed();
                 let elapsed_s = format!("{:02}:{:02}", elapsed.as_secs() / 60, elapsed.as_secs() % 60);
-                let total_s = duration_secs
+                let total_s   = duration_secs
                     .map(|s| format!("{:02}:{:02}", s / 60, s % 60))
                     .unwrap_or_else(|| "--:--".into());
-                let vol_pct = (p.volume * 100.0).round() as u8;
+                let vol_pct   = (p.volume * 100.0).round() as u8;
 
-                // Remote badge: [⬡ @nick] appended to the time/vol line.
                 let remote_badge = if let P2pBufferState::Playing { peer_nick } = &app.p2p_buffer_state {
                     format!("  [⬡ @{peer_nick}]")
                 } else {
                     String::new()
                 };
 
-                let time_vol = Paragraph::new(format!(
-                    "{elapsed_s}/{total_s}  Vol:{} {vol_pct}%  {}{}{}",
-                    p.volume_bar(),
-                    p.repeat.icon(),
-                    p.shuffle.icon(),
-                    remote_badge,
-                ))
-                .style(Style::default().fg(super::CLR_DIM))
-                .alignment(Alignment::Center);
-                frame.render_widget(time_vol, time_vol_area);
-            } else {
-                let idle = Paragraph::new("─ stopped ─")
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "{elapsed_s}/{total_s}  Vol:{} {vol_pct}%  {}{}{}",
+                        p.volume_bar(),
+                        p.repeat.icon(),
+                        p.shuffle.icon(),
+                        remote_badge,
+                    ))
                     .style(Style::default().fg(super::CLR_DIM))
-                    .alignment(Alignment::Center);
-                frame.render_widget(idle, playing_area);
+                    .alignment(Alignment::Center),
+                    status_area,
+                );
+            } else {
+                frame.render_widget(
+                    Paragraph::new("─ stopped ─")
+                        .style(Style::default().fg(super::CLR_DIM))
+                        .alignment(Alignment::Center),
+                    playing_area,
+                );
             }
         }
     }
@@ -343,7 +409,11 @@ pub(super) fn render_player_pane(app: &App, frame: &mut Frame, area: Rect) {
         .style(Style::default().fg(super::CLR_DIM));
     frame.render_widget(div, divider_area);
 
-    render_track_metadata(app, frame, info_area);
+    if remote_context {
+        render_remote_track_metadata(app, frame, info_area);
+    } else {
+        render_track_metadata(app, frame, info_area);
+    }
 }
 
 fn render_track_metadata(app: &App, frame: &mut Frame, area: Rect) {
@@ -423,6 +493,69 @@ fn render_track_metadata(app: &App, frame: &mut Frame, area: Rect) {
         Paragraph::new(lines).wrap(Wrap { trim: true }),
         area,
     );
+}
+
+/// Metadata panel for the remote library screen — shows the focused remote
+/// track's details instead of the local library selection.
+fn render_remote_track_metadata(app: &App, frame: &mut Frame, area: Rect) {
+    // If a remote track is actively playing, show that; otherwise show the
+    // focused track in the remote list.
+    let track = if let Some(rt) = &app.player.current_remote {
+        rt.clone()
+    } else if let Some(rt) = app.remote_tracks.get(app.remote_library_selected) {
+        rt.clone()
+    } else {
+        let empty = Paragraph::new("No remote track focused.")
+            .style(Style::default().fg(super::CLR_DIM))
+            .alignment(Alignment::Center);
+        frame.render_widget(empty, area);
+        return;
+    };
+
+    let w = area.width as usize;
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Title  ", Style::default().fg(super::CLR_DIM)),
+            Span::styled(super::truncate(&track.title, w.saturating_sub(8)), Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("Artist ", Style::default().fg(super::CLR_DIM)),
+            Span::styled(super::truncate(&track.artist, w.saturating_sub(8)), Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    if !track.album.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Album  ", Style::default().fg(super::CLR_DIM)),
+            Span::styled(super::truncate(&track.album, w.saturating_sub(8)), Style::default().fg(Color::White)),
+        ]));
+    }
+
+    if let Some(secs) = track.duration_secs {
+        lines.push(Line::from(vec![
+            Span::styled("Time   ", Style::default().fg(super::CLR_DIM)),
+            Span::styled(
+                format!("{:02}:{:02}", secs / 60, secs % 60),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("Format ", Style::default().fg(super::CLR_DIM)),
+        Span::styled(track.format.label().to_uppercase(), Style::default().fg(Color::White)),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled("Owner  ", Style::default().fg(super::CLR_DIM)),
+        Span::styled(
+            format!("@{}", track.owner_nick),
+            Style::default().fg(super::CLR_ACCENT),
+        ),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -535,89 +668,6 @@ pub(super) fn render_functions_pane(_app: &App, frame: &mut Frame, area: Rect) {
 // ---------------------------------------------------------------------------
 // P2P player pane helpers
 // ---------------------------------------------------------------------------
-
-/// Renders the "Requesting…" state — empty pulsing gauge + status line.
-fn render_p2p_requesting(peer_nick: &str, _width: u16, frame: &mut Frame, area: Rect) {
-    let [names_area, gauge_area, time_vol_area] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-
-    let info_lines = vec![
-        Line::styled("Connecting…", Style::default().fg(Color::White).bold()),
-        Line::styled(
-            format!("Requesting from @{peer_nick}"),
-            Style::default().fg(super::CLR_DIM),
-        ),
-        Line::default(),
-    ];
-    frame.render_widget(Paragraph::new(info_lines), names_area);
-
-    // Empty gauge in accent colour to indicate activity.
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(super::CLR_ACCENT).bg(Color::DarkGray))
-        .ratio(0.0);
-    frame.render_widget(gauge, gauge_area);
-
-    let status = Paragraph::new(format!("Waiting for @{peer_nick}…"))
-        .style(Style::default().fg(super::CLR_DIM))
-        .alignment(Alignment::Center);
-    frame.render_widget(status, time_vol_area);
-}
-
-/// Renders the "Buffering…" state — download progress gauge + byte counter.
-fn render_p2p_buffering(
-    peer_nick: &str,
-    received: u64,
-    total: u64,
-    stalled: bool,
-    _width: u16,
-    frame: &mut Frame,
-    area: Rect,
-) {
-    let [names_area, gauge_area, time_vol_area] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-
-    let pct = if total > 0 { received as f64 / total as f64 } else { 0.0 };
-
-    let info_lines = vec![
-        Line::styled(
-            if stalled { "⚠ Stalled" } else { "Buffering…" },
-            Style::default()
-                .fg(if stalled { Color::Yellow } else { Color::White })
-                .bold(),
-        ),
-        Line::styled(
-            format!("from @{peer_nick}"),
-            Style::default().fg(super::CLR_DIM),
-        ),
-        Line::default(),
-    ];
-    frame.render_widget(Paragraph::new(info_lines), names_area);
-
-    let gauge_color = if stalled { Color::Yellow } else { super::CLR_ACCENT };
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
-        .ratio(pct.clamp(0.0, 1.0));
-    frame.render_widget(gauge, gauge_area);
-
-    let recv_mb = received as f64 / (1024.0 * 1024.0);
-    let total_mb = total as f64 / (1024.0 * 1024.0);
-    let stall_prefix = if stalled { "⚠ Stalled  " } else { "" };
-    let status = Paragraph::new(format!(
-        "{stall_prefix}{:.1} MB / {:.1} MB  ({:.0}%)",
-        recv_mb, total_mb, pct * 100.0,
-    ))
-    .style(Style::default().fg(if stalled { Color::Yellow } else { super::CLR_DIM }))
-    .alignment(Alignment::Center);
-    frame.render_widget(status, time_vol_area);
-}
 
 // ---------------------------------------------------------------------------
 // Badge helper (playlist + tag badges for library rows)

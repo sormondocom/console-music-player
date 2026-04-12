@@ -28,7 +28,7 @@ use tokio::time;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::p2p::transfer::{sha256_hex, InboundTransfer, CHUNK_SIZE};
+use crate::p2p::transfer::{sha256_hex, InboundTransfer, CHUNK_SIZE, MAX_CHUNK_RETRIES};
 
 use libp2p::mdns;
 
@@ -138,6 +138,9 @@ pub struct MusicNode {
     /// Pre-serialised gossipsub payloads for an outbound track transfer.
     /// Drained one-per-select!-iteration so incoming swarm events interleave.
     outbound_queue: VecDeque<Vec<u8>>,
+    /// Active outbound transfers: transfer_id → (file_path, sha256_hex).
+    /// Kept alive after AcceptTrackRequest so ChunkNack retries can re-read chunks.
+    active_outbound: HashMap<Uuid, (PathBuf, String)>,
 }
 
 impl MusicNode {
@@ -192,6 +195,7 @@ impl MusicNode {
             beacon_rx,
             partial_catalogs: HashMap::new(),
             outbound_queue: VecDeque::new(),
+            active_outbound: HashMap::new(),
         };
 
         tokio::spawn(async move {
@@ -477,12 +481,15 @@ impl MusicNode {
                     if ok {
                         match self.serialise_kind(MusicKind::TrackComplete {
                             transfer_id,
-                            sha256,
+                            sha256: sha256.clone(),
                         }) {
                             Ok(p)  => payloads.push(p),
                             Err(e) => warn!(%transfer_id, "TrackComplete serialise: {e}"),
                         }
                     }
+
+                    // Keep path + hash alive for potential ChunkNack retries.
+                    self.active_outbound.insert(transfer_id, (path, sha256));
 
                     // Enqueue; the select! drain arm publishes one per iteration.
                     self.outbound_queue.extend(payloads);
@@ -958,10 +965,13 @@ impl MusicNode {
                     let inbound = InboundTransfer::new(track.clone(), total_chunks);
                     self.inbound_transfers.insert(transfer_id, inbound);
                     // Signal the UI to transition Requesting → Buffering.
+                    // Pass track metadata on this first event so the player
+                    // pane can show title/artist while downloading.
                     let _ = self.event_tx.send(P2pEvent::TrackBufferProgress {
                         transfer_id,
                         received: 0,
                         total: track.file_size,
+                        track: Some(track),
                     }).ok();
                 }
             }
@@ -975,13 +985,52 @@ impl MusicNode {
                         transfer_id,
                         received,
                         total,
+                        track: None,
                     }).ok();
                 }
             }
 
             MusicKind::TrackComplete { transfer_id, sha256 } => {
                 if let Some(mut inbound) = self.inbound_transfers.remove(&transfer_id) {
-                    inbound.expected_hash = Some(sha256);
+                    inbound.expected_hash = Some(sha256.clone());
+
+                    // Check for missing chunks before attempting assembly.
+                    let missing = inbound.missing_indices();
+                    if !missing.is_empty() {
+                        let retry = inbound.retry_count + 1;
+                        if retry <= MAX_CHUNK_RETRIES {
+                            let missing_len = missing.len();
+                            warn!(%transfer_id, missing_len, retry, "TrackComplete with missing chunks — sending ChunkNack");
+                            let _ = self.event_tx.send(P2pEvent::Info(format!(
+                                "Re-requesting {missing_len} missing chunk{} (retry {retry}/{MAX_CHUNK_RETRIES})…",
+                                if missing_len == 1 { "" } else { "s" },
+                            ))).ok();
+                            inbound.retry_count = retry;
+                            // Put the transfer back so arriving chunks still accumulate.
+                            self.inbound_transfers.insert(transfer_id, inbound);
+                            if let Err(e) = self.publish(MusicKind::ChunkNack {
+                                transfer_id,
+                                missing_indices: missing,
+                                retry,
+                            }).await {
+                                warn!(%transfer_id, "ChunkNack publish failed: {e}");
+                            }
+                        } else {
+                            warn!(%transfer_id, "max retries exceeded — transfer failed");
+                            let reason = format!(
+                                "{missing_len} chunk{} missing after {MAX_CHUNK_RETRIES} retries",
+                                if missing.len() == 1 { "" } else { "s" },
+                                missing_len = missing.len(),
+                            );
+                            let _ = self.event_tx.send(P2pEvent::TrackTransferFailed {
+                                transfer_id,
+                                reason,
+                            }).ok();
+                        }
+                        return;
+                    }
+
+                    // All chunks present — assemble and verify.
                     match inbound.assemble() {
                         Ok(bytes) => {
                             let _ = self.event_tx.send(P2pEvent::TrackBufferReady {
@@ -991,7 +1040,8 @@ impl MusicNode {
                             }).ok();
                         }
                         Err(reason) => {
-                            warn!(%transfer_id, %reason, "track assembly failed");
+                            // Hash mismatch — not a missing-chunk problem, can't retry.
+                            warn!(%transfer_id, %reason, "track integrity check failed");
                             let _ = self.event_tx.send(P2pEvent::TrackTransferFailed {
                                 transfer_id,
                                 reason,
@@ -1001,8 +1051,71 @@ impl MusicNode {
                 }
             }
 
+            MusicKind::ChunkNack { transfer_id, missing_indices, retry } if verified => {
+                // A peer is asking us to resend specific chunks for a transfer we sent.
+                if let Some((path, sha256)) = self.active_outbound.get(&transfer_id).cloned() {
+                    let missing_len = missing_indices.len();
+                    info!(%transfer_id, missing_len, retry, "ChunkNack — re-queuing missing chunks");
+                    let _ = self.event_tx.send(P2pEvent::Info(format!(
+                        "Re-sending {missing_len} missing chunk{} for peer (retry {retry}/{MAX_CHUNK_RETRIES})…",
+                        if missing_len == 1 { "" } else { "s" },
+                    ))).ok();
+
+                    // Re-read the file (it may have been evicted from OS cache).
+                    match tokio::fs::read(&path).await {
+                        Ok(bytes) => {
+                            let chunk_data: Vec<&[u8]> = bytes.chunks(CHUNK_SIZE).collect();
+                            let total = chunk_data.len() as u32;
+                            let mut ok = true;
+
+                            for index in &missing_indices {
+                                if let Some(chunk) = chunk_data.get(*index as usize) {
+                                    match self.serialise_kind(MusicKind::TrackChunk {
+                                        transfer_id,
+                                        index: *index,
+                                        total,
+                                        encrypted_data: chunk.to_vec(),
+                                    }) {
+                                        Ok(p)  => self.outbound_queue.push_back(p),
+                                        Err(e) => {
+                                            warn!(%transfer_id, index, "ChunkNack resend serialise failed: {e}");
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    warn!(%transfer_id, index, "ChunkNack: index out of range — ignoring");
+                                }
+                            }
+
+                            // Re-send TrackComplete so the receiver can re-check.
+                            if ok {
+                                if let Ok(p) = self.serialise_kind(MusicKind::TrackComplete {
+                                    transfer_id,
+                                    sha256: sha256.clone(),
+                                }) {
+                                    self.outbound_queue.push_back(p);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%transfer_id, "ChunkNack resend: file read failed: {e}");
+                            let _ = self.publish(MusicKind::TrackDecline {
+                                transfer_id,
+                                reason: format!("retry read error: {e}"),
+                            }).await;
+                            self.active_outbound.remove(&transfer_id);
+                        }
+                    }
+                } else {
+                    debug!(%transfer_id, "ChunkNack for unknown transfer — ignoring");
+                }
+            }
+
             MusicKind::TrackDecline { transfer_id, reason } => {
                 self.inbound_transfers.remove(&transfer_id);
+                // Clean up any outbound state too (e.g. if both sides gave up).
+                self.active_outbound.remove(&transfer_id);
                 let _ = self.event_tx.send(P2pEvent::TrackTransferFailed {
                     transfer_id,
                     reason,

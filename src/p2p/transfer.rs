@@ -24,6 +24,9 @@ pub const CHUNK_SIZE: usize = 64 * 1024;
 // InboundTransfer — per-transfer receive state
 // ---------------------------------------------------------------------------
 
+/// Maximum number of `ChunkNack` retries before the transfer is abandoned.
+pub const MAX_CHUNK_RETRIES: u32 = 3;
+
 /// State for an inbound track transfer being assembled in RAM.
 ///
 /// Chunks are stored by index until all arrive, then assembled and
@@ -35,6 +38,8 @@ pub struct InboundTransfer {
     chunks: HashMap<u32, Vec<u8>>,
     /// Expected SHA-256 hex digest; set when `TrackComplete` arrives.
     pub expected_hash: Option<String>,
+    /// How many `ChunkNack` retries have been sent for this transfer.
+    pub retry_count: u32,
 }
 
 impl InboundTransfer {
@@ -44,6 +49,7 @@ impl InboundTransfer {
             total_chunks,
             chunks: HashMap::new(),
             expected_hash: None,
+            retry_count: 0,
         }
     }
 
@@ -60,6 +66,13 @@ impl InboundTransfer {
     /// `true` when every expected chunk has arrived.
     pub fn is_complete(&self) -> bool {
         self.chunks.len() as u32 == self.total_chunks
+    }
+
+    /// Returns indices of chunks that have not yet been received.
+    pub fn missing_indices(&self) -> Vec<u32> {
+        (0..self.total_chunks)
+            .filter(|i| !self.chunks.contains_key(i))
+            .collect()
     }
 
     /// Assemble chunks in index order and verify SHA-256 integrity.

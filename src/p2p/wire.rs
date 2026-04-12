@@ -240,6 +240,15 @@ pub enum MusicKind {
         /// Lowercase hex SHA-256 of the plaintext audio bytes.
         sha256: String,
     },
+    /// Receiver reports missing chunks after `TrackComplete` — requests a resend.
+    /// The sender re-queues only the listed indices and a fresh `TrackComplete`.
+    ChunkNack {
+        transfer_id: Uuid,
+        /// Zero-based indices of the chunks that were not received.
+        missing_indices: Vec<u32>,
+        /// How many retries have been attempted so far (starts at 1).
+        retry: u32,
+    },
     /// Sender declines a transfer request.
     TrackDecline {
         transfer_id: Uuid,

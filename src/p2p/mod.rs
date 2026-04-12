@@ -109,10 +109,14 @@ pub enum P2pEvent {
         requester_fp: String,
     },
     /// Progress update while buffering a remote track.
+    /// `track` is `Some` only on the first event (when `received == 0`).
     TrackBufferProgress {
         transfer_id: Uuid,
         received: u64,
         total: u64,
+        /// Track metadata — present on the first event so the UI can show
+        /// title/artist while the download is in progress.
+        track: Option<RemoteTrack>,
     },
     /// The in-memory buffer is complete; bytes are ready for playback.
     /// The bytes are wrapped in `Zeroizing` so they are wiped from memory
@@ -231,6 +235,8 @@ pub enum P2pBufferState {
     Buffering {
         transfer_id: Uuid,
         peer_nick: String,
+        track_title: String,
+        track_artist: String,
         received: u64,
         total: u64,
         /// True when no chunk has arrived for more than `STALL_THRESHOLD`.
