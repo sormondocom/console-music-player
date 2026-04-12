@@ -13,6 +13,7 @@ mod party_line;
 mod playlists;
 mod remote_library;
 mod repair;
+mod settings;
 mod sources;
 mod transfer;
 
@@ -119,6 +120,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         Screen::P2pConnect    => overlays::render_p2p_connect_screen(app, frame, body_area),
         Screen::RemoteLibrary => remote_library::render_remote_library(app, frame, body_area),
         Screen::PartyLine     => party_line::render_party_line(app, frame, body_area),
+        Screen::Settings      => settings::render_settings(app, frame, body_area),
     }
 
     // Tag edit overlay — floats above whatever screen is active.
@@ -221,6 +223,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             Screen::P2pConnect    => " Paste a peer address and press Enter to connect  [Esc] Cancel",
             Screen::RemoteLibrary => " [↑↓/PgUp/Dn] Navigate  [Enter] Stream  [P] Pause  [[] Vol-  []] Vol+  [N] Nominate  [Esc] Back",
             Screen::PartyLine     => " [↑↓] Navigate  [Y] Vote Yes  [N] Vote No  [Esc] Back",
+            Screen::Settings      => " [↑↓] Navigate  [Enter/F2] Edit  [S] Save & reload  [Esc] Back",
         }
     };
 

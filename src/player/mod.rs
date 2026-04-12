@@ -363,9 +363,17 @@ impl Player {
 
         // Cursor<Vec<u8>> implements Read + Seek — symphonia is happy with it.
         let cursor = std::io::Cursor::new(bytes.to_vec());
-        let source = rodio::Decoder::new(cursor)
-            .map_err(|e| format!("Cannot decode remote track '{}': {e}", track.title))?
-            .convert_samples::<f32>();
+        let decoder = rodio::Decoder::new(cursor)
+            .map_err(|e| format!("Cannot decode remote track '{}': {e}", track.title))?;
+
+        // Extract duration from the decoder before consuming it — this gives us
+        // an accurate duration even when the catalog metadata had None.
+        let decoded_duration_secs: Option<u32> = decoder
+            .total_duration()
+            .map(|d| d.as_secs() as u32)
+            .filter(|&s| s > 0);
+
+        let source = decoder.convert_samples::<f32>();
 
         sink.set_volume(self.volume);
         sink.append(SampleCapture::new(
@@ -374,9 +382,16 @@ impl Player {
             self.decoder_panic_flag.clone(),
         ));
 
+        // Use decoder-reported duration as fallback when catalog metadata is absent.
+        if track.duration_secs.is_none() || track.duration_secs == Some(0) {
+            let mut track = track;
+            track.duration_secs = decoded_duration_secs;
+            self.current_remote = Some(track);
+        } else {
+            self.current_remote = Some(track);
+        }
         self.sink = Some(sink);
-        self.current_track  = None;  // clear local track
-        self.current_remote = Some(track);
+        self.current_track = None;  // clear local track
         self.state = PlaybackState::Playing;
         self.started_at = Some(Instant::now());
         self.elapsed_before_pause = Duration::ZERO;
@@ -486,10 +501,17 @@ impl Player {
     /// Progress 0.0..=1.0 based on track duration metadata.
     pub fn progress(&self) -> f64 {
         let duration_secs = self
-            .current_track
+            .current_remote
             .as_ref()
             .and_then(|t| t.duration_secs)
-            .unwrap_or(0) as f64;
+            .map(|s| s as f64)
+            .or_else(|| {
+                self.current_track
+                    .as_ref()
+                    .and_then(|t| t.duration_secs)
+                    .map(|s| s as f64)
+            })
+            .unwrap_or(0.0);
 
         if duration_secs == 0.0 {
             return 0.0;

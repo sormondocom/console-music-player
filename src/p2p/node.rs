@@ -28,7 +28,7 @@ use tokio::time;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::p2p::transfer::{sha256_hex, InboundTransfer, CHUNK_SIZE, MAX_CHUNK_RETRIES};
+use crate::p2p::transfer::{sha256_hex, InboundTransfer, CHUNK_SIZE};
 
 use libp2p::mdns;
 
@@ -141,6 +141,12 @@ pub struct MusicNode {
     /// Active outbound transfers: transfer_id → (file_path, sha256_hex).
     /// Kept alive after AcceptTrackRequest so ChunkNack retries can re-read chunks.
     active_outbound: HashMap<Uuid, (PathBuf, String)>,
+    /// Maximum ChunkNack retries before a transfer is abandoned (from config).
+    chunk_retries: u32,
+    /// Seconds without a chunk before flagging a transfer as stalled.
+    stall_secs: u64,
+    /// Seconds after stall before abandoning the transfer entirely.
+    abandon_secs: u64,
 }
 
 impl MusicNode {
@@ -153,6 +159,9 @@ impl MusicNode {
         identity: PgpIdentity,
         bootstrap_peers: Vec<(PeerId, Multiaddr)>,
         listen_port: Option<u16>,
+        chunk_retries: u32,
+        stall_secs: u64,
+        abandon_secs: u64,
         cmd_rx:   UnboundedReceiver<P2pCommand>,
         event_tx: UnboundedSender<P2pEvent>,
     ) -> anyhow::Result<()> {
@@ -196,6 +205,9 @@ impl MusicNode {
             partial_catalogs: HashMap::new(),
             outbound_queue: VecDeque::new(),
             active_outbound: HashMap::new(),
+            chunk_retries,
+            stall_secs,
+            abandon_secs,
         };
 
         tokio::spawn(async move {
@@ -998,11 +1010,12 @@ impl MusicNode {
                     let missing = inbound.missing_indices();
                     if !missing.is_empty() {
                         let retry = inbound.retry_count + 1;
-                        if retry <= MAX_CHUNK_RETRIES {
+                        let max_retries = self.chunk_retries;
+                        if retry <= max_retries {
                             let missing_len = missing.len();
                             warn!(%transfer_id, missing_len, retry, "TrackComplete with missing chunks — sending ChunkNack");
                             let _ = self.event_tx.send(P2pEvent::Info(format!(
-                                "Re-requesting {missing_len} missing chunk{} (retry {retry}/{MAX_CHUNK_RETRIES})…",
+                                "Re-requesting {missing_len} missing chunk{} (retry {retry}/{max_retries})…",
                                 if missing_len == 1 { "" } else { "s" },
                             ))).ok();
                             inbound.retry_count = retry;
@@ -1016,11 +1029,11 @@ impl MusicNode {
                                 warn!(%transfer_id, "ChunkNack publish failed: {e}");
                             }
                         } else {
-                            warn!(%transfer_id, "max retries exceeded — transfer failed");
+                            let missing_len = missing.len();
+                            warn!(%transfer_id, "max retries ({max_retries}) exceeded — transfer failed");
                             let reason = format!(
-                                "{missing_len} chunk{} missing after {MAX_CHUNK_RETRIES} retries",
-                                if missing.len() == 1 { "" } else { "s" },
-                                missing_len = missing.len(),
+                                "{missing_len} chunk{} missing after {max_retries} retries",
+                                if missing_len == 1 { "" } else { "s" },
                             );
                             let _ = self.event_tx.send(P2pEvent::TrackTransferFailed {
                                 transfer_id,
@@ -1057,8 +1070,9 @@ impl MusicNode {
                     let missing_len = missing_indices.len();
                     info!(%transfer_id, missing_len, retry, "ChunkNack — re-queuing missing chunks");
                     let _ = self.event_tx.send(P2pEvent::Info(format!(
-                        "Re-sending {missing_len} missing chunk{} for peer (retry {retry}/{MAX_CHUNK_RETRIES})…",
+                        "Re-sending {missing_len} missing chunk{} for peer (retry {retry}/{})…",
                         if missing_len == 1 { "" } else { "s" },
+                        self.chunk_retries,
                     ))).ok();
 
                     // Re-read the file (it may have been evicted from OS cache).

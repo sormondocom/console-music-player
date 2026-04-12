@@ -65,6 +65,25 @@ pub enum Screen {
     RemoteLibrary,
     /// Party Line — nominate and vote on tracks for group playback.  (Beta)
     PartyLine,
+    /// Configuration editor — live-editable settings with hot-reload.
+    Settings,
+}
+
+// ---------------------------------------------------------------------------
+// Settings state
+// ---------------------------------------------------------------------------
+
+/// A single editable settings field shown on the Settings screen.
+#[derive(Debug, Clone)]
+pub struct SettingsField {
+    /// Human-readable label shown in the left column.
+    pub label: &'static str,
+    /// Brief description shown below the value when this field is focused.
+    pub description: &'static str,
+    /// The current value as an editable string.
+    pub value: String,
+    /// The config key this field maps to.
+    pub key: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +547,20 @@ pub struct App {
     pub p2p_key_seq: Vec<char>,
     /// Timestamp of the first key in the current P2P chord sequence.
     pub p2p_key_seq_time: Option<std::time::Instant>,
+
+    // --- settings (hot-reloadable) ---
+    /// Seconds without a chunk before flagging stalled (from config).
+    pub p2p_stall_secs: u64,
+    /// Seconds after stall before abandoning transfer (from config).
+    pub p2p_abandon_secs: u64,
+
+    // --- settings screen state ---
+    /// Settings fields being edited: Vec of (label, current_value_string).
+    pub settings_fields: Vec<SettingsField>,
+    /// Which settings field is currently focused.
+    pub settings_selected: usize,
+    /// True when the focused settings field is in inline-edit mode.
+    pub settings_editing: bool,
 }
 
 impl App {
@@ -592,6 +625,11 @@ impl App {
             p2p_listen_addrs: Vec::new(),
             p2p_key_seq: Vec::new(),
             p2p_key_seq_time: None,
+            p2p_stall_secs: 5,
+            p2p_abandon_secs: 30,
+            settings_fields: Vec::new(),
+            settings_selected: 0,
+            settings_editing: false,
         };
         app.rescan();
         app.rebuild_playlist_membership();
@@ -1867,7 +1905,20 @@ impl App {
                     })
                     .collect();
 
-                match MusicNode::spawn(identity, bootstrap_peers, cfg.p2p_listen_port, channels.cmd_rx, channels.event_tx) {
+                // Apply live-reloadable config values.
+                self.p2p_stall_secs   = cfg.p2p_stall_secs;
+                self.p2p_abandon_secs = cfg.p2p_abandon_secs;
+
+                match MusicNode::spawn(
+                    identity,
+                    bootstrap_peers,
+                    cfg.p2p_listen_port,
+                    cfg.p2p_chunk_retries,
+                    cfg.p2p_stall_secs,
+                    cfg.p2p_abandon_secs,
+                    channels.cmd_rx,
+                    channels.event_tx,
+                ) {
                     Ok(()) => {
                         // Broadcast library catalog immediately after activation
                         let catalog = crate::p2p::catalog::build_catalog(&self.library);
@@ -1906,6 +1957,127 @@ impl App {
         self.status_message = Some("P2P disconnected.".into());
     }
 
+    /// Open the Settings screen, populating fields from `cfg`.
+    pub fn open_settings(&mut self, cfg: &crate::config::Config) {
+        self.settings_fields = vec![
+            SettingsField {
+                label: "Chunk retries",
+                description: "How many times a receiver retries missing chunks before giving up (default: 5)",
+                value: cfg.p2p_chunk_retries.to_string(),
+                key: "p2p_chunk_retries",
+            },
+            SettingsField {
+                label: "Beacon interval (s)",
+                description: "LAN beacon broadcast interval in seconds — lower = faster discovery (default: 2)",
+                value: cfg.p2p_beacon_interval_secs.to_string(),
+                key: "p2p_beacon_interval_secs",
+            },
+            SettingsField {
+                label: "mDNS interval (s)",
+                description: "mDNS probe interval in seconds (default: 30)",
+                value: cfg.p2p_mdns_interval_secs.to_string(),
+                key: "p2p_mdns_interval_secs",
+            },
+            SettingsField {
+                label: "Stall threshold (s)",
+                description: "Seconds without a chunk before a transfer is flagged as stalled (default: 5)",
+                value: cfg.p2p_stall_secs.to_string(),
+                key: "p2p_stall_secs",
+            },
+            SettingsField {
+                label: "Abandon timeout (s)",
+                description: "Seconds after stall before a transfer is abandoned entirely (default: 30)",
+                value: cfg.p2p_abandon_secs.to_string(),
+                key: "p2p_abandon_secs",
+            },
+            SettingsField {
+                label: "P2P listen port",
+                description: "Fixed TCP/UDP port for P2P (0 = random). Requires restart to take effect.",
+                value: cfg.p2p_listen_port.unwrap_or(0).to_string(),
+                key: "p2p_listen_port",
+            },
+        ];
+        self.settings_selected = 0;
+        self.screen = Screen::Settings;
+    }
+
+    /// Parse settings fields back into `cfg`, save to disk, and hot-reload
+    /// values that can be applied without a restart.
+    /// Returns a human-readable summary of what changed.
+    pub fn apply_settings(&mut self, cfg: &mut crate::config::Config) -> String {
+        let mut changed: Vec<String> = Vec::new();
+
+        for field in &self.settings_fields {
+            match field.key {
+                "p2p_chunk_retries" => {
+                    if let Ok(v) = field.value.trim().parse::<u32>() {
+                        let v = v.max(1);
+                        if cfg.p2p_chunk_retries != v {
+                            cfg.p2p_chunk_retries = v;
+                            changed.push(format!("chunk retries → {v}"));
+                        }
+                    }
+                }
+                "p2p_beacon_interval_secs" => {
+                    if let Ok(v) = field.value.trim().parse::<u64>() {
+                        let v = v.max(1);
+                        if cfg.p2p_beacon_interval_secs != v {
+                            cfg.p2p_beacon_interval_secs = v;
+                            changed.push(format!("beacon interval → {v}s"));
+                        }
+                    }
+                }
+                "p2p_mdns_interval_secs" => {
+                    if let Ok(v) = field.value.trim().parse::<u64>() {
+                        let v = v.max(1);
+                        if cfg.p2p_mdns_interval_secs != v {
+                            cfg.p2p_mdns_interval_secs = v;
+                            changed.push(format!("mDNS interval → {v}s"));
+                        }
+                    }
+                }
+                "p2p_stall_secs" => {
+                    if let Ok(v) = field.value.trim().parse::<u64>() {
+                        let v = v.max(1);
+                        if cfg.p2p_stall_secs != v {
+                            cfg.p2p_stall_secs = v;
+                            self.p2p_stall_secs = v;  // hot-reload
+                            changed.push(format!("stall threshold → {v}s"));
+                        }
+                    }
+                }
+                "p2p_abandon_secs" => {
+                    if let Ok(v) = field.value.trim().parse::<u64>() {
+                        let v = v.max(1);
+                        if cfg.p2p_abandon_secs != v {
+                            cfg.p2p_abandon_secs = v;
+                            self.p2p_abandon_secs = v;  // hot-reload
+                            changed.push(format!("abandon timeout → {v}s"));
+                        }
+                    }
+                }
+                "p2p_listen_port" => {
+                    if let Ok(v) = field.value.trim().parse::<u16>() {
+                        let new_port = if v == 0 { None } else { Some(v) };
+                        if cfg.p2p_listen_port != new_port {
+                            cfg.p2p_listen_port = new_port;
+                            changed.push(format!("listen port → {} (restart required)", v));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        cfg.save();
+
+        if changed.is_empty() {
+            "Settings unchanged.".into()
+        } else {
+            format!("Saved: {}", changed.join(", "))
+        }
+    }
+
     /// Push a toast notification onto the queue.
     pub fn push_toast(&mut self, toast: Toast) {
         // Keep at most 5 toasts — drop oldest if full.
@@ -1942,18 +2114,18 @@ impl App {
         }
 
         // Stall detection for in-progress buffer.
-        const STALL_SECS: u64 = 5;
-        const ABANDON_SECS: u64 = 30;
+        let stall_secs   = self.p2p_stall_secs;
+        let abandon_secs = self.p2p_abandon_secs;
         if let P2pBufferState::Buffering { stalled, stalled_since, last_chunk_at, transfer_id, peer_nick, .. } =
             &mut self.p2p_buffer_state
         {
             let elapsed = last_chunk_at.elapsed().as_secs();
-            if elapsed >= STALL_SECS && !*stalled {
+            if elapsed >= stall_secs && !*stalled {
                 *stalled = true;
                 *stalled_since = Some(std::time::Instant::now());
             }
             if let Some(since) = stalled_since {
-                if since.elapsed().as_secs() >= ABANDON_SECS {
+                if since.elapsed().as_secs() >= abandon_secs {
                     let tid = *transfer_id;
                     let nick = peer_nick.clone();
                     self.p2p_buffer_state = P2pBufferState::Idle;

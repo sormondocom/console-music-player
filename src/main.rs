@@ -291,6 +291,16 @@ async fn run_event_loop(
                     continue;
                 }
 
+                // F9 — open Settings from any screen (except input overlays).
+                if key.code == KeyCode::F(9)
+                    && !matches!(app.screen, Screen::Settings)
+                    && app.search_state.is_none()
+                    && app.tag_edit_state.is_none()
+                {
+                    app.open_settings(cfg);
+                    continue;
+                }
+
                 // Don't wipe status while the user is typing
                 let is_input_screen = matches!(
                     app.screen,
@@ -376,6 +386,7 @@ fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
         }),
         Screen::RemoteLibrary   => handle_remote_library_key(app, key),
         Screen::PartyLine       => handle_party_line_key(app, key),
+        Screen::Settings        => handle_settings_key(app, key, cfg),
     }
 }
 
@@ -1176,6 +1187,59 @@ fn persist_sources(app: &App) {
     let mut cfg = Config::load();
     cfg.source_dirs = app.source_dirs.clone();
     cfg.save();
+}
+
+fn handle_settings_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
+    if app.settings_editing {
+        // In-field edit mode — only text input and confirm/cancel.
+        match key {
+            KeyCode::Esc => {
+                // Cancel edit: reload from cfg.
+                app.settings_editing = false;
+                app.open_settings(cfg);
+            }
+            KeyCode::Enter => {
+                app.settings_editing = false;
+            }
+            KeyCode::Backspace => {
+                if let Some(f) = app.settings_fields.get_mut(app.settings_selected) {
+                    f.value.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(f) = app.settings_fields.get_mut(app.settings_selected) {
+                    f.value.push(c);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Navigation mode.
+    match key {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+            app.screen = Screen::Library;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.settings_selected = app.settings_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !app.settings_fields.is_empty() {
+                app.settings_selected =
+                    (app.settings_selected + 1).min(app.settings_fields.len() - 1);
+            }
+        }
+        KeyCode::Enter | KeyCode::F(2) => {
+            app.settings_editing = true;
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            let msg = app.apply_settings(cfg);
+            app.status_message = Some(msg);
+            app.screen = Screen::Library;
+        }
+        _ => {}
+    }
 }
 
 fn refresh_devices(app: &mut App) {

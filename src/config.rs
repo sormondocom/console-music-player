@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     /// Directories scanned for music files.
     pub source_dirs: Vec<PathBuf>,
@@ -42,6 +42,56 @@ pub struct Config {
     /// If absent or 0, a random port is assigned each session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2p_listen_port: Option<u16>,
+
+    // ── Tunable settings ─────────────────────────────────────────────────────
+    /// How many times a receiver retries missing chunks before giving up.
+    /// Default: 5.
+    #[serde(default = "default_chunk_retries")]
+    pub p2p_chunk_retries: u32,
+
+    /// LAN beacon broadcast interval in seconds.  Lower = faster discovery,
+    /// higher = less broadcast noise.  Default: 2.
+    #[serde(default = "default_beacon_interval_secs")]
+    pub p2p_beacon_interval_secs: u64,
+
+    /// mDNS probe interval in seconds.  Default: 30.
+    #[serde(default = "default_mdns_interval_secs")]
+    pub p2p_mdns_interval_secs: u64,
+
+    /// Seconds of inactivity before a stalled chunk transfer is flagged.
+    /// Default: 5.
+    #[serde(default = "default_stall_secs")]
+    pub p2p_stall_secs: u64,
+
+    /// Seconds after stall before a transfer is abandoned entirely.
+    /// Default: 30.
+    #[serde(default = "default_abandon_secs")]
+    pub p2p_abandon_secs: u64,
+}
+
+fn default_chunk_retries()      -> u32 { 5 }
+fn default_beacon_interval_secs() -> u64 { 2 }
+fn default_mdns_interval_secs() -> u64 { 30 }
+fn default_stall_secs()         -> u64 { 5 }
+fn default_abandon_secs()       -> u64 { 30 }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            source_dirs:              Vec::new(),
+            p2p_identity_armored:     None,
+            p2p_identity_passphrase:  None,
+            p2p_nickname:             None,
+            p2p_trusted_peers:        Vec::new(),
+            p2p_bootstrap_peers:      Vec::new(),
+            p2p_listen_port:          None,
+            p2p_chunk_retries:        default_chunk_retries(),
+            p2p_beacon_interval_secs: default_beacon_interval_secs(),
+            p2p_mdns_interval_secs:   default_mdns_interval_secs(),
+            p2p_stall_secs:           default_stall_secs(),
+            p2p_abandon_secs:         default_abandon_secs(),
+        }
+    }
 }
 
 /// A trusted peer persisted across sessions.
