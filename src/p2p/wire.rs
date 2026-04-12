@@ -206,10 +206,13 @@ pub enum MusicKind {
     /// Response to a `CatalogRequest` — full catalog, possibly paginated.
     CatalogResponse {
         tracks: Vec<RemoteTrack>,
-        /// Page index (0-based); `None` if not paginated.
-        page: Option<u32>,
-        /// Total page count; `None` if not paginated.
-        total_pages: Option<u32>,
+        /// Page index (0-based).
+        page: u32,
+        /// Total number of pages.
+        total_pages: u32,
+        /// Exact total track count across all pages — receiver flushes when
+        /// accumulated tracks reach this number, regardless of page order.
+        total_tracks: u32,
     },
 
     // ── Track streaming (3-way handshake) ────────────────────────────────

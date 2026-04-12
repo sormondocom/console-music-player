@@ -849,28 +849,38 @@ impl MusicNode {
 
             MusicKind::CatalogRequest if verified => {
                 if self.keystore.get_by_fingerprint(&sender_fp).is_some() {
-                    let catalog = self.local_catalog.clone();
-                    let total = catalog.len();
-                    let pages: Vec<&[RemoteTrack]> = catalog.chunks(CATALOG_PAGE_SIZE).collect();
-                    let total_pages = pages.len() as u32;
+                    let catalog     = self.local_catalog.clone();
+                    let total       = catalog.len() as u32;
+                    let page_slices: Vec<Vec<RemoteTrack>> = catalog
+                        .chunks(CATALOG_PAGE_SIZE)
+                        .map(|s| s.to_vec())
+                        .collect();
+                    let total_pages = page_slices.len() as u32;
 
-                    info!(%sender_nick, total, total_pages, "sending catalog");
+                    info!(%sender_nick, total, total_pages, "queuing catalog for send");
                     let _ = self.event_tx.send(P2pEvent::Info(format!(
                         "Sending catalog to {sender_nick} ({total} tracks, {total_pages} page{})…",
                         if total_pages == 1 { "" } else { "s" }
                     ))).ok();
 
-                    for (i, page_tracks) in pages.iter().enumerate() {
-                        if let Err(e) = self.publish(MusicKind::CatalogResponse {
-                            tracks: page_tracks.to_vec(),
-                            page: Some(i as u32),
-                            total_pages: Some(total_pages),
-                        }).await {
-                            warn!(page = i, "catalog page send failed: {e}");
-                            let _ = self.event_tx.send(P2pEvent::Warning(format!(
-                                "Catalog page {} of {total_pages} failed to send: {e}", i + 1
-                            ))).ok();
-                            break;
+                    // Pre-serialize all pages into the outbound queue so the
+                    // swarm event loop is not blocked between page sends.
+                    for (i, page_tracks) in page_slices.into_iter().enumerate() {
+                        match self.serialise_kind(MusicKind::CatalogResponse {
+                            tracks: page_tracks,
+                            page: i as u32,
+                            total_pages,
+                            total_tracks: total,
+                        }) {
+                            Ok(payload) => self.outbound_queue.push_back(payload),
+                            Err(e) => {
+                                warn!(page = i, "catalog page serialise failed: {e}");
+                                let _ = self.event_tx.send(P2pEvent::Warning(format!(
+                                    "Catalog page {} of {total_pages} could not be serialised: {e}",
+                                    i + 1
+                                ))).ok();
+                                break;
+                            }
                         }
                     }
                 } else {
@@ -878,37 +888,37 @@ impl MusicNode {
                 }
             }
 
-            MusicKind::CatalogResponse { tracks, page, total_pages } if verified => {
-                let page_num  = page.unwrap_or(0);
-                let total_pgs = total_pages.unwrap_or(1);
-                let page_len  = tracks.len();
+            MusicKind::CatalogResponse { tracks, page, total_pages, total_tracks } if verified => {
+                let page_len   = tracks.len();
+                let expected   = total_tracks as usize;
 
-                info!(%sender_nick, page_num, total_pgs, page_len, "catalog page received");
+                info!(%sender_nick, page, total_pages, page_len, expected, "catalog page received");
 
-                // Accumulate pages.
+                // Accumulate regardless of arrival order.
                 let acc = self.partial_catalogs
                     .entry(sender_fp.clone())
                     .or_default();
                 acc.extend(tracks);
 
-                if page_num + 1 < total_pgs {
-                    // More pages coming — report progress.
-                    let received = acc.len();
+                let received = acc.len();
+
+                if received < expected {
+                    // Still waiting for more pages — report progress.
                     let _ = self.event_tx.send(P2pEvent::Info(format!(
-                        "Receiving catalog from {sender_nick}: page {} of {total_pgs} ({received} tracks so far)…",
-                        page_num + 1,
+                        "Receiving catalog from {sender_nick}: {received}/{expected} tracks (page {} of {total_pages})…",
+                        page + 1,
                     ))).ok();
                 } else {
-                    // Final page — flush the accumulator.
+                    // All tracks received — flush the accumulator.
                     let mut owned = self.partial_catalogs.remove(&sender_fp).unwrap_or_default();
                     let total_received = owned.len();
                     for t in &mut owned {
                         t.owner_fp   = sender_fp.clone();
                         t.owner_nick = sender_nick.clone();
                     }
-                    info!(%sender_nick, total_received, "catalog complete");
+                    info!(%sender_nick, total_received, expected, "catalog complete");
                     let _ = self.event_tx.send(P2pEvent::Info(format!(
-                        "Catalog from {sender_nick} complete — {total_received} tracks"
+                        "Catalog from {sender_nick} complete — {total_received} of {expected} tracks received"
                     ))).ok();
                     let _ = self.event_tx.send(P2pEvent::RemoteCatalogReceived {
                         peer_fp:   sender_fp,
