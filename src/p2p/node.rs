@@ -135,6 +135,9 @@ pub struct MusicNode {
     /// Accumulates paginated CatalogResponse pages keyed by sender fingerprint.
     /// Flushed to RemoteCatalogReceived when the final page arrives.
     partial_catalogs: HashMap<String, Vec<RemoteTrack>>,
+    /// Pre-serialised gossipsub payloads for an outbound track transfer.
+    /// Drained one-per-select!-iteration so incoming swarm events interleave.
+    outbound_queue: VecDeque<Vec<u8>>,
 }
 
 impl MusicNode {
@@ -188,6 +191,7 @@ impl MusicNode {
             port_tx,
             beacon_rx,
             partial_catalogs: HashMap::new(),
+            outbound_queue: VecDeque::new(),
         };
 
         tokio::spawn(async move {
@@ -246,6 +250,23 @@ impl MusicNode {
                         self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
                         if let Err(e) = self.swarm.dial(addr.clone()) {
                             debug!(%peer_id, %addr, "LAN beacon dial: {e}");
+                        }
+                    }
+                }
+
+                // Drain one pre-serialised outbound payload per loop iteration.
+                // This interleaves outgoing track chunks with incoming swarm
+                // events so the receiver's TrackChunk handlers run while the
+                // server is still transmitting — preventing stalls.
+                _ = async { tokio::task::yield_now().await },
+                    if !self.outbound_queue.is_empty() => {
+                    if let Some(payload) = self.outbound_queue.pop_front() {
+                        if let Err(e) = self.swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .publish(self.topic.clone(), payload)
+                        {
+                            warn!("outbound chunk publish failed: {e}");
                         }
                     }
                 }
@@ -388,6 +409,7 @@ impl MusicNode {
                 if let Some((path, track, _requester_fp)) =
                     self.pending_outbound.remove(&transfer_id)
                 {
+                    // Read the file asynchronously (yields to the scheduler).
                     let bytes = match tokio::fs::read(&path).await {
                         Ok(b)  => b,
                         Err(e) => {
@@ -399,37 +421,71 @@ impl MusicNode {
                             return false;
                         }
                     };
-                    let sha256   = sha256_hex(&bytes);
-                    let chunks: Vec<&[u8]> = bytes.chunks(CHUNK_SIZE).collect();
-                    let total    = chunks.len() as u32;
 
-                    if let Err(e) = self.publish(MusicKind::TrackOffer {
+                    let sha256 = sha256_hex(&bytes);
+                    let total  = bytes.chunks(CHUNK_SIZE).count() as u32;
+
+                    let _ = self.event_tx.send(P2pEvent::Info(format!(
+                        "Serving track to peer ({total} chunks)…"
+                    ))).ok();
+
+                    // Pre-serialise every outbound message into raw gossipsub
+                    // payloads and park them in the outbound queue.
+                    //
+                    // publish() has no real await points (it just signs + enqueues
+                    // in gossipsub's internal buffer), so looping over 1 000 chunks
+                    // with `self.publish().await` is effectively a busy loop that
+                    // starves the swarm of incoming event processing.
+                    //
+                    // By pre-serialising here and draining one payload per select!
+                    // iteration we interleave outgoing chunks with incoming swarm
+                    // events, allowing TrackChunk messages to be *received and
+                    // processed* while the server is still sending them.
+                    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(total as usize + 2);
+                    let mut ok = true;
+
+                    // TrackOffer
+                    match self.serialise_kind(MusicKind::TrackOffer {
                         transfer_id,
                         track,
                         total_chunks: total,
-                    }).await {
-                        warn!(%transfer_id, "TrackOffer failed: {e}");
-                        return false;
+                    }) {
+                        Ok(p)  => payloads.push(p),
+                        Err(e) => { warn!(%transfer_id, "TrackOffer serialise: {e}"); ok = false; }
                     }
 
-                    for (index, chunk) in chunks.iter().enumerate() {
-                        if let Err(e) = self.publish(MusicKind::TrackChunk {
-                            transfer_id,
-                            index: index as u32,
-                            total,
-                            encrypted_data: chunk.to_vec(),
-                        }).await {
-                            warn!(%transfer_id, index, "TrackChunk failed: {e}");
-                            return false;
+                    // Chunks
+                    if ok {
+                        for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
+                            match self.serialise_kind(MusicKind::TrackChunk {
+                                transfer_id,
+                                index: index as u32,
+                                total,
+                                encrypted_data: chunk.to_vec(),
+                            }) {
+                                Ok(p)  => payloads.push(p),
+                                Err(e) => {
+                                    warn!(%transfer_id, index, "TrackChunk serialise: {e}");
+                                    ok = false;
+                                    break;
+                                }
+                            }
                         }
                     }
 
-                    if let Err(e) = self.publish(MusicKind::TrackComplete {
-                        transfer_id,
-                        sha256,
-                    }).await {
-                        warn!(%transfer_id, "TrackComplete failed: {e}");
+                    // TrackComplete
+                    if ok {
+                        match self.serialise_kind(MusicKind::TrackComplete {
+                            transfer_id,
+                            sha256,
+                        }) {
+                            Ok(p)  => payloads.push(p),
+                            Err(e) => warn!(%transfer_id, "TrackComplete serialise: {e}"),
+                        }
                     }
+
+                    // Enqueue; the select! drain arm publishes one per iteration.
+                    self.outbound_queue.extend(payloads);
                 }
             }
 
@@ -1192,5 +1248,27 @@ impl MusicNode {
         self.publish(MusicKind::StatusAnnounce {
             status: NodeStatus::Online,
         }).await
+    }
+
+    /// Serialise and sign a `MusicKind` into a raw gossipsub payload without
+    /// publishing it.  Used to pre-build the outbound chunk queue.
+    fn serialise_kind(&self, kind: MusicKind) -> anyhow::Result<Vec<u8>> {
+        use crate::p2p::wire::{MusicMessage, SignedMusicMessage};
+        let msg = MusicMessage {
+            id:          Uuid::new_v4(),
+            room:        TOPIC.to_string(),
+            sender_fp:   self.identity.fingerprint(),
+            sender_nick: self.identity.nickname().to_string(),
+            timestamp:   Utc::now(),
+            kind,
+        };
+        let msg_bytes = serde_json::to_vec(&msg)?;
+        let signature = crate::p2p::crypto::sign_data(
+            &msg_bytes,
+            self.identity.secret_key(),
+            self.identity.passphrase_fn(),
+        )?;
+        let signed  = SignedMusicMessage { message: msg, signature };
+        Ok(serde_json::to_vec(&signed)?)
     }
 }

@@ -1078,8 +1078,8 @@ fn handle_remote_library_key(app: &mut App, key: KeyCode) {
         KeyCode::Enter => {
             // Request the focused track from its owner.
             if let Some(track) = app.remote_tracks.get(app.remote_library_selected) {
-                let track_id = track.id;
-                let peer_fp  = track.owner_fp.clone();
+                let track_id  = track.id;
+                let peer_fp   = track.owner_fp.clone();
                 let peer_nick = track.owner_nick.clone();
                 app.p2p_buffer_state = crate::p2p::P2pBufferState::Requesting {
                     track_id,
@@ -1088,8 +1088,17 @@ fn handle_remote_library_key(app: &mut App, key: KeyCode) {
                 if let Some(node) = &app.p2p_node {
                     node.send(crate::p2p::P2pCommand::RequestTrack { track_id, peer_fp });
                 }
-                app.screen = Screen::Library; // return to library to watch buffering gauge
+                // Stay on the remote library so the user can see progress inline.
             }
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            app.player.toggle_pause();
+        }
+        KeyCode::Char('[') => {
+            app.player.set_volume((app.player.volume - 0.05).max(0.0));
+        }
+        KeyCode::Char(']') => {
+            app.player.set_volume((app.player.volume + 0.05).min(1.0));
         }
         KeyCode::Char('n') | KeyCode::Char('N') => {
             // Nominate the focused track for the party line.

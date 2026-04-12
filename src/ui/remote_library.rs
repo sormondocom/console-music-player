@@ -1,18 +1,39 @@
 //! Remote Library screen — browse tracks shared by trusted peers.
+//!
+//! Layout mirrors the main library: track list on the left, player pane on
+//! the right.  The player pane is the same component used by the local library
+//! so buffer progress, stall warnings, and playback controls all work inline.
 
 use ratatui::{
-    layout::Rect,
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem},
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
     Frame,
 };
 
 use crate::app::App;
 
 pub(super) fn render_remote_library(app: &App, frame: &mut Frame, area: Rect) {
+    // ── Two-column layout: track list | player pane ──────────────────────────
+    let [list_area, player_area] = Layout::horizontal([
+        Constraint::Percentage(60),
+        Constraint::Percentage(40),
+    ])
+    .areas(area);
+
+    render_track_list(app, frame, list_area);
+    // Re-use the same player pane renderer as the main library screen.
+    super::library::render_player_pane(app, frame, player_area);
+}
+
+fn render_track_list(app: &App, frame: &mut Frame, area: Rect) {
     let count = app.remote_tracks.len();
-    let title = format!(" ⬡ Remote Library — {} track{} ", count, if count == 1 { "" } else { "s" });
+    let title = format!(
+        " ⬡ Remote Library — {} track{} ",
+        count,
+        if count == 1 { "" } else { "s" }
+    );
 
     let block = Block::default()
         .title(title)
@@ -24,12 +45,15 @@ pub(super) fn render_remote_library(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(block, area);
 
     if app.remote_tracks.is_empty() {
-        let msg = ratatui::widgets::Paragraph::new(
+        let msg = Paragraph::new(
             "No remote tracks available.\n\
-             Trusted peers will share their libraries automatically.",
+             Approved peers share their libraries automatically.\n\
+             \n\
+             If you just approved a peer, a catalog exchange is in progress —\n\
+             watch the toast notifications in the bottom-right corner.",
         )
         .style(Style::default().fg(super::CLR_DIM))
-        .alignment(ratatui::layout::Alignment::Center);
+        .alignment(Alignment::Center);
         frame.render_widget(msg, inner);
         return;
     }
@@ -57,21 +81,28 @@ pub(super) fn render_remote_library(app: &App, frame: &mut Frame, area: Rect) {
             let padding = avail.saturating_sub(main_trunc.chars().count() + badge_w);
 
             let main_style = if focused {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
 
             ListItem::new(Line::from(vec![
                 Span::styled(main_trunc, main_style),
-                Span::raw(" ".repeat(padding)),
-                Span::styled(badge, Style::default().fg(super::CLR_ACCENT).add_modifier(Modifier::DIM)),
+                Span::raw(" ".repeat(padding.max(1))),
+                Span::styled(
+                    badge,
+                    Style::default()
+                        .fg(super::CLR_ACCENT)
+                        .add_modifier(Modifier::DIM),
+                ),
             ]))
         })
         .collect();
 
     let total = items.len();
-    let sel   = app.remote_library_selected.min(total.saturating_sub(1));
+    let sel = app.remote_library_selected.min(total.saturating_sub(1));
     let mut list_state = super::centered_list_state(sel, total, inner.height);
 
     let list = List::new(items)

@@ -219,7 +219,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             Screen::P2pPeers      => " [↑↓] Navigate  [A] Approve  [D] Deny  [C] Connect by address  [L] Remote Library  [P] Party Line  [X] Disconnect  [Esc] Back",
             Screen::P2pIdentity   => " Type your display name (a-z, A-Z, 0-9, max 12 chars)  [Enter] Confirm  [Esc] Cancel",
             Screen::P2pConnect    => " Paste a peer address and press Enter to connect  [Esc] Cancel",
-            Screen::RemoteLibrary => " [↑↓/PgUp/Dn] Navigate  [Enter] Stream  [N] Nominate for Party Line  [Esc] Back",
+            Screen::RemoteLibrary => " [↑↓/PgUp/Dn] Navigate  [Enter] Stream  [P] Pause  [[] Vol-  []] Vol+  [N] Nominate  [Esc] Back",
             Screen::PartyLine     => " [↑↓] Navigate  [Y] Vote Yes  [N] Vote No  [Esc] Back",
         }
     };
