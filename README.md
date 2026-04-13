@@ -208,6 +208,7 @@ cargo run -- --library /path/to/Music
 | `P` | Pause / resume |
 | `[` / `]` | Volume down / up |
 | `O` | Toggle single-track repeat |
+| `H` | Toggle shuffle (plays continuously in random order) |
 | `V` | Toggle waveform oscilloscope |
 | `/` | Open live search overlay |
 | `\` | Open gematria track selector |
@@ -216,6 +217,7 @@ cargo run -- --library /path/to/Music
 | `E` | Edit metadata tags (title, artist, album, year, genre) |
 | `G` | Edit user keyword tags for focused track |
 | `F` | Find duplicates |
+| `M` | Open file organizer (copy/verify/delete into new folders) |
 | `S` | Manage source directories |
 | `L` | Browse / load playlists |
 | `W` | Save current selection as playlist |
@@ -226,6 +228,7 @@ cargo run -- --library /path/to/Music
 | `X` | Scan iPod health |
 | `N` | Initialise fresh iTunesDB on iPod |
 | `U` | Dump iTunesDB contents to transfer log |
+| `F9` | Open settings screen (P2P tuning, port configuration) |
 | `Q` | Quit |
 
 ### Sort / Group-by presets (`Z`)
@@ -258,7 +261,7 @@ Fields searched: **Title, Artist, Album, Year, user Tags, Playlist name, File na
 | Any character | Append to search query |
 | `Backspace` | Delete last character |
 | `Ctrl+V` | Paste from clipboard |
-| `↑` / `↓` or `k` / `j` | Navigate results |
+| `↑` / `↓` | Navigate results (`k`/`j` are not aliased here — they can be typed as part of the query) |
 | `Page Up` / `Page Down` | Jump 10 results |
 | `Enter` | Jump to selected track in library |
 | `Esc` | Close without navigating |
@@ -342,6 +345,38 @@ audio.  Uses Unicode half-block characters (▀ ▄ █ space) for double vertic
 resolution.  Press `V` or `Esc` to return to the library.
 
 > Not available when using the mpv fallback backend (Termux without native audio).
+
+### Settings screen (`F9`)
+
+Press `F9` from any screen (except text-input overlays) to open the Settings
+screen.  Changes are applied and hot-reloaded immediately when you press `S` —
+most settings take effect without a restart.
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` or `k` / `j` | Navigate fields |
+| `Enter` / `F2` | Begin editing the focused field |
+| Any character / `Backspace` | Edit value |
+| `Enter` | Confirm edit |
+| `Esc` | Cancel edit / return to library |
+| `S` | Save all fields to `config.json` and hot-reload |
+
+**Configurable fields:**
+
+| Field | Default | Description |
+|-------|:-------:|-------------|
+| Chunk retries | 5 | Times a receiver retries missing P2P chunks before giving up |
+| Beacon interval (s) | 2 | LAN broadcast interval — lower = faster peer discovery |
+| mDNS interval (s) | 30 | mDNS probe interval |
+| Stall threshold (s) | 5 | Seconds without a chunk before a transfer is flagged as stalled |
+| Abandon timeout (s) | 30 | Seconds after stall before a transfer is abandoned |
+| P2P listen port | 0 (random) | Fixed TCP/UDP port; 0 = OS-assigned. Requires restart. |
+
+Settings that take effect immediately (hot-reload): Chunk retries, Beacon
+interval, mDNS interval, Stall threshold, Abandon timeout.  The listen port
+requires a P2P restart to take effect.
+
+---
 
 ### Amazon Music (easter egg)
 
@@ -986,6 +1021,13 @@ connected to anything new — you simply don't get the automatic port mapping.
   secret key, auto-generated passphrase stored alongside it).  A future version
   will use the OS keychain (Windows Credential Store, macOS Keychain,
   libsecret on Linux).
+- **Android/Termux — remote tracks are briefly written to disk.**  On desktop
+  platforms, streamed P2P tracks play entirely from RAM.  On Android/Termux,
+  where the native audio backend is unavailable and `mpv` is used instead, the
+  buffered bytes are written to a temporary file in `$TMPDIR` (usually
+  `/data/data/com.termux/files/usr/tmp/`) before mpv is launched.  The file is
+  deleted as soon as playback finishes or is stopped.  The waveform oscilloscope
+  is also unavailable on this path (mpv limitation).
 
 ---
 
@@ -1067,7 +1109,7 @@ console-music-player/
 ├── src/
 │   ├── main.rs             # Entry point, event loop, key dispatch, DLL probe
 │   ├── app.rs              # App state machine (12 screens, all overlay states)
-│   ├── config.rs           # Persistent config (source dirs, Amazon settings)
+│   ├── config.rs           # Persistent config (source dirs, P2P identity, tuning)
 │   ├── gematria.rs         # Numerology engine (4 systems, digital root, track selector)
 │   ├── util.rs             # Cross-cutting helpers (tilde expansion)
 │   ├── error.rs            # AppError / Result types
@@ -1080,6 +1122,8 @@ console-music-player/
 │   │   ├── transfer.rs     # Transfer progress screen
 │   │   ├── repair.rs       # iPod health / repair screens
 │   │   ├── dedup.rs        # Duplicate-finder two-pane screen
+│   │   ├── organize.rs     # File organizer screen (copy/verify/delete)
+│   │   ├── settings.rs     # Settings screen (live-editable P2P tuning fields)
 │   │   └── amazon.rs       # Amazon catalog browser + diagnostic log view
 │   ├── player/mod.rs       # rodio backend + mpv subprocess fallback + waveform tap; play_remote() for P2P
 │   ├── visualizer.rs       # SampleCapture source wrapper + oscilloscope renderer
@@ -1106,7 +1150,8 @@ console-music-player/
 │   │   ├── mod.rs          # Library state, 11 sort/group-by presets, Track struct
 │   │   ├── scanner.rs      # Filesystem scan, lofty tag reader/writer, magic-byte gate
 │   │   ├── dedup.rs        # Duplicate detection (exact-content + metadata match)
-│   │   └── magic.rs        # Magic-byte format verification
+│   │   ├── magic.rs        # Magic-byte format verification
+│   │   └── cache.rs        # ScanCache — mtime+size keyed metadata cache (scan_cache.json)
 │   ├── device/
 │   │   ├── mod.rs          # MusicDevice trait + enumeration
 │   │   ├── ipod_ums.rs     # USB Mass Storage iPod implementation

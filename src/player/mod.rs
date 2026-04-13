@@ -45,6 +45,9 @@ struct ExternalHandle {
     process: std::process::Child,
     /// Path to the Unix socket mpv is listening on.
     sock_path: std::path::PathBuf,
+    /// Temporary audio file written for in-memory (P2P) buffers.
+    /// `None` for local file playback.  Deleted when this handle is dropped.
+    temp_file: Option<std::path::PathBuf>,
     started_at: Option<Instant>,
     elapsed_before_pause: Duration,
     paused: bool,
@@ -72,6 +75,48 @@ impl ExternalHandle {
         Ok(Self {
             process,
             sock_path,
+            temp_file: None,
+            started_at: Some(Instant::now()),
+            elapsed_before_pause: Duration::ZERO,
+            paused: false,
+        })
+    }
+
+    /// Write `bytes` to a temp file, then spawn mpv to play it.
+    ///
+    /// Used on platforms where rodio is unavailable (e.g. Android/Termux) to
+    /// play in-memory P2P buffers.  The temp file is deleted when this handle
+    /// is dropped (natural end-of-track) or when `stop()` is called explicitly.
+    ///
+    /// `ext` should be the audio file extension without a leading dot ("mp3",
+    /// "flac", etc.) — mpv uses it for format detection.
+    fn spawn_from_bytes(bytes: &[u8], ext: &str, volume_pct: u32) -> Result<Self, String> {
+        let pid = std::process::id();
+        let temp_file = std::env::temp_dir()
+            .join(format!("cmp-remote-{pid}.{ext}"));
+
+        std::fs::write(&temp_file, bytes)
+            .map_err(|e| format!("Cannot write temp audio file: {e}"))?;
+
+        let sock_path = std::env::temp_dir()
+            .join(format!("cmp-mpv-{pid}.sock"));
+
+        let process = std::process::Command::new("mpv")
+            .args([
+                "--no-terminal",
+                "--no-video",
+                "--really-quiet",
+                &format!("--input-ipc-server={}", sock_path.display()),
+                &format!("--volume={volume_pct}"),
+                temp_file.to_str().unwrap_or(""),
+            ])
+            .spawn()
+            .map_err(|e| format!("Could not spawn mpv: {e}"))?;
+
+        Ok(Self {
+            process,
+            sock_path,
+            temp_file: Some(temp_file),
             started_at: Some(Instant::now()),
             elapsed_before_pause: Duration::ZERO,
             paused: false,
@@ -117,7 +162,12 @@ impl ExternalHandle {
     fn stop(&mut self) {
         self.send(r#"{"command":["quit"]}"#);
         let _ = self.process.wait();
+        // Explicit cleanup — Drop will also attempt this, which is fine
+        // (remove_file on a missing file returns Err that we ignore).
         let _ = std::fs::remove_file(&self.sock_path);
+        if let Some(ref tmp) = self.temp_file {
+            let _ = std::fs::remove_file(tmp);
+        }
     }
 
     fn is_finished(&mut self) -> bool {
@@ -135,6 +185,43 @@ impl ExternalHandle {
 
     fn set_volume(&self, volume_pct: u32) {
         self.send(&format!(r#"{{"command":["set_property","volume",{volume_pct}]}}"#));
+    }
+}
+
+/// Clean up socket and temp file when the handle is dropped.
+///
+/// This fires both on an explicit `stop()` (which already removes the files,
+/// so these calls are no-ops) and on natural end-of-track when `tick()` drops
+/// the handle by assigning `self.ext = None`.
+#[cfg(unix)]
+impl Drop for ExternalHandle {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock_path);
+        if let Some(ref tmp) = self.temp_file {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote format → file extension helper
+// ---------------------------------------------------------------------------
+
+/// Map a `RemoteFormat` to a lowercase file extension string.
+/// Used when writing a temp file for mpv on platforms without rodio.
+#[cfg(unix)]
+fn remote_format_ext(fmt: &crate::p2p::wire::RemoteFormat) -> &str {
+    use crate::p2p::wire::RemoteFormat::*;
+    match fmt {
+        Mp3           => "mp3",
+        Flac          => "flac",
+        Ogg           => "ogg",
+        Aac           => "aac",
+        M4a           => "m4a",
+        Wav           => "wav",
+        Opus          => "opus",
+        Tracker(ext)  => ext.as_str(),
+        Unknown(ext)  => ext.as_str(),
     }
 }
 
@@ -337,9 +424,13 @@ impl Player {
 
     /// Play a remote track from an in-memory buffer.
     ///
-    /// The bytes are wrapped in `std::io::Cursor` which implements both `Read`
-    /// and `Seek`, satisfying symphonia's `MediaSource` requirement for all
-    /// formats (including FLAC).  The buffer is never written to disk.
+    /// **Rodio path (desktop):** the bytes are wrapped in `std::io::Cursor` and
+    /// decoded directly — nothing is written to disk.
+    ///
+    /// **mpv path (Android/Termux):** rodio cannot reach the Android audio
+    /// system, so the bytes are written to a temp file in the OS temp directory,
+    /// mpv is spawned to play it, and the file is deleted when playback ends.
+    /// The temp file lives only for the duration of playback.
     ///
     /// On success, `current_remote` is set and `current_track` is cleared.
     pub fn play_remote(
@@ -353,49 +444,69 @@ impl Player {
         // track finishing mid-download doesn't hijack playback after this call.
         self.needs_next = false;
 
-        let handle = self
-            .handle
-            .as_ref()
-            .ok_or_else(|| "No audio output device available for remote playback.".to_string())?;
+        // ── rodio path (desktop / any platform with a native audio device) ──
+        if let Some(handle) = &self.handle {
+            let sink = Sink::try_new(handle)
+                .map_err(|e| format!("Cannot create audio sink: {e}"))?;
 
-        let sink = Sink::try_new(handle)
-            .map_err(|e| format!("Cannot create audio sink: {e}"))?;
+            // Cursor<Vec<u8>> implements Read + Seek — symphonia is happy with it.
+            let cursor = std::io::Cursor::new(bytes.to_vec());
+            let decoder = rodio::Decoder::new(cursor)
+                .map_err(|e| format!("Cannot decode remote track '{}': {e}", track.title))?;
 
-        // Cursor<Vec<u8>> implements Read + Seek — symphonia is happy with it.
-        let cursor = std::io::Cursor::new(bytes.to_vec());
-        let decoder = rodio::Decoder::new(cursor)
-            .map_err(|e| format!("Cannot decode remote track '{}': {e}", track.title))?;
+            // Extract duration from the decoder before consuming it — this gives us
+            // an accurate duration even when the catalog metadata had None.
+            let decoded_duration_secs: Option<u32> = decoder
+                .total_duration()
+                .map(|d| d.as_secs() as u32)
+                .filter(|&s| s > 0);
 
-        // Extract duration from the decoder before consuming it — this gives us
-        // an accurate duration even when the catalog metadata had None.
-        let decoded_duration_secs: Option<u32> = decoder
-            .total_duration()
-            .map(|d| d.as_secs() as u32)
-            .filter(|&s| s > 0);
+            let source = decoder.convert_samples::<f32>();
 
-        let source = decoder.convert_samples::<f32>();
+            sink.set_volume(self.volume);
+            sink.append(SampleCapture::new(
+                source,
+                self.wave_buffer.clone(),
+                self.decoder_panic_flag.clone(),
+            ));
 
-        sink.set_volume(self.volume);
-        sink.append(SampleCapture::new(
-            source,
-            self.wave_buffer.clone(),
-            self.decoder_panic_flag.clone(),
-        ));
-
-        // Use decoder-reported duration as fallback when catalog metadata is absent.
-        if track.duration_secs.is_none() || track.duration_secs == Some(0) {
+            // Use decoder-reported duration as fallback when catalog metadata is absent.
             let mut track = track;
-            track.duration_secs = decoded_duration_secs;
+            if track.duration_secs.is_none() || track.duration_secs == Some(0) {
+                track.duration_secs = decoded_duration_secs;
+            }
             self.current_remote = Some(track);
-        } else {
-            self.current_remote = Some(track);
+            self.sink = Some(sink);
+            self.current_track = None;
+            self.state = PlaybackState::Playing;
+            self.started_at = Some(Instant::now());
+            self.elapsed_before_pause = Duration::ZERO;
+            return Ok(());
         }
-        self.sink = Some(sink);
-        self.current_track = None;  // clear local track
-        self.state = PlaybackState::Playing;
-        self.started_at = Some(Instant::now());
-        self.elapsed_before_pause = Duration::ZERO;
-        Ok(())
+
+        // ── mpv path (Android/Termux — no native audio device) ──────────────
+        #[cfg(unix)]
+        {
+            if self.ext_player.is_some() {
+                let ext = remote_format_ext(&track.format);
+                let vol_pct = (self.volume * 100.0).round() as u32;
+                let handle = ExternalHandle::spawn_from_bytes(&bytes, ext, vol_pct)
+                    .map_err(|e| e.to_string())?;
+                self.ext = Some(handle);
+                self.current_remote = Some(track);
+                self.current_track = None;
+                self.state = PlaybackState::Playing;
+                info!(
+                    "Playing remote (mpv): {} — {}",
+                    self.current_remote.as_ref().map(|t| t.artist.as_str()).unwrap_or("?"),
+                    self.current_remote.as_ref().map(|t| t.title.as_str()).unwrap_or("?"),
+                );
+                return Ok(());
+            }
+        }
+
+        Err("No audio output device and no external player found.\n\
+             On Termux, run:  pkg install mpv".into())
     }
 
     /// Decode and append a standard audio file (MP3, FLAC, etc.) via rodio/symphonia.
