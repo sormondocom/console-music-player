@@ -21,8 +21,19 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2p_identity_armored: Option<String>,
 
-    /// Auto-generated passphrase protecting the secret key.
-    /// Beta simplification — TODO: move to OS keychain before stable.
+    /// Passphrase protecting the secret key.
+    ///
+    /// **Deprecated storage path.** On platforms with a native credential store
+    /// (Windows Credential Manager, macOS Keychain, Linux Secret Service) this
+    /// field is `None` — the passphrase lives in the OS keychain instead.
+    ///
+    /// This field is kept for two reasons:
+    ///   1. **Migration** — existing installs that wrote the passphrase here
+    ///      before the keychain integration can still load their identity.
+    ///      `activate_p2p()` moves the value to the keychain on first run and
+    ///      clears this field.
+    ///   2. **Fallback** — Android/Termux and headless Linux (no secret-service
+    ///      daemon) continue to use this field because no keychain is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p2p_identity_passphrase: Option<String>,
 

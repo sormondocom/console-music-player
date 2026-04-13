@@ -4,6 +4,7 @@
 mod app;
 mod config;
 mod gematria;
+mod keychain;
 mod organize;
 mod p2p;
 mod platform;

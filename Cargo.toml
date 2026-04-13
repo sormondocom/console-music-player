@@ -93,6 +93,11 @@ futures-util = "0.3"
 # arboard requires a display server — not available on Android/Termux.
 arboard = "3"
 
+# OS credential store for the P2P identity passphrase.
+# Windows → Credential Manager, macOS → Keychain, Linux → Secret Service.
+# Not available on Android/Termux — falls back to config.json storage there.
+keyring = "3"
+
 [profile.release]
 opt-level = 3
 lto = true

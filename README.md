@@ -26,7 +26,7 @@ MOD tracker playback, and a numerology-based track selector, written in Rust.
 - iPod Classic / Nano / Mini / Shuffle upload via USB Mass Storage
 - iTunesDB & iTunesSD read/write — no iTunes required
 - iPod health scan and database repair
-- **Amazon Music** easter egg — catalog browser and MP3 downloader (session-cookie based)
+- **Amazon Music** — catalog browser and MP3 downloader via the Amazon Music desktop app (Windows; CDP automation)
 - **P2P music sharing** (beta) — share your library with trusted peers on the same network or over the internet; stream tracks in-memory and vote on synchronized group playback via the Party Line
 - Playlists saved as JSON; single-track repeat
 - **Ctrl+V paste** in all text input fields (desktop platforms)
@@ -378,18 +378,28 @@ requires a P2P restart to take effect.
 
 ---
 
-### Amazon Music (easter egg)
+### Amazon Music
 
 Type the key sequence `A` → `C` → `E` within 2 seconds from the library screen
-to open the Amazon Music catalog browser.  This feature requires a valid
-`music.amazon.com` session cookie — you will be prompted to paste one on each
-session start (cookies are session-scoped and expire).
+to open the Amazon Music catalog browser.
 
-**How to get your cookie:**
-1. Open `music.amazon.com` in a browser and sign in
-2. Press `F12` → Network tab → click any request
-3. Under Request Headers, right-click the `cookie:` value → Copy value
-4. Paste it into `cmp` with `Ctrl+V` when prompted
+**Requirement: the Amazon Music desktop app must be installed.**  This feature
+works by automating the Amazon Music Win32 application via the Chrome DevTools
+Protocol (CDP).  It is only available on **Windows** and only with the
+**Win32 installer version** of Amazon Music — the UWP / Microsoft Store version
+cannot be automated this way.
+
+`cmp` launches Amazon Music with a local debugging port enabled, connects to it
+over a WebSocket, and drives the download buttons on your behalf.  Only tracks
+you own (purchased or included in your Prime/Unlimited subscription as DRM-free
+MP3s) can be downloaded this way.
+
+> **A note on Amazon's cooperation:** Amazon provides no public API for
+> accessing owned music downloads, and their application actively obfuscates its
+> internal structure.  Getting this feature to work has required significant
+> reverse-engineering effort, and Amazon can break it at any time by updating
+> their app.  We'll keep at it, but it's a tough cookie to crack with an
+> adversary that has zero interest in making things easy.
 
 | Key | Action |
 |-----|--------|
@@ -398,14 +408,12 @@ session start (cookies are session-scoped and expire).
 | `Page Up` / `Page Down` | Jump 10 tracks |
 | `D` | Download focused Amazon track as MP3 |
 | `R` | Refresh / re-fetch catalog |
-| `?` | Open diagnostic log (full HTTP exchange dump) |
+| `?` | Open diagnostic log (full CDP exchange dump) |
 | `Esc` | Close diagnostic log / return to library |
 
-The diagnostic log (`?`) shows the complete untruncated HTTP exchange for any
-failed request — method, URL, all request headers, HTTP status code, all
-response headers, and the full response body.  This is especially useful for
-diagnosing expired-cookie 404 responses where Amazon returns an HTML error page
-instead of JSON.
+The diagnostic log (`?`) shows the complete untruncated CDP exchange for any
+failed operation — useful when an Amazon Music update has changed the page
+structure and downloads are no longer being triggered correctly.
 
 ### P2P music sharing (beta)
 
@@ -1128,7 +1136,7 @@ console-music-player/
 │   ├── player/mod.rs       # rodio backend + mpv subprocess fallback + waveform tap; play_remote() for P2P
 │   ├── visualizer.rs       # SampleCapture source wrapper + oscilloscope renderer
 │   ├── tracker/mod.rs      # libopenmpt wrapper + pure-Rust metadata parsers
-│   ├── amazon/mod.rs       # Amazon Music easter egg (AmazonClient, catalog, download)
+│   ├── amazon/mod.rs       # Amazon Music local install detection (web API abandoned)
 │   ├── p2p/
 │   │   ├── mod.rs          # P2pHandle, P2pCommand, P2pEvent, P2pBufferState, Toast
 │   │   ├── identity.rs     # PGP identity: load_or_generate(), EdDSA + ECDH Curve25519
@@ -1369,7 +1377,7 @@ All three files live in the same platform-specific config directory:
 
 | File | Contents |
 |------|----------|
-| `config.json` | Source directories, Amazon cookie, P2P identity + trusted peers |
+| `config.json` | Source directories, P2P identity + trusted peers |
 | `tags.json` | User keyword tags per track path |
 | `playlists/{name}.json` | Track path list per named playlist (one file each) |
 
