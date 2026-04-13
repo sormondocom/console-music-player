@@ -4,8 +4,9 @@
   <img src="assets/mascot.svg" alt="console-music-player mascot — an iPod Classic showing the TUI" width="200"/>
 </p>
 
-A cross-platform terminal music player with iPod Classic / Shuffle support,
-MOD tracker playback, and a numerology-based track selector, written in Rust.
+A cross-platform terminal music player with MOD tracker playback and a
+numerology-based track selector, written in Rust.  iPod device support is in
+active development.
 
 ---
 
@@ -23,9 +24,7 @@ MOD tracker playback, and a numerology-based track selector, written in Rust.
 - **User tag library** (`[G]`): tag any track with custom keywords; filter and group by tag
 - In-place tag editor (`[E]`): title, artist, album, year, genre
 - Playlist badges and tag badges shown inline in the track list
-- iPod Classic / Nano / Mini / Shuffle upload via USB Mass Storage
-- iTunesDB & iTunesSD read/write — no iTunes required
-- iPod health scan and database repair
+- **iPod device support** (beta) — USB Mass Storage upload, health scan, and database tools for Classic / Nano / Mini / Shuffle; iTunesDB write is still being stabilised and may not work reliably on all models
 - **Amazon Music** — catalog browser and MP3 downloader via the Amazon Music desktop app (Windows; CDP automation)
 - **P2P music sharing** (beta) — share your library with trusted peers on the same network or over the internet; stream tracks in-memory and vote on synchronized group playback via the Party Line
 - Playlists saved as JSON; single-track repeat
@@ -38,14 +37,20 @@ MOD tracker playback, and a numerology-based track selector, written in Rust.
 
 | Platform | Standard audio | Tracker (MOD/XM/IT…) | iPod transfer |
 |----------|:---:|:---:|:---:|
-| **Windows 10/11** (x86-64) | ✅ | ✅ (DLLs bundled) | ✅ |
-| **Linux** (x86-64, aarch64) | ✅ | ✅ (`apt`/`dnf`/`pacman`) | ✅ |
-| **macOS** (x86-64, Apple Silicon) | ✅ | ✅ (`brew`) | ✅ |
-| **Android — Termux** (aarch64) | ✅ via `mpv` | ✅ (`pkg install libopenmpt`) | ⚠️ (USB limited) |
+| **Windows 10/11** (x86-64) | ✅ | ✅ (DLLs bundled) | 🚧 beta |
+| **Linux** (x86-64, aarch64) | ✅ | ✅ (`apt`/`dnf`/`pacman`) | 🚧 beta |
+| **macOS** (x86-64, Apple Silicon) | ✅ | ✅ (`brew`) | 🚧 beta |
+| **Android — Termux** (aarch64) | ✅ via `mpv` | ✅ (`pkg install libopenmpt`) | ⚠️ beta + USB limited |
 
-> iPod transfer on Android depends on the device exposing the iPod as USB Mass
-> Storage. Many modern Android phones require a USB-OTG adapter and a file
-> manager that mounts the device at a known path.
+> **iPod transfer is in beta.** The USB Mass Storage detection and file copy
+> pipeline work, but iTunesDB write (required for the iPod to recognise
+> transferred tracks) is still being stabilised.  Transfers may complete without
+> the tracks appearing in the iPod's own menu.  Use with caution and keep
+> backups of your iTunesDB file.
+>
+> Android iPod transfer additionally depends on the device exposing the iPod as
+> USB Mass Storage, which requires a USB-OTG adapter and may need a file manager
+> to mount the iPod at a known path.
 
 ---
 
@@ -223,7 +228,7 @@ cargo run -- --library /path/to/Music
 | `W` | Save current selection as playlist |
 | `R` | Rescan library (or clear active playlist filter) |
 | `D` | Rescan connected devices |
-| `T` | Transfer selected tracks to iPod |
+| `T` | Transfer selected tracks to iPod ⚠️ beta — see [iPod support](#ipod-support--️-beta) |
 | `I` | Browse iPod track library |
 | `X` | Scan iPod health |
 | `N` | Initialise fresh iTunesDB on iPod |
@@ -1067,18 +1072,27 @@ used by OpenMPT, VLC, and most modern media players that support these formats.
 
 ---
 
-## iPod support
+## iPod support  ⚠️ beta
 
-Supported models (USB Mass Storage, no iTunes needed):
+> **This feature is in active development and not yet ready for everyday use.**
+> The USB detection and file copy steps work, but iTunesDB write — the part
+> that makes the iPod's own firmware recognise the new tracks — is still being
+> stabilised.  On many models, transferred files will land on the device
+> correctly but won't appear in the iPod's menus until this is resolved.
+>
+> We're working on it.  If you want to track or contribute to the effort, the
+> relevant code is in `ipod-rs/src/itunesdb.rs`.
 
-| Family | DB format | Folder layout |
-|--------|-----------|---------------|
-| Classic 1st–6th gen | iTunesDB | `iPod_Control/Music/Fxx/` |
-| Mini 1st–2nd gen | iTunesDB | `iPod_Control/Music/Fxx/` |
-| Nano 1st–5th gen | iTunesDB | `iPod_Control/Music/Fxx/` |
-| Shuffle 1st–3rd gen | iTunesSD | `iPod_Control/Music/` |
+### Target models
 
-iPod touch uses the iOS/AFC protocol and is not supported by this path.
+| Family | DB format | Status |
+|--------|-----------|--------|
+| Classic 1st–6th gen | iTunesDB | File copy ✅ · DB write 🚧 |
+| Mini 1st–2nd gen | iTunesDB | File copy ✅ · DB write 🚧 |
+| Nano 1st–5th gen | iTunesDB | File copy ✅ · DB write 🚧 |
+| Shuffle 1st–3rd gen | iTunesSD | File copy ✅ · DB write 🚧 |
+
+iPod touch uses the iOS/AFC protocol and is not covered by this path.
 
 ### Windows note
 
