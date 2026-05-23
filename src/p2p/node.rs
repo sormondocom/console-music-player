@@ -158,6 +158,33 @@ impl MusicNode {
     /// The caller should first create a `P2pHandle` via `P2pHandle::channel()`,
     /// then pass the resulting `NodeChannels` here.  The handle is stored in
     /// `App::p2p_node`; the node runs as a background tokio task.
+    /// Load a persisted Ed25519 keypair from its hex-encoded secret bytes.
+    /// Returns an error if the hex is malformed or the wrong length.
+    fn keypair_from_hex(hex_str: &str) -> anyhow::Result<Keypair> {
+        use libp2p::identity::ed25519;
+        let mut bytes = hex::decode(hex_str)
+            .map_err(|e| anyhow::anyhow!("transport keypair hex decode: {e}"))?;
+        let secret = ed25519::SecretKey::try_from_bytes(&mut bytes)
+            .map_err(|e| anyhow::anyhow!("transport keypair parse: {e}"))?;
+        Ok(Keypair::from(ed25519::Keypair::from(secret)))
+    }
+
+    /// Encode the Ed25519 secret key as a lowercase hex string for persistence.
+    fn keypair_to_hex(kp: &Keypair) -> Option<String> {
+        kp.clone()
+            .try_into_ed25519()
+            .ok()
+            .map(|ed| hex::encode(ed.secret().as_ref()))
+    }
+
+    /// Spawn the node on the tokio runtime.
+    ///
+    /// `transport_keypair_hex` — if `Some`, the hex-encoded Ed25519 secret key
+    /// from a previous session is reused so our `PeerId` stays stable.  If
+    /// `None` (first run) a fresh keypair is generated.
+    ///
+    /// Returns the hex of the keypair actually used (whether loaded or newly
+    /// generated) so the caller can persist it to config for the next run.
     pub fn spawn(
         identity: PgpIdentity,
         bootstrap_peers: Vec<(PeerId, Multiaddr)>,
@@ -165,10 +192,31 @@ impl MusicNode {
         chunk_retries: u32,
         stall_secs: u64,
         abandon_secs: u64,
+        transport_keypair_hex: Option<&str>,
         cmd_rx:   UnboundedReceiver<P2pCommand>,
         event_tx: UnboundedSender<P2pEvent>,
-    ) -> anyhow::Result<()> {
-        let keypair = Keypair::generate_ed25519();
+    ) -> anyhow::Result<String> {
+        // Load the persisted keypair or generate a fresh one.
+        let keypair = if let Some(hex) = transport_keypair_hex {
+            match Self::keypair_from_hex(hex) {
+                Ok(kp) => {
+                    info!("Loaded persisted libp2p transport keypair");
+                    kp
+                }
+                Err(e) => {
+                    warn!("Could not load persisted transport keypair ({e}) — generating new one");
+                    Keypair::generate_ed25519()
+                }
+            }
+        } else {
+            info!("Generating new libp2p transport keypair");
+            Keypair::generate_ed25519()
+        };
+
+        // Encode for return (caller saves to config).
+        let returned_hex = Self::keypair_to_hex(&keypair)
+            .unwrap_or_default();
+
         let local_peer_id = keypair.public().to_peer_id();
         let mut swarm = network::build_swarm(keypair)?;
 
@@ -218,7 +266,7 @@ impl MusicNode {
             node.run(bootstrap_peers).await;
         });
 
-        Ok(())
+        Ok(returned_hex)
     }
 
     // -----------------------------------------------------------------------
@@ -938,6 +986,18 @@ impl MusicNode {
                 let expected   = total_tracks as usize;
 
                 info!(%sender_nick, page, total_pages, page_len, expected, "catalog page received");
+
+                // Page 0 marks the start of a fresh catalog exchange.  Clear any
+                // leftover pages from an interrupted previous exchange so stale
+                // data from a prior session never mixes with the new one.
+                if page == 0 {
+                    if let Some(stale) = self.partial_catalogs.remove(&sender_fp) {
+                        if !stale.is_empty() {
+                            debug!(%sender_nick, stale_count = stale.len(),
+                                "clearing stale partial catalog on new exchange");
+                        }
+                    }
+                }
 
                 // Accumulate regardless of arrival order.
                 let acc = self.partial_catalogs

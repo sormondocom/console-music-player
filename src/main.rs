@@ -283,6 +283,8 @@ async fn run_event_loop(
                             }
                         } else if app.search_state.is_some() {
                             for c in clean.chars() { app.search_push(c); }
+                        } else if app.remote_search_state.is_some() {
+                            for c in clean.chars() { app.remote_search_push(c); }
                         } else if let Some(state) = &mut app.tag_edit_state {
                             state.input.push_str(&clean);
                         } else {
@@ -306,7 +308,8 @@ async fn run_event_loop(
                 let is_input_screen = matches!(
                     app.screen,
                     Screen::AddSource | Screen::SavePlaylist | Screen::EditTrack | Screen::Amazon
-                ) || app.search_state.is_some();
+                ) || app.search_state.is_some()
+                  || app.remote_search_state.is_some();
                 if !is_input_screen {
                     app.status_message = None;
                 }
@@ -343,6 +346,11 @@ fn handle_key(app: &mut App, key: KeyCode, cfg: &mut Config) {
     // Search overlay intercepts all keys when open.
     if app.search_state.is_some() {
         handle_search_key(app, key);
+        return;
+    }
+    // Remote library search overlay intercepts all keys when open.
+    if app.remote_search_state.is_some() {
+        handle_remote_search_key(app, key);
         return;
     }
     // Tag edit overlay intercepts all keys.
@@ -1125,6 +1133,29 @@ fn handle_remote_library_key(app: &mut App, key: KeyCode) {
                 app.screen = Screen::PartyLine;
             }
         }
+        KeyCode::Char('/') => app.begin_remote_search(),
+        _ => {}
+    }
+}
+
+fn handle_remote_search_key(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc   => app.cancel_remote_search(),
+        KeyCode::Enter => app.confirm_remote_search(),
+        KeyCode::Up    => {
+            if let Some(s) = &mut app.remote_search_state { s.move_up(); }
+        }
+        KeyCode::Down  => {
+            if let Some(s) = &mut app.remote_search_state { s.move_down(); }
+        }
+        KeyCode::PageUp => {
+            if let Some(s) = &mut app.remote_search_state { s.page_up(PAGE_SIZE); }
+        }
+        KeyCode::PageDown => {
+            if let Some(s) = &mut app.remote_search_state { s.page_down(PAGE_SIZE); }
+        }
+        KeyCode::Backspace => app.remote_search_pop(),
+        KeyCode::Char(c)   => app.remote_search_push(c),
         _ => {}
     }
 }

@@ -450,16 +450,21 @@ impl Player {
                 .map_err(|e| format!("Cannot create audio sink: {e}"))?;
 
             // Cursor<Vec<u8>> implements Read + Seek — symphonia is happy with it.
+            // Wrap creation+duration probe in catch_unwind: symphonia may panic
+            // on unusual or edge-case encodings (unreachable!() in codec paths).
             let cursor = std::io::Cursor::new(bytes.to_vec());
-            let decoder = rodio::Decoder::new(cursor)
-                .map_err(|e| format!("Cannot decode remote track '{}': {e}", track.title))?;
-
-            // Extract duration from the decoder before consuming it — this gives us
-            // an accurate duration even when the catalog metadata had None.
-            let decoded_duration_secs: Option<u32> = decoder
-                .total_duration()
-                .map(|d| d.as_secs() as u32)
-                .filter(|&s| s > 0);
+            let title_for_err = track.title.clone();
+            let (decoder, decoded_duration_secs) = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| {
+                    let dec = rodio::Decoder::new(cursor)?;
+                    let dur = dec.total_duration()
+                        .map(|t| t.as_secs() as u32)
+                        .filter(|&s| s > 0);
+                    Ok::<_, rodio::decoder::DecoderError>((dec, dur))
+                })
+            )
+            .map_err(|_| format!("Decoder panicked for '{title_for_err}'"))?
+            .map_err(|e| format!("Cannot decode remote track '{title_for_err}': {e}"))?;
 
             let source = decoder.convert_samples::<f32>();
 
@@ -513,9 +518,13 @@ impl Player {
     fn play_standard(&self, track: &Track, sink: &Sink) -> Result<(), String> {
         let file = File::open(&track.path)
             .map_err(|e| format!("Cannot open '{}': {e}", track.path.display()))?;
-        let source = Decoder::new(BufReader::new(file))
-            .map_err(|e| format!("Cannot decode '{}': {e}", track.path.display()))?
-            .convert_samples::<f32>();
+        let path_str = track.path.display().to_string();
+        let source = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| Decoder::new(BufReader::new(file)))
+        )
+        .map_err(|_| format!("Decoder panicked for '{path_str}'"))?
+        .map_err(|e| format!("Cannot decode '{path_str}': {e}"))?
+        .convert_samples::<f32>();
         sink.set_volume(self.volume);
         sink.append(SampleCapture::new(
             source,

@@ -51,6 +51,8 @@ pub(super) fn render_main(app: &App, frame: &mut Frame, area: Rect) {
 pub(super) fn render_waveform_pane(app: &App, frame: &mut Frame, area: Rect) {
     let title = if let Some(track) = &app.player.current_track {
         format!(" ◈ {} — {} ", track.display_title(), track.display_artist())
+    } else if let Some(rt) = &app.player.current_remote {
+        format!(" ◈ {} — {} [@{}] ", rt.title, rt.artist, rt.owner_nick)
     } else {
         " ◈ Waveform — no track playing ".into()
     };

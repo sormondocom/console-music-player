@@ -133,6 +133,11 @@ pub fn render(app: &App, frame: &mut Frame) {
         overlays::render_search_overlay(state, frame, body_area);
     }
 
+    // Remote library search overlay.
+    if let Some(state) = &app.remote_search_state {
+        overlays::render_search_overlay(state, frame, body_area);
+    }
+
     // Gematria overlay — above everything.
     if let Some(state) = &app.gematria_state {
         overlays::render_gematria_overlay(app, state, frame, body_area);

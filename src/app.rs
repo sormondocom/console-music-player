@@ -490,6 +490,8 @@ pub struct App {
     // --- search ---
     /// Live search overlay; `Some` while the search UI is open.
     pub search_state: Option<SearchState>,
+    /// Live search overlay for the Remote Library screen.
+    pub remote_search_state: Option<SearchState>,
 
     // --- marquee scrolling ---
     /// Monotonically incrementing tick counter, reset whenever the focused
@@ -598,6 +600,7 @@ impl App {
             playlist_membership: HashMap::new(),
             tag_edit_state: None,
             search_state: None,
+            remote_search_state: None,
             amazon_key_seq: Vec::new(),
             amazon_key_seq_time: None,
             amazon_state: None,
@@ -1411,14 +1414,25 @@ impl App {
             self.search_state = None;
             return;
         };
-        let target_path = result.track.path.clone();
-        if let Some(pos) = self.library.tracks.iter().position(|t| t.path == target_path) {
+        let target = result.track.clone();
+
+        let find_pos = |tracks: &[crate::library::Track]| -> Option<usize> {
+            if let Some(ref origin) = target.remote {
+                tracks.iter().position(|t| {
+                    t.remote.as_ref().map(|r| r.track_id) == Some(origin.track_id)
+                })
+            } else {
+                tracks.iter().position(|t| t.path == target.path)
+            }
+        };
+
+        if let Some(pos) = find_pos(&self.library.tracks) {
             self.library.selected_index = pos;
             self.reset_marquee();
-        } else {
-            // Track filtered out by playlist — clear filter first.
+        } else if target.remote.is_none() {
+            // Local track filtered out by playlist — clear filter first.
             self.library.clear_playlist();
-            if let Some(pos) = self.library.tracks.iter().position(|t| t.path == target_path) {
+            if let Some(pos) = find_pos(&self.library.tracks) {
                 self.library.selected_index = pos;
                 self.reset_marquee();
             }
@@ -1429,6 +1443,73 @@ impl App {
     /// Close the search overlay without navigating.
     pub fn cancel_search(&mut self) {
         self.search_state = None;
+    }
+
+    // --- Remote Library search -----------------------------------------------
+
+    pub fn begin_remote_search(&mut self) {
+        self.remote_search_state = Some(SearchState::new());
+    }
+
+    pub fn remote_search_push(&mut self, c: char) {
+        if let Some(state) = &mut self.remote_search_state { state.query.push(c); }
+        self.run_remote_search();
+    }
+
+    pub fn remote_search_pop(&mut self) {
+        if let Some(state) = &mut self.remote_search_state { state.query.pop(); }
+        self.run_remote_search();
+    }
+
+    pub fn confirm_remote_search(&mut self) {
+        let Some(state) = &self.remote_search_state else { return };
+        let Some(result) = state.results.get(state.selected) else {
+            self.remote_search_state = None;
+            return;
+        };
+        self.remote_library_selected = result.track_index;
+        self.remote_search_state = None;
+    }
+
+    pub fn cancel_remote_search(&mut self) {
+        self.remote_search_state = None;
+    }
+
+    fn run_remote_search(&mut self) {
+        let Some(state) = &mut self.remote_search_state else { return };
+        let query = state.query.trim().to_lowercase();
+
+        if query.is_empty() {
+            state.results.clear();
+            return;
+        }
+
+        let mut results: Vec<SearchResult> = self
+            .remote_tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, rt)| {
+                let mut fields: Vec<&'static str> = Vec::new();
+                if rt.title.to_lowercase().contains(&query)      { fields.push("Title");  }
+                if rt.artist.to_lowercase().contains(&query)     { fields.push("Artist"); }
+                if rt.album.to_lowercase().contains(&query)      { fields.push("Album");  }
+                if rt.owner_nick.to_lowercase().contains(&query) { fields.push("Peer");   }
+                if fields.is_empty() { return None; }
+                Some(SearchResult {
+                    track_index:    idx,
+                    track:          Self::remote_track_to_lib_track(rt),
+                    matched_fields: fields,
+                })
+            })
+            .collect();
+
+        results.sort_by_key(|r| {
+            let exact_title  = r.track.title.to_lowercase()  == query;
+            let exact_artist = r.track.artist.to_lowercase() == query;
+            (!exact_title, !exact_artist, r.track_index)
+        });
+
+        state.results = results;
     }
 
     /// Run the current query against all tracks and update results.
@@ -1989,10 +2070,16 @@ impl App {
                     cfg.p2p_chunk_retries,
                     cfg.p2p_stall_secs,
                     cfg.p2p_abandon_secs,
+                    cfg.p2p_transport_keypair_hex.as_deref(),
                     channels.cmd_rx,
                     channels.event_tx,
                 ) {
-                    Ok(()) => {
+                    Ok(keypair_hex) => {
+                        // Persist the transport keypair so PeerId stays stable next run.
+                        if cfg.p2p_transport_keypair_hex.as_deref() != Some(&keypair_hex) {
+                            cfg.p2p_transport_keypair_hex = Some(keypair_hex);
+                            cfg.save();
+                        }
                         // Broadcast library catalog immediately after activation
                         let catalog = crate::p2p::catalog::build_catalog(&self.library);
                         handle.send(crate::p2p::P2pCommand::AnnounceLibrary(catalog));

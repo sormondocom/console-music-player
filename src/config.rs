@@ -49,6 +49,20 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub p2p_bootstrap_peers: Vec<String>,
 
+    /// Hex-encoded Ed25519 secret key for the libp2p transport layer.
+    ///
+    /// Persisted so our `PeerId` stays stable across restarts — a changing
+    /// `PeerId` causes every peer to see us as brand-new and triggers repeated
+    /// catalog re-exchanges, accumulating duplicate remote tracks.
+    ///
+    /// This is the *transport* key only (Noise handshake / connection identity).
+    /// It is separate from the PGP signing key stored in `p2p_identity_armored`
+    /// and carries no message-signing authority.  Storing it in plaintext here
+    /// is acceptable; the sensitive piece is the PGP key, which is passphrase-
+    /// protected and the passphrase lives in the OS keychain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2p_transport_keypair_hex: Option<String>,
+
     /// Fixed TCP/UDP listen port for P2P (enables consistent port-forwarding).
     /// If absent or 0, a random port is assigned each session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,18 +103,19 @@ fn default_abandon_secs()       -> u64 { 30 }
 impl Default for Config {
     fn default() -> Self {
         Self {
-            source_dirs:              Vec::new(),
-            p2p_identity_armored:     None,
-            p2p_identity_passphrase:  None,
-            p2p_nickname:             None,
-            p2p_trusted_peers:        Vec::new(),
-            p2p_bootstrap_peers:      Vec::new(),
-            p2p_listen_port:          None,
-            p2p_chunk_retries:        default_chunk_retries(),
-            p2p_beacon_interval_secs: default_beacon_interval_secs(),
-            p2p_mdns_interval_secs:   default_mdns_interval_secs(),
-            p2p_stall_secs:           default_stall_secs(),
-            p2p_abandon_secs:         default_abandon_secs(),
+            source_dirs:                Vec::new(),
+            p2p_identity_armored:       None,
+            p2p_identity_passphrase:    None,
+            p2p_nickname:               None,
+            p2p_trusted_peers:          Vec::new(),
+            p2p_bootstrap_peers:        Vec::new(),
+            p2p_listen_port:            None,
+            p2p_transport_keypair_hex:  None,
+            p2p_chunk_retries:          default_chunk_retries(),
+            p2p_beacon_interval_secs:   default_beacon_interval_secs(),
+            p2p_mdns_interval_secs:     default_mdns_interval_secs(),
+            p2p_stall_secs:             default_stall_secs(),
+            p2p_abandon_secs:           default_abandon_secs(),
         }
     }
 }
