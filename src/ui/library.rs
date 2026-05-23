@@ -140,15 +140,33 @@ pub(super) fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
     // Build the display list.  For GroupBy sort orders, section header rows
     // are injected between groups.  Headers are not selectable, so we track a
     // separate visual_selected index that accounts for the offsets.
+    // Remote tracks always sit at the bottom under a "Remote Libraries" header.
     let use_sections = app.library.sort_order.has_sections();
 
     let mut items: Vec<ListItem> = Vec::with_capacity(app.library.tracks.len() + 8);
     let mut visual_selected: usize = app.library.selected_index;
     let mut last_key: Option<String> = None;
+    let mut remote_header_injected = false;
 
     for (i, track) in app.library.tracks.iter().enumerate() {
-        // Inject a section header whenever the group key changes.
-        if use_sections {
+        // Inject the "Remote Libraries" divider before the first remote track.
+        // Remote tracks are always at the end (see apply_sort), so this fires once.
+        if track.is_remote() && !remote_header_injected {
+            let label = "── Remote Libraries ";
+            let dashes = "─".repeat(avail.saturating_sub(label.chars().count()));
+            let header_text = format!("{label}{dashes}");
+            items.push(ListItem::new(Line::from(Span::styled(
+                header_text,
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))));
+            remote_header_injected = true;
+            if i <= app.library.selected_index {
+                visual_selected += 1;
+            }
+        }
+
+        // Inject a section header whenever the group key changes (local tracks only).
+        if use_sections && !track.is_remote() {
             if let Some(key) = app.library.section_key(track) {
                 if last_key.as_deref() != Some(&key) {
                     let dashes = "─".repeat(avail.saturating_sub(key.len() + 4));
@@ -169,7 +187,15 @@ pub(super) fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
         let selected   = app.is_track_selected(i);
         let marker     = if selected { "◆ " } else { "  " };
 
-        let (badge_spans, badge_width) = build_badges(app, &track.path);
+        // Remote tracks use a peer badge instead of playlist/tag badges.
+        let (badge_spans, badge_width) = if let Some(ref origin) = track.remote {
+            let badge = format!("[@{}]", origin.peer_nick);
+            let w = badge.chars().count() + 1; // +1 for leading space
+            let color = if is_focused { Color::Cyan } else { Color::DarkGray };
+            (vec![Span::raw(" "), Span::styled(badge, Style::default().fg(color))], w)
+        } else {
+            build_badges(app, &track.path)
+        };
         let main_avail = avail.saturating_sub(badge_width);
 
         let full = track.info_line();
@@ -187,7 +213,10 @@ pub(super) fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
             super::truncate(&full, main_avail)
         };
 
-        let (title_color, meta_color) = if is_focused {
+        // Remote tracks use a slightly dimmer title so they're visually distinct.
+        let (title_color, meta_color) = if track.is_remote() {
+            if is_focused { (Color::Cyan, Color::DarkGray) } else { (Color::DarkGray, Color::DarkGray) }
+        } else if is_focused {
             (Color::White, Color::Gray)
         } else {
             (Color::White, super::CLR_DIM)
@@ -481,13 +510,24 @@ fn render_track_metadata(app: &App, frame: &mut Frame, area: Rect) {
         ),
     ]));
 
-    lines.push(Line::from(vec![
-        Span::styled("Path   ", Style::default().fg(super::CLR_DIM)),
-        Span::styled(
-            super::truncate(&track.path.display().to_string(), w.saturating_sub(8)),
-            Style::default().fg(super::CLR_DIM),
-        ),
-    ]));
+    // Show peer identity for remote tracks; local path for local tracks.
+    if let Some(ref origin) = track.remote {
+        lines.push(Line::from(vec![
+            Span::styled("Source ", Style::default().fg(super::CLR_DIM)),
+            Span::styled(
+                format!("@{} (remote)", origin.peer_nick),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("Path   ", Style::default().fg(super::CLR_DIM)),
+            Span::styled(
+                super::truncate(&track.path.display().to_string(), w.saturating_sub(8)),
+                Style::default().fg(super::CLR_DIM),
+            ),
+        ]));
+    }
 
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }),

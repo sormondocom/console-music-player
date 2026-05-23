@@ -153,7 +153,20 @@ fn unix_year_month(secs: u64) -> (i32, u32) {
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use uuid::Uuid;
+
 use crate::media::{MediaCapability, MediaFormat, MediaItem};
+
+/// Origin metadata for a track sourced from a P2P peer, not the local filesystem.
+#[derive(Debug, Clone)]
+pub struct RemoteOrigin {
+    /// PGP fingerprint of the owning peer.
+    pub peer_fp: String,
+    /// Human-readable nickname of the owning peer.
+    pub peer_nick: String,
+    /// Content-addressed UUID (UUIDv5) used to request this track over P2P.
+    pub track_id: Uuid,
+}
 
 /// A single audio track with full metadata.
 #[derive(Debug, Clone)]
@@ -168,6 +181,14 @@ pub struct Track {
     pub bitrate_kbps: Option<u32>,
     pub sample_rate_hz: Option<u32>,
     pub channels: Option<u8>,
+    /// Set when the track lives on a remote peer rather than the local filesystem.
+    pub remote: Option<RemoteOrigin>,
+}
+
+impl Track {
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
 }
 
 impl MediaItem for Track {
@@ -193,6 +214,9 @@ impl MediaItem for Track {
     }
 
     fn capabilities(&self) -> &'static [MediaCapability] {
+        if self.remote.is_some() {
+            return &[];
+        }
         match self.format() {
             MediaFormat::Standard => &[
                 MediaCapability::TagEdit,
@@ -296,7 +320,14 @@ impl Library {
     }
 
     /// Re-sort `tracks` according to the current `sort_order`.
+    ///
+    /// Remote tracks are always placed after all local tracks, sorted by peer
+    /// nickname then artist then title, regardless of the active sort preset.
     pub fn apply_sort(&mut self) {
+        // Partition so remote tracks are never mixed into the local sort.
+        let mut remote: Vec<Track> = self.tracks.iter().filter(|t| t.remote.is_some()).cloned().collect();
+        self.tracks.retain(|t| t.remote.is_none());
+
         match self.sort_order {
             SortOrder::Original => {
                 // Restore the order tracks had when they were first scanned.
@@ -399,6 +430,17 @@ impl Library {
                 });
             }
         }
+
+        // Remote tracks always appear after all local tracks, sorted by peer
+        // nickname, then artist, then title.
+        remote.sort_by(|a, b| {
+            let na = a.remote.as_ref().map(|r| r.peer_nick.as_str()).unwrap_or("");
+            let nb = b.remote.as_ref().map(|r| r.peer_nick.as_str()).unwrap_or("");
+            na.cmp(nb)
+                .then_with(|| a.artist.cmp(&b.artist))
+                .then_with(|| a.title.cmp(&b.title))
+        });
+        self.tracks.extend(remote);
     }
 
     /// Update the tag sort keys (called whenever the tag store changes).
@@ -476,5 +518,45 @@ impl Library {
 
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty()
+    }
+
+    // ── Remote track management ──────────────────────────────────────────
+
+    /// Replace all tracks from `peer_fp` with `new_tracks` and re-sort.
+    ///
+    /// Remote tracks always appear at the bottom of the library regardless of
+    /// the active sort order (see `apply_sort`).
+    pub fn merge_remote_catalog(&mut self, peer_fp: &str, new_tracks: Vec<Track>) {
+        self.all_tracks.retain(|t| t.remote.as_ref().map(|r| r.peer_fp.as_str()) != Some(peer_fp));
+        self.tracks.retain(|t| t.remote.as_ref().map(|r| r.peer_fp.as_str()) != Some(peer_fp));
+        self.all_tracks.extend(new_tracks.iter().cloned());
+        self.tracks.extend(new_tracks);
+        if self.selected_index >= self.tracks.len() {
+            self.selected_index = self.tracks.len().saturating_sub(1);
+        }
+    }
+
+    /// Remove all tracks sourced from `peer_fp`.
+    pub fn remove_remote_peer(&mut self, peer_fp: &str) {
+        self.all_tracks.retain(|t| t.remote.as_ref().map(|r| r.peer_fp.as_str()) != Some(peer_fp));
+        self.tracks.retain(|t| t.remote.as_ref().map(|r| r.peer_fp.as_str()) != Some(peer_fp));
+        if self.selected_index >= self.tracks.len() {
+            self.selected_index = self.tracks.len().saturating_sub(1);
+        }
+    }
+
+    /// Remove all remote tracks (called on P2P disconnect).
+    pub fn clear_remote_tracks(&mut self) {
+        self.all_tracks.retain(|t| t.remote.is_none());
+        self.tracks.retain(|t| t.remote.is_none());
+        if self.selected_index >= self.tracks.len() {
+            self.selected_index = self.tracks.len().saturating_sub(1);
+        }
+    }
+
+    /// Return a clone of all remote tracks currently in the library.
+    /// Used by `rescan()` to re-inject peers after replacing the local catalog.
+    pub fn take_remote_tracks(&self) -> Vec<Track> {
+        self.all_tracks.iter().filter(|t| t.remote.is_some()).cloned().collect()
     }
 }

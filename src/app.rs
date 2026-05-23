@@ -12,7 +12,7 @@ use crate::device::ipod_ums::IpodUmsDevice;
 use crate::device::MusicDevice;
 use crate::library::dedup::{self, DedupAction, DuplicateGroup};
 use crate::library::scanner;
-use crate::library::{Library, TrackEdit};
+use crate::library::{Library, RemoteOrigin, Track, TrackEdit};
 use crate::media::MediaItem;
 use crate::player::Player;
 use crate::playlist::{ConflictCtx, Playlist};
@@ -641,6 +641,8 @@ impl App {
 
     pub fn rescan(&mut self) {
         let active_playlist = self.library.active_playlist.clone();
+        // Preserve remote tracks so they survive the local catalog rebuild.
+        let saved_remote = self.library.take_remote_tracks();
         match scanner::scan_directories(&self.source_dirs) {
             Ok(tracks) => {
                 let n = tracks.len();
@@ -650,6 +652,16 @@ impl App {
                     if let Ok(pl) = Playlist::load(&name) {
                         self.library.load_playlist(&name, &pl.tracks);
                     }
+                }
+                // Re-inject remote tracks grouped by peer.
+                let mut by_peer: std::collections::HashMap<String, Vec<Track>> = std::collections::HashMap::new();
+                for t in saved_remote {
+                    if let Some(ref o) = t.remote {
+                        by_peer.entry(o.peer_fp.clone()).or_default().push(t);
+                    }
+                }
+                for (fp, tracks) in by_peer {
+                    self.library.merge_remote_catalog(&fp, tracks);
                 }
                 self.status_message = Some(format!(
                     "Scanned {} source(s) — {n} tracks.",
@@ -906,6 +918,24 @@ impl App {
 
     pub fn play_focused(&mut self) {
         if let Some(track) = self.library.tracks.get(self.library.selected_index).cloned() {
+            // Remote tracks are fetched over P2P rather than played from disk.
+            if let Some(origin) = &track.remote {
+                if let Some(node) = &self.p2p_node {
+                    node.send(crate::p2p::P2pCommand::RequestTrack {
+                        track_id: origin.track_id,
+                        peer_fp:  origin.peer_fp.clone(),
+                    });
+                    self.p2p_buffer_state = P2pBufferState::Requesting {
+                        track_id:  origin.track_id,
+                        peer_nick: origin.peer_nick.clone(),
+                    };
+                } else {
+                    self.status_message = Some(
+                        "P2P not active — cannot play remote track.".into()
+                    );
+                }
+                return;
+            }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.player.play(&track)
             }));
@@ -1986,6 +2016,27 @@ impl App {
         }
     }
 
+    /// Convert a wire `RemoteTrack` into a library `Track` for display in the main library.
+    fn remote_track_to_lib_track(rt: &RemoteTrack) -> Track {
+        Track {
+            path:           std::path::PathBuf::new(),
+            title:          rt.title.clone(),
+            artist:         rt.artist.clone(),
+            album:          rt.album.clone(),
+            year:           rt.year,
+            duration_secs:  rt.duration_secs,
+            file_size:      rt.file_size,
+            bitrate_kbps:   rt.bitrate_kbps,
+            sample_rate_hz: rt.sample_rate_hz,
+            channels:       rt.channels,
+            remote: Some(RemoteOrigin {
+                peer_fp:   rt.owner_fp.clone(),
+                peer_nick: rt.owner_nick.clone(),
+                track_id:  rt.id,
+            }),
+        }
+    }
+
     /// Deactivate P2P mode, disconnecting from the network.
     pub fn deactivate_p2p(&mut self) {
         if let Some(node) = &self.p2p_node {
@@ -1996,6 +2047,7 @@ impl App {
         self.remote_tracks.clear();
         self.p2p_peer_list.clear();
         self.p2p_listen_addrs.clear();
+        self.library.clear_remote_tracks();
         self.screen = Screen::Library;
         self.status_message = Some("P2P disconnected.".into());
     }
@@ -2249,9 +2301,13 @@ impl App {
                     t.owner_fp   = peer_fp.clone();
                     t.owner_nick = peer_nick.clone();
                 }
-                // Merge into remote_tracks, replacing any previous entries from this peer.
+                // Merge into remote_tracks (for the RemoteLibrary screen).
                 self.remote_tracks.retain(|t| t.owner_fp != peer_fp);
-                self.remote_tracks.extend(tracks);
+                self.remote_tracks.extend(tracks.iter().cloned());
+                // Also inject into the main library so remote tracks are visible
+                // on the Library screen without navigating to P2P screens.
+                let lib_tracks: Vec<Track> = tracks.iter().map(Self::remote_track_to_lib_track).collect();
+                self.library.merge_remote_catalog(&peer_fp, lib_tracks);
                 // The node already emits a "catalog complete" Info toast; no
                 // duplicate toast needed here.
             }

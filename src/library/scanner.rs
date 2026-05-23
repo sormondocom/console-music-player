@@ -119,6 +119,7 @@ fn scan_directory_cached(
                 bitrate_kbps:   cached.bitrate_kbps,
                 sample_rate_hz: cached.sample_rate_hz,
                 channels:       cached.channels,
+                remote:         None,
             };
             tracks.push(track);
             *hits += 1;
@@ -160,6 +161,7 @@ fn scan_directory_cached(
                 bitrate_kbps:   None,
                 sample_rate_hz: Some(48_000),
                 channels:       if tmeta.channels > 0 { Some(tmeta.channels as u8) } else { None },
+                remote:         None,
             }
         } else {
             let meta = read_metadata(path);
@@ -174,6 +176,7 @@ fn scan_directory_cached(
                 bitrate_kbps:   meta.bitrate_kbps,
                 sample_rate_hz: meta.sample_rate_hz,
                 channels:       meta.channels,
+                remote:         None,
             }
         };
 
