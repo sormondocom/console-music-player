@@ -50,6 +50,14 @@ pub const BEACON_PORT: u16 = 17_101;
 /// discovery with negligible bandwidth (~200 B × N-interfaces × 0.5 Hz).
 const BEACON_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long before a previously-forwarded peer is eligible for re-discovery.
+///
+/// If a peer drops and reconnects on the same (peer_id, port) within this
+/// window the duplicate beacon is still suppressed.  After this TTL the entry
+/// expires and the next beacon triggers a fresh dial attempt — allowing
+/// reconnection without saturating the node with dial requests every 2 s.
+const REDISCOVER_TTL: Duration = Duration::from_secs(30);
+
 /// Four-byte protocol magic prepended to every datagram.
 /// Drops unrelated UDP packets cheaply without a full parse.
 const MAGIC: &[u8; 4] = b"CMP1";
@@ -130,14 +138,19 @@ async fn run(
     let mut ticker   = time::interval(BEACON_INTERVAL);
     // First tick fires immediately — start broadcasting right away.
     let mut recv_buf = vec![0u8; 512];
-    // Track (peer_id_str, tcp_port) pairs we've already forwarded so we don't
-    // flood the node with duplicate dial requests every 2 seconds.
-    let mut seen: std::collections::HashSet<(String, u16)> = std::collections::HashSet::new();
+    // Track when each (peer_id_str, tcp_port) pair was last forwarded.
+    // Entries expire after REDISCOVER_TTL so a peer that drops and comes back
+    // on the same port is re-dialled rather than silently ignored forever.
+    let mut seen: std::collections::HashMap<(String, u16), std::time::Instant> =
+        std::collections::HashMap::new();
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 send_beacons(&socket, &beacon_payload).await;
+                // Prune expired entries so the map does not grow unbounded.
+                let now = std::time::Instant::now();
+                seen.retain(|_, ts| now.duration_since(*ts) < REDISCOVER_TTL);
             }
 
             result = socket.recv_from(&mut recv_buf) => {
@@ -231,7 +244,7 @@ fn handle_recv(
     data:         &[u8],
     from:         SocketAddr,
     my_peer_id:   &str,
-    seen:         &mut std::collections::HashSet<(String, u16)>,
+    seen:         &mut std::collections::HashMap<(String, u16), std::time::Instant>,
     tx:           &mpsc::UnboundedSender<(PeerId, Multiaddr)>,
 ) {
     // Magic check
@@ -249,10 +262,15 @@ fn handle_recv(
         return;
     }
 
-    // Dedup: only forward each (peer_id, port) pair once per session
+    // Suppress if this (peer_id, port) was forwarded recently — avoids flooding
+    // the node with dial requests every 2 s.  After REDISCOVER_TTL the entry
+    // expires and the next beacon triggers a fresh dial (reconnection path).
     let key = (beacon.peer_id.clone(), beacon.tcp_port);
-    if seen.contains(&key) {
-        return;
+    let now = std::time::Instant::now();
+    if let Some(&last) = seen.get(&key) {
+        if now.duration_since(last) < REDISCOVER_TTL {
+            return;
+        }
     }
 
     // Parse PeerId
@@ -268,7 +286,7 @@ fn handle_recv(
         return;
     };
 
-    seen.insert(key);
-    debug!(%peer_id, %ma, "LAN beacon: new peer");
+    seen.insert(key, now);
+    debug!(%peer_id, %ma, "LAN beacon: peer (re)discovered");
     let _ = tx.send((peer_id, ma));
 }

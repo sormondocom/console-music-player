@@ -147,6 +147,9 @@ pub struct MusicNode {
     stall_secs: u64,
     /// Seconds after stall before abandoning the transfer entirely.
     abandon_secs: u64,
+    /// Last known dial address per PeerId — populated on ConnectionEstablished
+    /// so the status ticker can proactively retry offline peers.
+    peer_addrs: HashMap<PeerId, Multiaddr>,
 }
 
 impl MusicNode {
@@ -208,6 +211,7 @@ impl MusicNode {
             chunk_retries,
             stall_secs,
             abandon_secs,
+            peer_addrs: HashMap::new(),
         };
 
         tokio::spawn(async move {
@@ -257,6 +261,24 @@ impl MusicNode {
                         warn!("status announce failed: {e}");
                     }
                     self.prune_expired_nominations().await;
+
+                    // Keep the UI peer list fresh without requiring user navigation.
+                    let snapshot: Vec<_> = self.node_map.values().cloned().collect();
+                    let _ = self.event_tx.send(P2pEvent::PeerListSnapshot(snapshot)).ok();
+
+                    // Re-dial any offline peers whose address we still know.
+                    // The swarm deduplicates; this is a no-op when already connected.
+                    let offline_addrs: Vec<(PeerId, Multiaddr)> = self.peer_addrs
+                        .iter()
+                        .filter(|(pid, _)| !self.swarm.is_connected(pid))
+                        .map(|(pid, addr)| (*pid, addr.clone()))
+                        .collect();
+                    for (peer_id, addr) in offline_addrs {
+                        debug!(%peer_id, %addr, "status tick: retrying offline peer");
+                        if let Err(e) = self.swarm.dial(addr) {
+                            debug!(%peer_id, "retry dial failed: {e}");
+                        }
+                    }
                 }
 
                 discovered = self.beacon_rx.recv() => {
@@ -580,8 +602,12 @@ impl MusicNode {
                 }
             }
 
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, .. } => {
                 info!(%peer_id, "connection established");
+                // Remember the remote address so the status ticker can re-dial
+                // if this peer later goes offline.
+                let remote_addr = endpoint.get_remote_address().clone();
+                self.peer_addrs.insert(peer_id, remote_addr);
                 network::add_gossipsub_peer(&mut self.swarm, peer_id);
                 // Re-announce our PGP key so the new peer learns our identity.
                 // The startup announcement fires before any peers are connected
