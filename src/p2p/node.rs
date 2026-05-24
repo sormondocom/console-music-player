@@ -150,6 +150,9 @@ pub struct MusicNode {
     /// Last known dial address per PeerId — populated on ConnectionEstablished
     /// so the status ticker can proactively retry offline peers.
     peer_addrs: HashMap<PeerId, Multiaddr>,
+    /// Peers whose last connection closed; we wait for a grace period before
+    /// declaring them offline to avoid spurious toasts on LAN connection churn.
+    pending_offline: HashMap<PeerId, std::time::Instant>,
 }
 
 impl MusicNode {
@@ -260,6 +263,7 @@ impl MusicNode {
             stall_secs,
             abandon_secs,
             peer_addrs: HashMap::new(),
+            pending_offline: HashMap::new(),
         };
 
         tokio::spawn(async move {
@@ -287,6 +291,11 @@ impl MusicNode {
 
         let mut status_ticker = time::interval(STATUS_ANNOUNCE_INTERVAL);
         status_ticker.tick().await; // skip immediate first tick
+
+        // Fires every 2 s to promote peers from pending_offline → PeerOffline
+        // after the 8 s grace period.  This smooths over momentary LAN drops.
+        let mut offline_check_ticker = time::interval(Duration::from_secs(2));
+        offline_check_ticker.tick().await; // skip immediate first tick
 
         loop {
             tokio::select! {
@@ -325,6 +334,31 @@ impl MusicNode {
                         debug!(%peer_id, %addr, "status tick: retrying offline peer");
                         if let Err(e) = self.swarm.dial(addr) {
                             debug!(%peer_id, "retry dial failed: {e}");
+                        }
+                    }
+                }
+
+                _ = offline_check_ticker.tick() => {
+                    const OFFLINE_GRACE_SECS: u64 = 8;
+                    let now = std::time::Instant::now();
+                    let expired: Vec<PeerId> = self.pending_offline
+                        .iter()
+                        .filter(|(_, t)| now.duration_since(**t).as_secs() >= OFFLINE_GRACE_SECS)
+                        .map(|(pid, _)| *pid)
+                        .collect();
+                    for peer_id in expired {
+                        self.pending_offline.remove(&peer_id);
+                        if let Some(fp) = self.keystore.fingerprint_for_peer(&peer_id).map(str::to_string) {
+                            if let Some(info) = self.node_map.get_mut(&fp) {
+                                info.status = NodeStatus::Offline;
+                            }
+                            let nick = self.node_map.get(&fp)
+                                .map(|n| n.nickname.clone())
+                                .unwrap_or_default();
+                            let _ = self.event_tx.send(P2pEvent::PeerOffline {
+                                fingerprint: fp,
+                                nickname: nick,
+                            }).ok();
                         }
                     }
                 }
@@ -652,6 +686,8 @@ impl MusicNode {
 
             SwarmEvent::ConnectionEstablished { peer_id, ref endpoint, .. } => {
                 info!(%peer_id, "connection established");
+                // Cancel any pending-offline grace timer — peer reconnected.
+                self.pending_offline.remove(&peer_id);
                 // Remember the remote address so the status ticker can re-dial
                 // if this peer later goes offline.
                 let remote_addr = endpoint.get_remote_address().clone();
@@ -666,19 +702,14 @@ impl MusicNode {
                 }
             }
 
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                info!(%peer_id, "connection closed");
-                if let Some(fp) = self.keystore.fingerprint_for_peer(&peer_id).map(str::to_string) {
-                    if let Some(info) = self.node_map.get_mut(&fp) {
-                        info.status = NodeStatus::Offline;
-                    }
-                    let nick = self.node_map.get(&fp)
-                        .map(|n| n.nickname.clone())
-                        .unwrap_or_default();
-                    let _ = self.event_tx.send(P2pEvent::PeerOffline {
-                        fingerprint: fp,
-                        nickname: nick,
-                    }).ok();
+            SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                info!(%peer_id, remaining = num_established, "connection closed");
+                // Only start the offline grace timer when the last connection to
+                // this peer has closed.  libp2p can maintain multiple connections
+                // to the same peer; a close event for one of several is not
+                // meaningful from an application perspective.
+                if num_established == 0 {
+                    self.pending_offline.insert(peer_id, std::time::Instant::now());
                 }
             }
 

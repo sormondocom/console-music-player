@@ -930,8 +930,9 @@ impl App {
                     // discarded by the TrackBufferReady guard below.
                     self.player.stop();
                     self.p2p_buffer_state = P2pBufferState::Requesting {
-                        track_id:  origin.track_id,
-                        peer_nick: origin.peer_nick.clone(),
+                        track_id:     origin.track_id,
+                        peer_nick:    origin.peer_nick.clone(),
+                        requested_at: std::time::Instant::now(),
                     };
                     node.send(crate::p2p::P2pCommand::RequestTrack {
                         track_id: origin.track_id,
@@ -1851,18 +1852,13 @@ impl App {
             // Suppress any pending advance so the error overlay can show cleanly.
             self.player.needs_next = false;
         } else if self.player.take_needs_next() {
-            // Only auto-advance into the local library when no remote track is
-            // active.  If a remote track just finished, clear the buffer state
-            // and stop — the user must choose the next remote track explicitly.
-            match &self.p2p_buffer_state {
-                P2pBufferState::Playing { .. } => {
-                    self.p2p_buffer_state = P2pBufferState::Idle;
-                    self.player.current_remote = None;
-                }
-                _ => {
-                    self.advance_track();
-                }
+            // If a remote track just finished, clear the buffer state first so
+            // advance_track() / play_focused() can start fresh.
+            if matches!(&self.p2p_buffer_state, P2pBufferState::Playing { .. }) {
+                self.p2p_buffer_state = P2pBufferState::Idle;
+                self.player.current_remote = None;
             }
+            self.advance_track();
         }
         self.tick_transfer();
         self.tick_organize();
@@ -2300,6 +2296,21 @@ impl App {
             party.prune_expired();
         }
 
+        // Requesting timeout — peer never sent TrackOffer.
+        if let P2pBufferState::Requesting { requested_at, peer_nick, .. } = &self.p2p_buffer_state {
+            if requested_at.elapsed().as_secs() >= 30 {
+                let nick = peer_nick.clone();
+                self.p2p_buffer_state = P2pBufferState::Idle;
+                self.push_toast(Toast::error(format!(
+                    "{nick} did not respond to track request"
+                )));
+                if self.player.shuffle == crate::player::ShuffleMode::On {
+                    self.advance_track();
+                }
+                return;
+            }
+        }
+
         // Stall detection for in-progress buffer.
         let stall_secs   = self.p2p_stall_secs;
         let abandon_secs = self.p2p_abandon_secs;
@@ -2321,6 +2332,9 @@ impl App {
                     )));
                     if let Some(node) = &self.p2p_node {
                         node.send(crate::p2p::P2pCommand::DeclineTrackRequest { transfer_id: tid });
+                    }
+                    if self.player.shuffle == crate::player::ShuffleMode::On {
+                        self.advance_track();
                     }
                     return;
                 }
@@ -2508,6 +2522,9 @@ impl App {
             P2pEvent::TrackTransferFailed { reason, .. } => {
                 self.p2p_buffer_state = P2pBufferState::Idle;
                 self.push_toast(Toast::error(format!("Transfer failed: {reason}")));
+                if self.player.shuffle == crate::player::ShuffleMode::On {
+                    self.advance_track();
+                }
             }
             P2pEvent::TrackNominated { nomination_id, track, nominated_by } => {
                 let party = self.party_line.get_or_insert_with(PartyLineState::new);
@@ -2533,8 +2550,9 @@ impl App {
                         let peer_fp = track.owner_fp.clone();
                         let peer_nick = track.owner_nick.clone();
                         self.p2p_buffer_state = crate::p2p::P2pBufferState::Requesting {
-                            track_id: track.id,
+                            track_id:     track.id,
                             peer_nick,
+                            requested_at: std::time::Instant::now(),
                         };
                         node.send(crate::p2p::P2pCommand::RequestTrack {
                             track_id: track.id,

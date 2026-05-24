@@ -230,6 +230,7 @@ pub enum P2pBufferState {
     Requesting {
         track_id: Uuid,
         peer_nick: String,
+        requested_at: std::time::Instant,
     },
     /// Chunks arriving; downloading into the in-memory buffer.
     Buffering {

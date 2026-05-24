@@ -1106,6 +1106,7 @@ fn handle_remote_library_key(app: &mut App, key: KeyCode) {
                 app.p2p_buffer_state = crate::p2p::P2pBufferState::Requesting {
                     track_id,
                     peer_nick,
+                    requested_at: std::time::Instant::now(),
                 };
                 if let Some(node) = &app.p2p_node {
                     node.send(crate::p2p::P2pCommand::RequestTrack { track_id, peer_fp });
