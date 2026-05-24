@@ -1101,6 +1101,8 @@ fn handle_remote_library_key(app: &mut App, key: KeyCode) {
                 let track_id  = track.id;
                 let peer_fp   = track.owner_fp.clone();
                 let peer_nick = track.owner_nick.clone();
+                // Commit immediately: stop whatever is playing/paused.
+                app.player.stop();
                 app.p2p_buffer_state = crate::p2p::P2pBufferState::Requesting {
                     track_id,
                     peer_nick,

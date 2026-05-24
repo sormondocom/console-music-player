@@ -924,14 +924,19 @@ impl App {
             // Remote tracks are fetched over P2P rather than played from disk.
             if let Some(origin) = &track.remote {
                 if let Some(node) = &self.p2p_node {
-                    node.send(crate::p2p::P2pCommand::RequestTrack {
-                        track_id: origin.track_id,
-                        peer_fp:  origin.peer_fp.clone(),
-                    });
+                    // Commit immediately: stop whatever is playing/paused so the
+                    // UI reflects the new intent and the old sink is released.
+                    // Any in-flight download for a previous request will be
+                    // discarded by the TrackBufferReady guard below.
+                    self.player.stop();
                     self.p2p_buffer_state = P2pBufferState::Requesting {
                         track_id:  origin.track_id,
                         peer_nick: origin.peer_nick.clone(),
                     };
+                    node.send(crate::p2p::P2pCommand::RequestTrack {
+                        track_id: origin.track_id,
+                        peer_fp:  origin.peer_fp.clone(),
+                    });
                 } else {
                     self.status_message = Some(
                         "P2P not active — cannot play remote track.".into()
@@ -2441,11 +2446,14 @@ impl App {
                 }
             }
             P2pEvent::TrackBufferReady { bytes, track, transfer_id } => {
-                let nick = if let P2pBufferState::Buffering { ref peer_nick, .. } = self.p2p_buffer_state {
-                    peer_nick.clone()
-                } else {
-                    track.owner_nick.clone()
-                };
+                // Guard: only play if we're still in Buffering state for this exact
+                // transfer.  If the user selected a different track after this
+                // download started, p2p_buffer_state will have moved on and this
+                // stale TrackBufferReady must not hijack playback.
+                let is_current = matches!(
+                    &self.p2p_buffer_state,
+                    P2pBufferState::Buffering { transfer_id: tid, .. } if *tid == transfer_id
+                );
 
                 // Check if this is for an active party line — if so, defer playback to start_at.
                 let is_party = self.party_line
@@ -2453,6 +2461,17 @@ impl App {
                     .and_then(|p| p.active.as_ref())
                     .map(|a| a.track.id == track.id && !a.started)
                     .unwrap_or(false);
+
+                // Discard stale completions (user moved on to a different track).
+                if !is_current && !is_party {
+                    return;
+                }
+
+                let nick = if let P2pBufferState::Buffering { ref peer_nick, .. } = self.p2p_buffer_state {
+                    peer_nick.clone()
+                } else {
+                    track.owner_nick.clone()
+                };
 
                 if is_party {
                     // Mark buffer ready; tick_p2p will start playback at start_at.
