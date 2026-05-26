@@ -2121,6 +2121,7 @@ impl App {
                 peer_fp:   rt.owner_fp.clone(),
                 peer_nick: rt.owner_nick.clone(),
                 track_id:  rt.id,
+                ext:       rt.format.label().to_lowercase(),
             }),
         }
     }

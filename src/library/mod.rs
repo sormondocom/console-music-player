@@ -90,13 +90,7 @@ impl SortOrder {
     /// Returns `None` for sort orders that don't use section headers.
     pub fn section_key(self, track: &Track) -> Option<String> {
         match self {
-            Self::GroupByExtension => Some(
-                track.path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_uppercase())
-                    .unwrap_or_else(|| "OTHER".into()),
-            ),
+            Self::GroupByExtension => Some(track_ext_key(track).to_uppercase()),
             Self::GroupByArtist => Some(
                 if track.artist.is_empty() {
                     "Unknown Artist".into()
@@ -166,6 +160,9 @@ pub struct RemoteOrigin {
     pub peer_nick: String,
     /// Content-addressed UUID (UUIDv5) used to request this track over P2P.
     pub track_id: Uuid,
+    /// Lowercase file-extension hint (e.g. "mp3", "flac") used for sorting
+    /// and grouping because remote tracks have no local filesystem path.
+    pub ext: String,
 }
 
 /// A single audio track with full metadata.
@@ -256,6 +253,19 @@ pub struct TrackEdit {
     pub genre:        Option<String>,
 }
 
+/// Returns the lowercase extension string for a track, using the remote `ext`
+/// hint for remote tracks (which have an empty local path).
+fn track_ext_key(t: &Track) -> String {
+    if let Some(ref origin) = t.remote {
+        return origin.ext.clone();
+    }
+    t.path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Library
 // ---------------------------------------------------------------------------
@@ -320,20 +330,25 @@ impl Library {
     }
 
     /// Re-sort `tracks` according to the current `sort_order`.
+    /// Re-sort `tracks` according to the current `sort_order`.
     ///
-    /// Remote tracks are always placed after all local tracks, sorted by peer
-    /// nickname then artist then title, regardless of the active sort preset.
+    /// Remote tracks are sorted in-place alongside local tracks using the same
+    /// key.  For sort orders that rely on filesystem metadata (DateAdded,
+    /// GroupByMonth, Original) remote tracks sort after local ones because they
+    /// have no local mtime or scan position.
     pub fn apply_sort(&mut self) {
-        // Partition so remote tracks are never mixed into the local sort.
-        let mut remote: Vec<Track> = self.tracks.iter().filter(|t| t.remote.is_some()).cloned().collect();
-        self.tracks.retain(|t| t.remote.is_none());
-
         match self.sort_order {
             SortOrder::Original => {
-                // Restore the order tracks had when they were first scanned.
                 let pos: std::collections::HashMap<&PathBuf, usize> =
                     self.original_paths.iter().enumerate().map(|(i, p)| (p, i)).collect();
-                self.tracks.sort_by_key(|t| pos.get(&t.path).copied().unwrap_or(usize::MAX));
+                // Remote tracks (empty path) get usize::MAX → appear after all local tracks.
+                self.tracks.sort_by(|a, b| {
+                    let pa = pos.get(&a.path).copied().unwrap_or(usize::MAX);
+                    let pb = pos.get(&b.path).copied().unwrap_or(usize::MAX);
+                    pa.cmp(&pb)
+                        .then_with(|| a.artist.cmp(&b.artist))
+                        .then_with(|| a.title.cmp(&b.title))
+                });
             }
             SortOrder::ArtistAlbumTitle => {
                 self.tracks.sort_by(|a, b| {
@@ -355,23 +370,18 @@ impl Library {
             }
             SortOrder::DateAdded => {
                 // Best available proxy on all platforms: file modification time.
-                // Newer files sort first.
+                // Newer files sort first; remote tracks (no mtime) sort last.
                 self.tracks.sort_by(|a, b| {
-                    let mt = |p: &PathBuf| {
-                        std::fs::metadata(p).and_then(|m| m.modified()).ok()
+                    let mt = |t: &Track| {
+                        if t.remote.is_some() { return None; }
+                        std::fs::metadata(&t.path).and_then(|m| m.modified()).ok()
                     };
-                    mt(&b.path).cmp(&mt(&a.path))
+                    mt(b).cmp(&mt(a))
                 });
             }
             SortOrder::GroupByExtension => {
                 self.tracks.sort_by(|a, b| {
-                    let ext = |t: &Track| {
-                        t.path.extension()
-                            .and_then(|e| e.to_str())
-                            .map(|e| e.to_lowercase())
-                            .unwrap_or_default()
-                    };
-                    ext(a).cmp(&ext(b))
+                    track_ext_key(a).cmp(&track_ext_key(b))
                         .then_with(|| a.artist.cmp(&b.artist))
                         .then_with(|| a.album.cmp(&b.album))
                         .then_with(|| a.title.cmp(&b.title))
@@ -386,11 +396,10 @@ impl Library {
             }
             SortOrder::GroupByYear => {
                 self.tracks.sort_by(|a, b| {
-                    // None (unknown year) sorts last.
                     match (a.year, b.year) {
-                        (None,    None)    => std::cmp::Ordering::Equal,
-                        (None,    Some(_)) => std::cmp::Ordering::Greater,
-                        (Some(_), None)    => std::cmp::Ordering::Less,
+                        (None,    None)      => std::cmp::Ordering::Equal,
+                        (None,    Some(_))   => std::cmp::Ordering::Greater,
+                        (Some(_), None)      => std::cmp::Ordering::Less,
                         (Some(ya), Some(yb)) => ya.cmp(&yb),
                     }
                     .then_with(|| a.artist.cmp(&b.artist))
@@ -400,17 +409,17 @@ impl Library {
             SortOrder::GroupByMonth => {
                 self.tracks.sort_by(|a, b| {
                     let month_key = |t: &Track| {
+                        if t.remote.is_some() { return None; }
                         std::fs::metadata(&t.path)
                             .and_then(|m| m.modified())
                             .ok()
                             .and_then(|st| st.duration_since(std::time::UNIX_EPOCH).ok())
                             .map(|d| unix_year_month(d.as_secs()))
                     };
-                    // None (unreadable mtime) sorts last.
                     match (month_key(a), month_key(b)) {
-                        (None, None)       => std::cmp::Ordering::Equal,
-                        (None, Some(_))    => std::cmp::Ordering::Greater,
-                        (Some(_), None)    => std::cmp::Ordering::Less,
+                        (None, None)         => std::cmp::Ordering::Equal,
+                        (None, Some(_))      => std::cmp::Ordering::Greater,
+                        (Some(_), None)      => std::cmp::Ordering::Less,
                         (Some(ka), Some(kb)) => ka.cmp(&kb),
                     }
                     .then_with(|| a.artist.cmp(&b.artist))
@@ -418,10 +427,8 @@ impl Library {
                 });
             }
             SortOrder::GroupByTag => {
-                // Clone to avoid simultaneous mutable/immutable borrow of self.
                 let tag_keys = self.tag_sort_keys.clone();
                 self.tracks.sort_by(|a, b| {
-                    // Untagged entries sort after all tagged groups.
                     let ka = tag_keys.get(&a.path).map(String::as_str).unwrap_or("\u{FFFF}");
                     let kb = tag_keys.get(&b.path).map(String::as_str).unwrap_or("\u{FFFF}");
                     ka.cmp(kb)
@@ -430,17 +437,6 @@ impl Library {
                 });
             }
         }
-
-        // Remote tracks always appear after all local tracks, sorted by peer
-        // nickname, then artist, then title.
-        remote.sort_by(|a, b| {
-            let na = a.remote.as_ref().map(|r| r.peer_nick.as_str()).unwrap_or("");
-            let nb = b.remote.as_ref().map(|r| r.peer_nick.as_str()).unwrap_or("");
-            na.cmp(nb)
-                .then_with(|| a.artist.cmp(&b.artist))
-                .then_with(|| a.title.cmp(&b.title))
-        });
-        self.tracks.extend(remote);
     }
 
     /// Update the tag sort keys (called whenever the tag store changes).
@@ -524,13 +520,14 @@ impl Library {
 
     /// Replace all tracks from `peer_fp` with `new_tracks` and re-sort.
     ///
-    /// Remote tracks always appear at the bottom of the library regardless of
-    /// the active sort order (see `apply_sort`).
+    /// Remote tracks are sorted in-place alongside local tracks according to
+    /// the active sort order.
     pub fn merge_remote_catalog(&mut self, peer_fp: &str, new_tracks: Vec<Track>) {
         self.all_tracks.retain(|t| t.remote.as_ref().map(|r| r.peer_fp.as_str()) != Some(peer_fp));
         self.tracks.retain(|t| t.remote.as_ref().map(|r| r.peer_fp.as_str()) != Some(peer_fp));
         self.all_tracks.extend(new_tracks.iter().cloned());
         self.tracks.extend(new_tracks);
+        self.apply_sort();
         if self.selected_index >= self.tracks.len() {
             self.selected_index = self.tracks.len().saturating_sub(1);
         }
