@@ -303,7 +303,7 @@ impl Toast {
         Self {
             message: msg.into(),
             level: ToastLevel::Error,
-            expires_at: None, // persists until dismissed
+            expires_at: Some(Instant::now() + std::time::Duration::from_secs(6)),
         }
     }
 

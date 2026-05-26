@@ -2304,9 +2304,7 @@ impl App {
                 self.push_toast(Toast::error(format!(
                     "{nick} did not respond to track request"
                 )));
-                if self.player.shuffle == crate::player::ShuffleMode::On {
-                    self.advance_track();
-                }
+                self.advance_track();
                 return;
             }
         }
@@ -2333,9 +2331,7 @@ impl App {
                     if let Some(node) = &self.p2p_node {
                         node.send(crate::p2p::P2pCommand::DeclineTrackRequest { transfer_id: tid });
                     }
-                    if self.player.shuffle == crate::player::ShuffleMode::On {
-                        self.advance_track();
-                    }
+                    self.advance_track();
                     return;
                 }
             }
@@ -2522,9 +2518,7 @@ impl App {
             P2pEvent::TrackTransferFailed { reason, .. } => {
                 self.p2p_buffer_state = P2pBufferState::Idle;
                 self.push_toast(Toast::error(format!("Transfer failed: {reason}")));
-                if self.player.shuffle == crate::player::ShuffleMode::On {
-                    self.advance_track();
-                }
+                self.advance_track();
             }
             P2pEvent::TrackNominated { nomination_id, track, nominated_by } => {
                 let party = self.party_line.get_or_insert_with(PartyLineState::new);
