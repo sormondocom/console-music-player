@@ -142,33 +142,15 @@ pub(super) fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
     // Build the display list.  For GroupBy sort orders, section header rows
     // are injected between groups.  Headers are not selectable, so we track a
     // separate visual_selected index that accounts for the offsets.
-    // Remote tracks always sit at the bottom under a "Remote Libraries" header.
     let use_sections = app.library.sort_order.has_sections();
 
     let mut items: Vec<ListItem> = Vec::with_capacity(app.library.tracks.len() + 8);
     let mut visual_selected: usize = app.library.selected_index;
     let mut last_key: Option<String> = None;
-    let mut remote_header_injected = false;
 
     for (i, track) in app.library.tracks.iter().enumerate() {
-        // Inject the "Remote Libraries" divider before the first remote track.
-        // Remote tracks are always at the end (see apply_sort), so this fires once.
-        if track.is_remote() && !remote_header_injected {
-            let label = "── Remote Libraries ";
-            let dashes = "─".repeat(avail.saturating_sub(label.chars().count()));
-            let header_text = format!("{label}{dashes}");
-            items.push(ListItem::new(Line::from(Span::styled(
-                header_text,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ))));
-            remote_header_injected = true;
-            if i <= app.library.selected_index {
-                visual_selected += 1;
-            }
-        }
-
-        // Inject a section header whenever the group key changes (local tracks only).
-        if use_sections && !track.is_remote() {
+        // Inject a section header whenever the group key changes.
+        if use_sections {
             if let Some(key) = app.library.section_key(track) {
                 if last_key.as_deref() != Some(&key) {
                     let dashes = "─".repeat(avail.saturating_sub(key.len() + 4));
@@ -189,16 +171,21 @@ pub(super) fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
         let selected   = app.is_track_selected(i);
         let marker     = if selected { "◆ " } else { "  " };
 
-        // Remote tracks use a peer badge instead of playlist/tag badges.
-        let (badge_spans, badge_width) = if let Some(ref origin) = track.remote {
-            let badge = format!("[@{}]", origin.peer_nick);
-            let w = badge.chars().count() + 1; // +1 for leading space
-            let color = if is_focused { Color::Cyan } else { Color::DarkGray };
-            (vec![Span::raw(" "), Span::styled(badge, Style::default().fg(color))], w)
-        } else {
-            build_badges(app, &track.path)
-        };
-        let main_avail = avail.saturating_sub(badge_width);
+        // Remote tracks: show "@nick  " prefix at the front; local tracks get
+        // playlist/tag badges at the end.
+        let (prefix_spans, prefix_width, badge_spans, badge_width) =
+            if let Some(ref origin) = track.remote {
+                let nick_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+                let prefix = format!("@{}  ", origin.peer_nick);
+                let w = prefix.chars().count();
+                (vec![Span::styled(prefix, Style::default().fg(nick_color))], w,
+                 vec![], 0usize)
+            } else {
+                let (bs, bw) = build_badges(app, &track.path);
+                (vec![], 0usize, bs, bw)
+            };
+
+        let main_avail = avail.saturating_sub(prefix_width + badge_width);
 
         let full = track.info_line();
 
@@ -215,7 +202,7 @@ pub(super) fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
             super::truncate(&full, main_avail)
         };
 
-        // Remote tracks use a slightly dimmer title so they're visually distinct.
+        // Remote tracks use cyan when focused, dark-gray otherwise.
         let (title_color, meta_color) = if track.is_remote() {
             if is_focused { (Color::Cyan, Color::DarkGray) } else { (Color::DarkGray, Color::DarkGray) }
         } else if is_focused {
@@ -224,29 +211,21 @@ pub(super) fn render_library_pane(app: &App, frame: &mut Frame, area: Rect) {
             (Color::White, super::CLR_DIM)
         };
 
+        let mut spans = vec![Span::styled(
+            marker,
+            Style::default().fg(if selected { super::CLR_SELECTED } else { Color::Reset }),
+        )];
+        spans.extend(prefix_spans);
+
         if let Some(sep) = display.find("  ·  ") {
             let (title_part, rest) = display.split_at(sep);
-            let mut spans = vec![
-                Span::styled(
-                    marker,
-                    Style::default().fg(if selected { super::CLR_SELECTED } else { Color::Reset }),
-                ),
-                Span::styled(title_part.to_string(), Style::default().fg(title_color).bold()),
-                Span::styled(rest.to_string(), Style::default().fg(meta_color)),
-            ];
-            spans.extend(badge_spans);
-            items.push(ListItem::new(Line::from(spans)));
+            spans.push(Span::styled(title_part.to_string(), Style::default().fg(title_color).bold()));
+            spans.push(Span::styled(rest.to_string(), Style::default().fg(meta_color)));
         } else {
-            let mut spans = vec![
-                Span::styled(
-                    marker,
-                    Style::default().fg(if selected { super::CLR_SELECTED } else { Color::Reset }),
-                ),
-                Span::styled(display, Style::default().fg(title_color)),
-            ];
-            spans.extend(badge_spans);
-            items.push(ListItem::new(Line::from(spans)));
-        };
+            spans.push(Span::styled(display, Style::default().fg(title_color)));
+        }
+        spans.extend(badge_spans);
+        items.push(ListItem::new(Line::from(spans)));
     }
 
     let mut state = super::centered_list_state(
