@@ -19,6 +19,8 @@ struct PendingEntry {
     peer_id: PeerId,
     key:     SignedPublicKey,
     nick:    String,
+    /// Original ASCII-armoured public key, kept so it can be persisted when approved.
+    armored: String,
 }
 
 /// Maps `libp2p::PeerId` ↔ PGP fingerprint ↔ `SignedPublicKey`,
@@ -47,9 +49,10 @@ impl PeerKeyStore {
         fingerprint: String,
         key: SignedPublicKey,
         nick: String,
+        armored: String,
     ) -> bool {
         if self.is_known(&fingerprint) { return false; }
-        self.pending.insert(fingerprint, PendingEntry { peer_id, key, nick });
+        self.pending.insert(fingerprint, PendingEntry { peer_id, key, nick, armored });
         true
     }
 
@@ -59,23 +62,40 @@ impl PeerKeyStore {
         fingerprint: String,
         key: SignedPublicKey,
         nick: String,
+        armored: String,
     ) -> bool {
         if self.is_known(&fingerprint) { return false; }
-        self.deferred.insert(fingerprint, PendingEntry { peer_id, key, nick });
+        self.deferred.insert(fingerprint, PendingEntry { peer_id, key, nick, armored });
         true
+    }
+
+    /// Pre-load a previously approved peer directly into the trusted bucket.
+    /// Used at node startup to restore persisted approvals without prompting.
+    pub fn insert_trusted(
+        &mut self,
+        peer_id_hint: Option<PeerId>,
+        fingerprint: String,
+        key: SignedPublicKey,
+    ) {
+        if let Some(pid) = peer_id_hint {
+            self.peer_map.insert(pid, fingerprint.clone());
+        }
+        self.trusted.insert(fingerprint, key);
     }
 
     // -----------------------------------------------------------------------
     // Trust management
     // -----------------------------------------------------------------------
 
-    pub fn approve(&mut self, fingerprint: &str) -> Option<String> {
+    /// Approve a pending/deferred peer.  Returns `(nickname, armored_public_key)` on success.
+    pub fn approve(&mut self, fingerprint: &str) -> Option<(String, String)> {
         let entry = self.pending.remove(fingerprint)
             .or_else(|| self.deferred.remove(fingerprint))?;
-        let nick = entry.nick.clone();
+        let nick    = entry.nick.clone();
+        let armored = entry.armored.clone();
         self.peer_map.insert(entry.peer_id, fingerprint.to_string());
         self.trusted.insert(fingerprint.to_string(), entry.key);
-        Some(nick)
+        Some((nick, armored))
     }
 
     pub fn approve_all(&mut self) -> usize {
@@ -162,6 +182,13 @@ impl PeerKeyStore {
 
     pub fn len(&self) -> usize { self.trusted.len() }
     pub fn is_empty(&self) -> bool { self.trusted.is_empty() }
+
+    /// Record a `PeerId → fingerprint` association without changing trust state.
+    /// Used when a pre-trusted peer re-announces (they're already in `trusted`
+    /// but we don't have their current `PeerId` from this session yet).
+    pub fn update_peer_map(&mut self, peer_id: PeerId, fingerprint: &str) {
+        self.peer_map.insert(peer_id, fingerprint.to_string());
+    }
 
     // -----------------------------------------------------------------------
     // Destructive operations

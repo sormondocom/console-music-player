@@ -2072,6 +2072,7 @@ impl App {
                     cfg.p2p_stall_secs,
                     cfg.p2p_abandon_secs,
                     cfg.p2p_transport_keypair_hex.as_deref(),
+                    cfg.p2p_trusted_peers.clone(),
                     channels.cmd_rx,
                     channels.event_tx,
                 ) {
@@ -2381,11 +2382,30 @@ impl App {
                     });
                 }
             }
-            P2pEvent::PeerTrusted { fingerprint, nickname } => {
+            P2pEvent::PeerTrusted { fingerprint, nickname, public_key_armored } => {
                 let display = Self::p2p_display_name(&nickname, &fingerprint);
                 self.push_toast(Toast::info(format!("{display} trusted")));
                 if let Some(p) = self.p2p_peer_list.iter_mut().find(|p| p.fingerprint == fingerprint) {
                     p.trust = TrustState::Trusted;
+                }
+                // Persist the approval so this peer is auto-approved next session.
+                let mut cfg = crate::config::Config::load();
+                if !cfg.p2p_trusted_peers.iter().any(|r| r.fingerprint == fingerprint) {
+                    cfg.p2p_trusted_peers.push(crate::config::TrustedPeerRecord {
+                        fingerprint,
+                        nickname,
+                        public_key_armored,
+                    });
+                    cfg.save();
+                }
+            }
+            P2pEvent::PeerDenied { fingerprint } => {
+                // Remove from persisted trust so we don't auto-approve next session.
+                let mut cfg = crate::config::Config::load();
+                let before = cfg.p2p_trusted_peers.len();
+                cfg.p2p_trusted_peers.retain(|r| r.fingerprint != fingerprint);
+                if cfg.p2p_trusted_peers.len() != before {
+                    cfg.save();
                 }
             }
             P2pEvent::PeerOffline { fingerprint, nickname } => {

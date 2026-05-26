@@ -86,8 +86,11 @@ pub enum P2pEvent {
     // ── Peer lifecycle ────────────────────────────────────────────────────
     /// A new peer has announced their key; awaiting user approval.
     PeerApprovalRequired { fingerprint: String, nickname: String },
-    /// The user approved a pending peer.
-    PeerTrusted { fingerprint: String, nickname: String },
+    /// A peer was approved (manually or auto via persisted trust).
+    /// Carries the armored public key so the UI can persist the record.
+    PeerTrusted { fingerprint: String, nickname: String, public_key_armored: String },
+    /// A peer was explicitly denied; the UI should remove any persisted record.
+    PeerDenied { fingerprint: String },
     /// A peer went offline or was rejected.
     PeerOffline { fingerprint: String, nickname: String },
     /// Fresh snapshot of all known peers (response to `GetPeerList`).

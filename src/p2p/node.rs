@@ -153,6 +153,9 @@ pub struct MusicNode {
     /// Peers whose last connection closed; we wait for a grace period before
     /// declaring them offline to avoid spurious toasts on LAN connection churn.
     pending_offline: HashMap<PeerId, std::time::Instant>,
+    /// Fingerprints loaded from persisted config at startup — auto-approved on
+    /// key announcement without requiring the user to press [A].
+    pre_trusted_fps: HashSet<String>,
 }
 
 impl MusicNode {
@@ -196,6 +199,7 @@ impl MusicNode {
         stall_secs: u64,
         abandon_secs: u64,
         transport_keypair_hex: Option<&str>,
+        trusted_peers: Vec<crate::config::TrustedPeerRecord>,
         cmd_rx:   UnboundedReceiver<P2pCommand>,
         event_tx: UnboundedSender<P2pEvent>,
     ) -> anyhow::Result<String> {
@@ -234,11 +238,27 @@ impl MusicNode {
         let (port_tx, port_rx) = watch::channel(None::<u16>);
         let beacon_rx = crate::p2p::lan_beacon::spawn(local_peer_id, port_rx);
 
+        // Pre-populate keystore with persisted trusted peers so they are
+        // auto-approved when they next announce their key.
+        let mut keystore = PeerKeyStore::new();
+        let mut pre_trusted_fps: HashSet<String> = HashSet::new();
+        for record in &trusted_peers {
+            use pgp::composed::{Deserializable, SignedPublicKey};
+            use std::io::Cursor;
+            if let Ok((key, _)) = SignedPublicKey::from_armor_single(
+                Cursor::new(record.public_key_armored.as_bytes()),
+            ) {
+                keystore.insert_trusted(None, record.fingerprint.clone(), key);
+                pre_trusted_fps.insert(record.fingerprint.clone());
+                info!(fp = %record.fingerprint, nick = %record.nickname, "restored trusted peer");
+            }
+        }
+
         let node = Self {
             swarm,
             topic: IdentTopic::new(TOPIC),
             identity,
-            keystore: PeerKeyStore::new(),
+            keystore,
             node_map: HashMap::new(),
             revoked_fps: HashSet::new(),
             event_tx,
@@ -264,6 +284,7 @@ impl MusicNode {
             abandon_secs,
             peer_addrs: HashMap::new(),
             pending_offline: HashMap::new(),
+            pre_trusted_fps,
         };
 
         tokio::spawn(async move {
@@ -426,22 +447,11 @@ impl MusicNode {
             }
 
             P2pCommand::ApproveKey(fp) => {
-                if let Some(nick) = self.keystore.approve(&fp) {
+                if let Some((nick, armored_key)) = self.keystore.approve(&fp) {
                     info!(%fp, %nick, "peer approved");
                     self.node_map_set_trust(&fp, TrustState::Trusted);
                     let _ = self.publish_announce_key().await;
 
-                    // Trigger mutual catalog exchange with the newly trusted peer.
-                    //
-                    // The CatalogPresence broadcast at node startup was received
-                    // while this peer was still Pending, so the handler silently
-                    // dropped it.  Publish fresh messages now (each publish() gets
-                    // a new message UUID so the seen-message dedup won't suppress them):
-                    //
-                    //  1. CatalogPresence — tells them we have tracks; if they've
-                    //     already approved us they'll immediately send a CatalogRequest.
-                    //  2. CatalogRequest  — asks for their catalog; they'll respond if
-                    //     they've approved us (signature verifies against their key).
                     let count = self.local_catalog.len() as u32;
                     let _ = self.event_tx.send(P2pEvent::Info(format!(
                         "{nick} approved — exchanging catalogs…"
@@ -454,8 +464,9 @@ impl MusicNode {
                     }
 
                     let _ = self.event_tx.send(P2pEvent::PeerTrusted {
-                        fingerprint: fp,
-                        nickname: nick,
+                        fingerprint:        fp,
+                        nickname:           nick,
+                        public_key_armored: armored_key,
                     }).ok();
                 }
             }
@@ -463,7 +474,9 @@ impl MusicNode {
             P2pCommand::DenyKey(fp) => {
                 self.keystore.reject(&fp);
                 self.node_map_set_trust(&fp, TrustState::Rejected);
+                self.pre_trusted_fps.remove(&fp);
                 info!(%fp, "peer rejected");
+                let _ = self.event_tx.send(P2pEvent::PeerDenied { fingerprint: fp }).ok();
             }
 
             P2pCommand::GetPeerList => {
@@ -1347,6 +1360,19 @@ impl MusicNode {
         if self.revoked_fps.contains(announced_fp) || self.keystore.is_rejected(announced_fp) {
             return;
         }
+        // If this fingerprint is already trusted (pre-loaded from config or approved
+        // earlier this session), update the PeerId mapping and trigger catalog
+        // exchange — don't re-prompt for approval.
+        if self.keystore.get_by_fingerprint(announced_fp).is_some() {
+            info!(%peer_id, %announced_fp, %nickname, "trusted peer re-announced — refreshing");
+            self.keystore.update_peer_map(peer_id, announced_fp);
+            self.node_map_upsert(announced_fp, nickname, TrustState::Trusted, NodeStatus::Online);
+            let count = self.local_catalog.len() as u32;
+            let _ = self.publish(MusicKind::CatalogPresence { track_count: count }).await;
+            let _ = self.publish(MusicKind::CatalogRequest).await;
+            return;
+        }
+        // Already pending or deferred — user hasn't acted yet, don't re-add.
         if self.keystore.is_known(announced_fp) {
             return;
         }
@@ -1367,13 +1393,35 @@ impl MusicNode {
 
         info!(%peer_id, %actual_fp, %nickname, "received key announcement");
 
-        self.keystore.insert_pending(peer_id, actual_fp.clone(), key, nickname.to_string());
-        self.node_map_upsert(&actual_fp, nickname, TrustState::Pending, NodeStatus::Online);
-
-        let _ = self.event_tx.send(P2pEvent::PeerApprovalRequired {
-            fingerprint: actual_fp,
-            nickname: nickname.to_string(),
-        }).ok();
+        if self.pre_trusted_fps.contains(&actual_fp) {
+            // This fingerprint was approved in a previous session — skip the
+            // approval prompt and trust them immediately.
+            self.keystore.insert_pending(
+                peer_id, actual_fp.clone(), key, nickname.to_string(), armored.to_string(),
+            );
+            if let Some((nick, armored_key)) = self.keystore.approve(&actual_fp) {
+                info!(%actual_fp, %nick, "auto-approved previously trusted peer");
+                self.node_map_upsert(&actual_fp, &nick, TrustState::Trusted, NodeStatus::Online);
+                let count = self.local_catalog.len() as u32;
+                let _ = self.event_tx.send(P2pEvent::PeerTrusted {
+                    fingerprint:       actual_fp.clone(),
+                    nickname:          nick,
+                    public_key_armored: armored_key,
+                }).ok();
+                let _ = self.publish_announce_key().await;
+                let _ = self.publish(MusicKind::CatalogPresence { track_count: count }).await;
+                let _ = self.publish(MusicKind::CatalogRequest).await;
+            }
+        } else {
+            self.keystore.insert_pending(
+                peer_id, actual_fp.clone(), key, nickname.to_string(), armored.to_string(),
+            );
+            self.node_map_upsert(&actual_fp, nickname, TrustState::Pending, NodeStatus::Online);
+            let _ = self.event_tx.send(P2pEvent::PeerApprovalRequired {
+                fingerprint: actual_fp,
+                nickname: nickname.to_string(),
+            }).ok();
+        }
     }
 
     // -----------------------------------------------------------------------
