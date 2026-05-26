@@ -1848,9 +1848,20 @@ impl App {
     pub fn tick(&mut self) {
         self.player.tick();
         if let Some(track) = self.player.take_decoder_panic() {
-            self.decoder_error_track = Some(track);
-            // Suppress any pending advance so the error overlay can show cleanly.
-            self.player.needs_next = false;
+            if track.remote.is_some() {
+                // Remote tracks can't be deleted locally — skip silently and advance.
+                self.p2p_buffer_state = P2pBufferState::Idle;
+                self.player.current_remote = None;
+                self.push_toast(Toast::warning(format!(
+                    "Decoder error on remote track '{}' — skipping",
+                    track.display_title()
+                )));
+                self.advance_track();
+            } else {
+                self.decoder_error_track = Some(track);
+                // Suppress any pending advance so the error overlay can show cleanly.
+                self.player.needs_next = false;
+            }
         } else if self.player.take_needs_next() {
             // If a remote track just finished, clear the buffer state first so
             // advance_track() / play_focused() can start fresh.
