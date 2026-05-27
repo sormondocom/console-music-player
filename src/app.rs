@@ -1990,12 +1990,19 @@ impl App {
             }
         };
 
-        // Resolve passphrase: OS keychain is authoritative; config.json is the
-        // migration fallback for existing installs that stored it there.
-        let keychain_hit = crate::keychain::load_passphrase();
-        let passphrase_from_config =
-            keychain_hit.is_none() && cfg.p2p_identity_passphrase.is_some();
-        let resolved_passphrase = keychain_hit.or_else(|| cfg.p2p_identity_passphrase.clone());
+        // Resolve passphrase from config.json.  If it is absent (user was on the
+        // old keychain-only path), pull it from the keychain once as a migration
+        // step and immediately write it back to config so future runs are reliable.
+        let resolved_passphrase = if cfg.p2p_identity_passphrase.is_some() {
+            cfg.p2p_identity_passphrase.clone()
+        } else if let Some(pw) = crate::keychain::load_passphrase() {
+            // Migrate from keychain → config so we never depend on the keychain again.
+            cfg.p2p_identity_passphrase = Some(pw.clone());
+            cfg.save();
+            Some(pw)
+        } else {
+            None
+        };
 
         match PgpIdentity::load_or_generate(
             &nickname,
@@ -2004,47 +2011,12 @@ impl App {
         ) {
             Ok((identity, new_keys)) => {
                 if let Some((armored, passphrase)) = new_keys {
-                    // Fresh keypair — try to store the passphrase in the OS
-                    // keychain.  Fall back to config.json if unavailable.
-                    cfg.p2p_identity_armored = Some(armored);
-                    cfg.p2p_nickname         = Some(nickname.clone());
-                    match crate::keychain::store_passphrase(&passphrase) {
-                        crate::keychain::StoreOutcome::Keychain => {
-                            cfg.p2p_identity_passphrase = None;
-                            cfg.save();
-                            self.push_toast(Toast::info(
-                                "P2P identity generated — passphrase secured in OS keychain.",
-                            ));
-                        }
-                        crate::keychain::StoreOutcome::ConfigFallback(reason) => {
-                            cfg.p2p_identity_passphrase = Some(passphrase);
-                            cfg.save();
-                            self.push_toast(Toast::warning(format!(
-                                "P2P identity generated — passphrase stored in config.json \
-                                 (keychain unavailable: {reason})."
-                            )));
-                        }
-                    }
-                } else if passphrase_from_config {
-                    // Migration: passphrase was already in config.json from a
-                    // previous install.  Move it to the keychain now and scrub
-                    // it from the file.
-                    if let Some(ref pw) = resolved_passphrase {
-                        match crate::keychain::store_passphrase(pw) {
-                            crate::keychain::StoreOutcome::Keychain => {
-                                cfg.p2p_identity_passphrase = None;
-                                cfg.save();
-                                self.push_toast(Toast::info(
-                                    "P2P passphrase migrated to OS keychain \
-                                     and removed from config.json.",
-                                ));
-                            }
-                            crate::keychain::StoreOutcome::ConfigFallback(_) => {
-                                // Keychain still unavailable — leave it in config.json
-                                // and stay silent so we don't toast on every launch.
-                            }
-                        }
-                    }
+                    // Fresh keypair — persist both armored key and passphrase to config.
+                    cfg.p2p_identity_armored    = Some(armored);
+                    cfg.p2p_identity_passphrase = Some(passphrase);
+                    cfg.p2p_nickname            = Some(nickname.clone());
+                    cfg.save();
+                    self.push_toast(Toast::info("P2P identity generated and saved."));
                 }
 
                 let fp = identity.fingerprint();
