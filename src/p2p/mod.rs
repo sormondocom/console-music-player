@@ -46,6 +46,10 @@ pub enum P2pCommand {
     DenyKey(String),
     /// Request a fresh snapshot of the peer list.
     GetPeerList,
+    /// Remove a peer from the node's tracking tables and their catalog from
+    /// our library.  Does NOT revoke trust — if they reconnect they are
+    /// auto-approved and their catalog is re-fetched.
+    ForgetPeer { fingerprint: String },
     /// Gracefully disconnect from the P2P network.
     Disconnect,
 

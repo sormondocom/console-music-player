@@ -193,7 +193,14 @@ fn render_error_bar(track: &Track, frame: &mut Frame, area: Rect) {
 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let library_hint;
-    let help = if app.gematria_state.is_some() {
+    let viz_hint;
+    let help = if app.viz_mode.is_some() {
+        viz_hint = format!(
+            " ◈ {} — [←→/hl] Cycle visualizer  [V/Esc] Back to library",
+            app.viz_mode.map(|m| m.label()).unwrap_or(""),
+        );
+        viz_hint.as_str()
+    } else if app.gematria_state.is_some() {
         " Type a phrase  [Tab] Cycle system  [Enter] Play selected track  [Esc] Cancel"
     } else if app.search_state.is_some() {
         " [↑↓] Navigate results  [PgUp/Dn] Page  [Enter] Jump to track  [Esc] Close  — type to filter"
@@ -223,7 +230,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             Screen::Dedup      => " [Tab] Panel  [↑↓] Navigate  [Space] Cycle action  [A] Auto  [Enter] Apply  [Esc] Cancel",
             Screen::Amazon     => " [S] Add as source  [L] Launch app  [D] Auto-download (Win32)  [↑↓] Scroll log  [Esc] Back",
             Screen::Organize   => " [↑↓/jk] Navigate groups  [Enter] Select destination  [Esc] Back",
-            Screen::P2pPeers      => " [↑↓] Navigate  [A] Approve  [D] Deny  [C] Connect by address  [L] Remote Library  [P] Party Line  [X] Disconnect  [Esc] Back",
+            Screen::P2pPeers      => " [↑↓] Navigate  [A] Approve  [D] Deny  [R] Remove  [C] Connect  [L] Remote Library  [P] Party Line  [X] Disconnect  [Esc] Back",
             Screen::P2pIdentity   => " Type your display name (a-z, A-Z, 0-9, max 12 chars)  [Enter] Confirm  [Esc] Cancel",
             Screen::P2pConnect    => " Paste a peer address and press Enter to connect  [Esc] Cancel",
             Screen::RemoteLibrary => " [↑↓/PgUp/Dn] Navigate  [Enter] Stream  [P] Pause  [[] Vol-  []] Vol+  [N] Nominate  [Esc] Back",

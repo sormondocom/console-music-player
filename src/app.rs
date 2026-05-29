@@ -476,9 +476,13 @@ pub struct App {
     // --- deduplication ---
     pub dedup_state: Option<DedupState>,
 
-    // --- waveform visualizer ---
-    /// When `true`, the library pane is replaced by the oscilloscope.
-    pub waveform_active: bool,
+    // --- visualizer ---
+    /// Active visualizer mode; `None` shows the library pane.
+    pub viz_mode:       Option<crate::visualizer::VizMode>,
+    /// Slowly-advancing phase used by the spirograph renderer.
+    pub viz_phase:      f64,
+    /// Persistent particle simulation for the fireworks visualizer.
+    pub firework_state: crate::visualizer::FireworkState,
 
     // --- tags ---
     pub tag_store: TagStore,
@@ -594,7 +598,9 @@ impl App {
             device_tracks_selected: 0,
             edit_state: None,
             dedup_state: None,
-            waveform_active: false,
+            viz_mode:       None,
+            viz_phase:      0.0,
+            firework_state: crate::visualizer::FireworkState::new(),
             marquee_tick: 0,
             tag_store: TagStore::load(),
             playlist_membership: HashMap::new(),
@@ -1846,6 +1852,12 @@ impl App {
     // --- tick ---
 
     pub fn tick(&mut self) {
+        if self.viz_mode.is_some() {
+            self.viz_phase += 0.007; // slow rotation — full cycle ~900 ticks
+        }
+        if self.viz_mode == Some(crate::visualizer::VizMode::Fireworks) {
+            self.firework_state.update(&self.player.wave_buffer);
+        }
         self.player.tick();
         if let Some(track) = self.player.take_decoder_panic() {
             if track.remote.is_some() {
@@ -2107,6 +2119,35 @@ impl App {
                 track_id:  rt.id,
                 ext:       rt.format.label().to_lowercase(),
             }),
+        }
+    }
+
+    /// Remove a peer from the UI, their remote tracks from the library, and
+    /// tell the node to forget its internal state for this peer.  Does NOT
+    /// revoke trust — if they reconnect they will be auto-approved and their
+    /// catalog re-fetched.
+    pub fn remove_p2p_peer(&mut self, fingerprint: &str) {
+        // Drop from the peer list and fix the cursor.
+        self.p2p_peer_list.retain(|p| p.fingerprint != fingerprint);
+        if self.p2p_peers_selected >= self.p2p_peer_list.len() {
+            self.p2p_peers_selected = self.p2p_peer_list.len().saturating_sub(1);
+        }
+
+        // Drop their tracks from both the remote_tracks vec and the main library.
+        self.remote_tracks.retain(|t| t.owner_fp != fingerprint);
+        self.library.remove_remote_peer(fingerprint);
+
+        // If this peer's track is actively buffering/playing, reset state.
+        if self.player.current_remote.as_ref().map(|t| t.owner_fp.as_str()) == Some(fingerprint) {
+            self.p2p_buffer_state = P2pBufferState::Idle;
+            self.player.current_remote = None;
+        }
+
+        // Tell the node to drop its tracking tables for this peer.
+        if let Some(node) = &self.p2p_node {
+            node.send(crate::p2p::P2pCommand::ForgetPeer {
+                fingerprint: fingerprint.to_string(),
+            });
         }
     }
 

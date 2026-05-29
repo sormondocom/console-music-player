@@ -34,8 +34,8 @@ pub(super) fn render_main(app: &App, frame: &mut Frame, area: Rect) {
     ])
     .areas(right);
 
-    if app.waveform_active {
-        render_waveform_pane(app, frame, left);
+    if let Some(mode) = app.viz_mode {
+        render_viz_pane(app, frame, left, mode);
     } else {
         render_library_pane(app, frame, left);
     }
@@ -45,17 +45,28 @@ pub(super) fn render_main(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// Waveform pane
+// Visualizer pane  (waveform, spirograph, …)
 // ---------------------------------------------------------------------------
 
-pub(super) fn render_waveform_pane(app: &App, frame: &mut Frame, area: Rect) {
-    let title = if let Some(track) = &app.player.current_track {
-        format!(" ◈ {} — {} ", track.display_title(), track.display_artist())
+pub(super) fn render_viz_pane(
+    app:   &App,
+    frame: &mut Frame,
+    area:  Rect,
+    mode:  visualizer::VizMode,
+) {
+    let track_label = if let Some(track) = &app.player.current_track {
+        format!("{} — {}", track.display_title(), track.display_artist())
     } else if let Some(rt) = &app.player.current_remote {
-        format!(" ◈ {} — {} [@{}] ", rt.title, rt.artist, rt.owner_nick)
+        format!("{} — {} [@{}]", rt.title, rt.artist, rt.owner_nick)
     } else {
-        " ◈ Waveform — no track playing ".into()
+        "no track playing".into()
     };
+
+    let title = format!(
+        " ◈ {} ◂ {} ▸  [←→] cycle  [Esc] back ",
+        mode.label(),
+        track_label,
+    );
 
     let block = Block::default()
         .title(title)
@@ -73,12 +84,22 @@ pub(super) fn render_waveform_pane(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let rows = visualizer::render_waveform(&app.player.wave_buffer, width, height);
-
-    let lines: Vec<Line> = rows
-        .into_iter()
-        .map(|row| Line::from(Span::styled(row, Style::default().fg(super::CLR_ACCENT))))
-        .collect();
+    let lines: Vec<Line> = match mode {
+        visualizer::VizMode::Fireworks => {
+            app.firework_state.render(width, height)
+        }
+        _ => {
+            let rows = match mode {
+                visualizer::VizMode::Waveform =>
+                    visualizer::render_waveform(&app.player.wave_buffer, width, height),
+                _ => // Spirograph
+                    visualizer::render_spirograph(&app.player.wave_buffer, width, height, app.viz_phase),
+            };
+            rows.into_iter()
+                .map(|row| Line::from(Span::styled(row, Style::default().fg(super::CLR_ACCENT))))
+                .collect()
+        }
+    };
 
     frame.render_widget(Paragraph::new(lines), inner);
 }

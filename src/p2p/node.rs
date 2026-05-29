@@ -484,6 +484,15 @@ impl MusicNode {
                 let _ = self.event_tx.send(P2pEvent::PeerListSnapshot(snapshot)).ok();
             }
 
+            P2pCommand::ForgetPeer { fingerprint } => {
+                // Drop the peer from our tracking tables.  We intentionally
+                // keep them in keystore.trusted so they are auto-approved and
+                // their catalog is re-fetched if they reconnect.
+                self.node_map.remove(&fingerprint);
+                self.partial_catalogs.remove(&fingerprint);
+                info!(fp = %fingerprint, "forgot peer (library cleared by user)");
+            }
+
             P2pCommand::Disconnect => {
                 return true;
             }

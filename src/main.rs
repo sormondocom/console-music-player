@@ -496,10 +496,20 @@ fn advance_amazon_seq(app: &mut App, c: char) -> bool {
 }
 
 fn handle_library_key(app: &mut App, key: KeyCode) {
-    // Esc closes the waveform overlay if it's active.
-    if key == KeyCode::Esc && app.waveform_active {
-        app.waveform_active = false;
-        return;
+    // When the visualizer is open, Esc exits and Left/Right cycle modes.
+    if app.viz_mode.is_some() {
+        match key {
+            KeyCode::Esc => { app.viz_mode = None; return; }
+            KeyCode::Left  | KeyCode::Char('h') | KeyCode::Char('H') => {
+                app.viz_mode = app.viz_mode.map(|m| m.prev());
+                return;
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                app.viz_mode = app.viz_mode.map(|m| m.next());
+                return;
+            }
+            _ => {} // all other keys fall through to normal handling below
+        }
     }
 
     // Easter egg: A→C→E rapid sequence opens the Amazon Music screen.
@@ -589,7 +599,10 @@ fn handle_library_key(app: &mut App, key: KeyCode) {
         KeyCode::Char('f') | KeyCode::Char('F') => app.begin_dedup(),
         KeyCode::Char('g') | KeyCode::Char('G') => app.begin_tag_edit(),
         KeyCode::Char('v') | KeyCode::Char('V') => {
-            app.waveform_active = !app.waveform_active;
+            app.viz_mode = match app.viz_mode {
+                None    => Some(crate::visualizer::VizMode::Waveform),
+                Some(_) => None,
+            };
         }
         KeyCode::Char('o') | KeyCode::Char('O') => {
             app.player.toggle_repeat();
@@ -1038,7 +1051,7 @@ fn handle_p2p_peers_key(app: &mut App, key: KeyCode) {
             }
         }
         KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
-            // Deny / revoke the focused peer.
+            // Deny / revoke the focused peer (blocks future reconnection).
             if let Some(info) = app.p2p_peer_list.get(app.p2p_peers_selected) {
                 let fp = info.fingerprint.clone();
                 if let Some(node) = &app.p2p_node {
@@ -1046,11 +1059,19 @@ fn handle_p2p_peers_key(app: &mut App, key: KeyCode) {
                 }
             }
         }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            // Remove the focused peer: clears their library tracks and forgets
+            // them locally without revoking trust.  They will be re-added and
+            // their catalog re-fetched if they come back online.
+            if let Some(info) = app.p2p_peer_list.get(app.p2p_peers_selected).cloned() {
+                app.remove_p2p_peer(&info.fingerprint);
+            }
+        }
         KeyCode::Char('x') | KeyCode::Char('X') => {
             // Disconnect from P2P.
             app.deactivate_p2p();
         }
-        KeyCode::Char('r') | KeyCode::Char('R') => {
+        KeyCode::Char('f') | KeyCode::Char('F') => {
             // Refresh peer list.
             if let Some(node) = &app.p2p_node {
                 node.send(crate::p2p::P2pCommand::GetPeerList);
