@@ -451,10 +451,11 @@ pub struct FireworkState {
     rng:          u64,
     // Audio analysis state (persists between ticks)
     lpf:          f32,   // IIR low-pass filter accumulator (~420 Hz cutoff @ 44.1 kHz)
-    bass_fast:    f32,   // short-term bass EMA  (~5-tick window)
+    bass_fast:    f32,   // short-term bass EMA  (~2-tick window)
     bass_slow:    f32,   // long-term bass EMA   (~33-tick window, used as baseline)
     rms_long:     f32,   // overall loudness EMA for silence detection
     hit_cooldown: u32,   // ticks to suppress re-triggering after a launch
+    was_paused:   bool,  // true while paused; triggers analysis reset on first resume tick
 }
 
 impl FireworkState {
@@ -472,6 +473,7 @@ impl FireworkState {
             bass_slow:    0.001,  // small non-zero avoids div-by-zero on first tick
             rms_long:     0.0,
             hit_cooldown: 0,
+            was_paused:   false,
         }
     }
 
@@ -484,16 +486,35 @@ impl FireworkState {
 
     // ── Public API ───────────────────────────────────────────────────────────
 
-    /// Advance the simulation one tick.  Pass the live audio buffer directly
-    /// so we can do bass onset detection on the raw samples.
-    pub fn update(&mut self, buffer: &WaveBuffer) {
+    /// Advance the simulation one tick.
+    ///
+    /// Pass `is_playing = false` when the player is paused or stopped: physics
+    /// still advances (particles coast to a stop) but audio analysis is skipped
+    /// so stale buffer data does not pre-converge the onset filters.  On the
+    /// first tick after resuming the filters reset, guaranteeing a rocket burst
+    /// as soon as the bass comes back.
+    pub fn update(&mut self, buffer: &WaveBuffer, is_playing: bool) {
+        // Physics runs every tick regardless of playback state.
+        self.tick_physics();
+
+        if !is_playing {
+            self.was_paused = true;
+            return;
+        }
+
         let samples: Vec<f32> = match buffer.try_lock() {
             Ok(g)  => g.iter().copied().collect(),
-            Err(_) => { self.tick_physics(); return; }
+            Err(_) => return,
         };
 
-        // Always keep particles moving even when the analysis fails.
-        self.tick_physics();
+        // After a pause the EMA filters have stale values; reset so the onset
+        // detector re-calibrates on the very first fresh frame.
+        if self.was_paused {
+            self.lpf       = 0.0;
+            self.bass_fast = 0.0;
+            self.bass_slow = 0.001;
+            self.was_paused = false;
+        }
 
         if samples.is_empty() {
             self.rms_long *= 0.97;
@@ -511,9 +532,6 @@ impl FireworkState {
         }
 
         // ── IIR low-pass (α ≈ 0.06 → ~420 Hz cutoff @ 44.1 kHz) ─────────
-        // Iterating the full ring buffer each tick is intentional: the filter
-        // state (self.lpf) evolves continuously and its running RMS captures
-        // the bass energy of the most recent ~85 ms window.
         let alpha = 0.06_f32;
         let mut bass_sq = 0.0f32;
         for &s in &samples {
@@ -522,22 +540,23 @@ impl FireworkState {
         }
         let bass_rms = (bass_sq / samples.len() as f32).sqrt();
 
-        self.bass_fast = self.bass_fast * 0.80 + bass_rms * 0.20; // ~5 ticks
+        // α=0.60 → ~2-tick response window; at 100 ms/tick this catches a
+        // single kick drum in the first tick rather than needing 4+ ticks.
+        self.bass_fast = self.bass_fast * 0.40 + bass_rms * 0.60; // ~2 ticks
         self.bass_slow = self.bass_slow * 0.97 + bass_rms * 0.03; // ~33 ticks
 
         // ── Beat/onset detection ──────────────────────────────────────────
         self.hit_cooldown = self.hit_cooldown.saturating_sub(1);
 
         // Ratio of short-term to long-term bass energy.
-        // Values above ~1.35 signal a transient (kick, bass hit, etc.).
+        // Threshold 1.20 (was 1.35) lets moderate kicks trigger rockets within
+        // a single 100 ms tick instead of requiring 4+ ticks of sustained bass.
         let ratio = self.bass_fast / self.bass_slow.max(0.0001);
 
-        if ratio > 1.35 && self.hit_cooldown == 0 && self.rockets.len() < MAX_ROCKETS {
+        if ratio > 1.20 && self.hit_cooldown == 0 && self.rockets.len() < MAX_ROCKETS {
             // Normalise strength: 0.0 = barely above threshold, 1.0 = very hard hit
-            let strength = ((ratio - 1.35) / 0.85).clamp(0.0, 1.0);
+            let strength = ((ratio - 1.20) / 0.80).clamp(0.0, 1.0);
             self.launch_on_hit(strength);
-            // Cooldown scales with hit strength so hard hits have a longer gap
-            // before the next rocket can fire (keeps the display from flooding).
             self.hit_cooldown = (7.0 + strength * 8.0) as u32;
         }
     }

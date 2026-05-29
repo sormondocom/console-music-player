@@ -1856,7 +1856,8 @@ impl App {
             self.viz_phase += 0.007; // slow rotation — full cycle ~900 ticks
         }
         if self.viz_mode == Some(crate::visualizer::VizMode::Fireworks) {
-            self.firework_state.update(&self.player.wave_buffer);
+            let is_playing = self.player.state == crate::player::PlaybackState::Playing;
+            self.firework_state.update(&self.player.wave_buffer, is_playing);
         }
         self.player.tick();
         if let Some(track) = self.player.take_decoder_panic() {
